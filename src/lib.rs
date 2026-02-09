@@ -9,4 +9,5 @@ pub mod cli;
 pub mod csv_handler;
 pub mod error;
 pub mod mqtt;
+pub mod recorder;
 pub mod topics;
