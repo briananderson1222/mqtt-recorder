@@ -8,6 +8,7 @@ pub mod broker;
 pub mod cli;
 pub mod csv_handler;
 pub mod error;
+pub mod mirror;
 pub mod mqtt;
 pub mod recorder;
 pub mod replayer;
