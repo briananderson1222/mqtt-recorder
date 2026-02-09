@@ -4,4 +4,5 @@
 //! It includes modules for CLI argument parsing, MQTT client operations,
 //! CSV handling, topic filtering, and embedded broker management.
 
+pub mod cli;
 pub mod error;
