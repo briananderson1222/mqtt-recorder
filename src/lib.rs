@@ -8,3 +8,4 @@ pub mod broker;
 pub mod cli;
 pub mod error;
 pub mod mqtt;
+pub mod topics;
