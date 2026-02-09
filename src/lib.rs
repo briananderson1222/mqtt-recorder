@@ -6,6 +6,7 @@
 
 pub mod broker;
 pub mod cli;
+pub mod csv_handler;
 pub mod error;
 pub mod mqtt;
 pub mod topics;
