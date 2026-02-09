@@ -1,0 +1,33 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock file (optional - keep for binaries, ignore for libraries)
+# Cargo.lock is kept for this binary project
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Log files
+*.log
+nohup.out
+
+# Recording files (user-generated data)
+*.csv
+!tests/**/*.csv
+
+# Environment files
+.env
+.env.*
+
+# Coverage reports
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
