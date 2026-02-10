@@ -21,7 +21,7 @@
 
 use crate::error::MqttRecorderError;
 use crate::mqtt::{MqttClientConfig, MqttClientV5};
-use rumqttd::{Broker, Config, ConnectionSettings, RouterConfig, ServerSettings};
+use rumqttd::{Broker, Config, ConnectionSettings, MetricSettings, MetricType, RouterConfig, ServerSettings};
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
@@ -162,8 +162,20 @@ impl EmbeddedBroker {
             }
         });
 
-        // Give the broker a moment to start up
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Wait for the broker to be ready by probing the TCP listener
+        let addr = format!("127.0.0.1:{}", port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(MqttRecorderError::Broker(format!(
+                    "Broker failed to start on port {} within 5 seconds", port
+                )));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
 
         Ok(Self {
             _handle: BrokerHandle { _thread: handle },
@@ -195,7 +207,7 @@ impl EmbeddedBroker {
         // Supports QoS 0, 1, and 2 (Requirement 10.7)
         let connection_settings = ConnectionSettings {
             connection_timeout_ms: 60000, // 60 seconds
-            max_payload_size: 256 * 1024, // 256 KB max payload
+            max_payload_size: 1024 * 1024, // 1 MB max payload (matches client default)
             max_inflight_count: 100,      // Support for QoS 1 and 2
             auth: None,                   // No authentication for embedded broker
             external_auth: None,
@@ -219,6 +231,19 @@ impl EmbeddedBroker {
         let mut v5_servers = HashMap::new();
         v5_servers.insert("1".to_string(), server_settings);
 
+        // Create metrics config so the timer thread pushes data to MetersLink
+        // Both Meters and Alerts must be present to avoid a panic in rumqttd's timer.rs
+        // (the select! macro evaluates unwrap() before checking the if-guard)
+        let meter_settings: MetricSettings =
+            serde_json::from_str(r#"{"push_interval": 1}"#)
+                .map_err(|e| MqttRecorderError::Broker(format!("metrics config: {}", e)))?;
+        let alert_settings: MetricSettings =
+            serde_json::from_str(r#"{"push_interval": 30}"#)
+                .map_err(|e| MqttRecorderError::Broker(format!("metrics config: {}", e)))?;
+        let mut metrics = HashMap::new();
+        metrics.insert(MetricType::Meters, meter_settings);
+        metrics.insert(MetricType::Alerts, alert_settings);
+
         // Create the final configuration
         let config = Config {
             id: 0,
@@ -230,7 +255,7 @@ impl EmbeddedBroker {
             console: None,
             bridge: None,
             prometheus: None,
-            metrics: None,
+            metrics: Some(metrics),
         };
 
         Ok(config)
@@ -432,10 +457,19 @@ mod tests {
         let server = v5.get("1").unwrap();
 
         assert!(server.connections.connection_timeout_ms > 0);
-        assert!(server.connections.max_payload_size > 0);
         assert!(server.connections.max_inflight_count > 0);
         assert!(server.connections.dynamic_filters);
         assert!(server.connections.auth.is_none());
+    }
+
+    #[test]
+    fn test_create_config_max_payload_matches_client_default() {
+        let config = EmbeddedBroker::create_config(1883).unwrap();
+        let v5 = config.v5.unwrap();
+        let server = v5.get("1").unwrap();
+
+        // Must match MqttClientConfig default max_packet_size (1MB)
+        assert_eq!(server.connections.max_payload_size, 1024 * 1024);
     }
 
     // Note: Integration tests for actual broker startup would require
