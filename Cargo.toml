@@ -81,3 +81,11 @@ path = "tests/property/broker_metrics_props.rs"
 [[test]]
 name = "mirror_test"
 path = "tests/integration/mirror_test.rs"
+
+[[test]]
+name = "recorder_test"
+path = "tests/integration/recorder_test.rs"
+
+[[test]]
+name = "replayer_test"
+path = "tests/integration/replayer_test.rs"

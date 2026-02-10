@@ -948,7 +948,9 @@ impl Terminal {
             frame.render_widget(audit_block, vert[1]);
             let visible = audit_inner.height as usize;
             let total = audit_entries.len();
-            let start = log_scroll;
+            let max_scroll = total.saturating_sub(visible);
+            let clamped_scroll = log_scroll.min(max_scroll);
+            let start = clamped_scroll;
             let end = (start + visible).min(total);
             let log_lines: Vec<Line> = audit_entries[..total]
                 .iter()
@@ -1009,7 +1011,7 @@ impl Terminal {
                     " Audit  ".into(),
                     Span::styled("[↑↓]", dim),
                     " Select  ".into(),
-                    Span::styled("[ ]", dim),
+                    Span::styled("[j/k]", dim),
                     " Scroll  ".into(),
                     Span::styled("[q]", Style::default().fg(Color::Red)),
                     " Quit".into(),
@@ -1184,11 +1186,14 @@ pub async fn run_tui(
                             KeyCode::Enter => {
                                 state.confirm_selection();
                             }
-                            KeyCode::Char('[') => {
-                                log_scroll = log_scroll.saturating_add(1);
-                                log_pinned_bottom = false;
+                            KeyCode::Char('j') => {
+                                let total = state.get_audit_log().len();
+                                if total > 0 && log_scroll < total.saturating_sub(1) {
+                                    log_scroll += 1;
+                                    log_pinned_bottom = false;
+                                }
                             }
-                            KeyCode::Char(']') => {
+                            KeyCode::Char('k') => {
                                 log_scroll = log_scroll.saturating_sub(1);
                                 if log_scroll == 0 {
                                     log_pinned_bottom = true;
