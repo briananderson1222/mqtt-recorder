@@ -272,10 +272,7 @@ impl Args {
                 if self.host.is_none() {
                     return Err("--host is required for record mode".to_string());
                 }
-                // File is required for record mode
-                if self.file.is_none() {
-                    return Err("--file is required for record mode".to_string());
-                }
+                // File is optional for record mode - auto-generated if not provided
             }
             Mode::Replay => {
                 // Requirement 1.22: IF mode is "replay" without --serve and --host is not provided, display error
@@ -354,7 +351,14 @@ impl Args {
     /// }
     /// ```
     pub fn is_standalone_broker(&self) -> bool {
-        self.serve && self.mode.is_none()
+        self.serve && self.mode.is_none() && self.host.is_none()
+    }
+
+    /// Apply default mode if none specified: mirror when --serve + --host, record when --host only.
+    pub fn apply_defaults(&mut self) {
+        if self.mode.is_none() && self.host.is_some() {
+            self.mode = Some(if self.serve { Mode::Mirror } else { Mode::Record });
+        }
     }
 }
 
@@ -413,16 +417,13 @@ mod tests {
     }
 
     #[test]
-    fn test_record_mode_requires_file() {
+    fn test_record_mode_file_optional() {
         let mut args = default_args();
         args.mode = Some(Mode::Record);
         args.host = Some("localhost".to_string());
 
-        let result = args.validate();
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .contains("--file is required for record mode"));
+        // No file specified - should be valid (auto-generated at runtime)
+        assert!(args.validate().is_ok());
     }
 
     #[test]
@@ -862,5 +863,124 @@ mod tests {
         assert!(result
             .unwrap_err()
             .contains("--fix cannot be used with --validate"));
+    }
+
+    // === apply_defaults tests ===
+
+    #[test]
+    fn test_apply_defaults_host_only_becomes_record() {
+        let mut args = default_args();
+        args.host = Some("broker.example.com".to_string());
+
+        args.apply_defaults();
+        assert_eq!(args.mode, Some(Mode::Record));
+    }
+
+    #[test]
+    fn test_apply_defaults_host_and_serve_becomes_mirror() {
+        let mut args = default_args();
+        args.host = Some("broker.example.com".to_string());
+        args.serve = true;
+
+        args.apply_defaults();
+        assert_eq!(args.mode, Some(Mode::Mirror));
+    }
+
+    #[test]
+    fn test_apply_defaults_serve_only_no_mode_set() {
+        let mut args = default_args();
+        args.serve = true;
+
+        args.apply_defaults();
+        assert_eq!(args.mode, None); // Standalone broker, no default mode
+    }
+
+    #[test]
+    fn test_apply_defaults_no_host_no_serve_no_mode_set() {
+        let mut args = default_args();
+
+        args.apply_defaults();
+        assert_eq!(args.mode, None);
+    }
+
+    #[test]
+    fn test_apply_defaults_does_not_override_explicit_mode() {
+        let mut args = default_args();
+        args.host = Some("broker.example.com".to_string());
+        args.mode = Some(Mode::Replay);
+        args.file = Some(PathBuf::from("test.csv"));
+
+        args.apply_defaults();
+        assert_eq!(args.mode, Some(Mode::Replay));
+    }
+
+    #[test]
+    fn test_apply_defaults_does_not_override_explicit_record() {
+        let mut args = default_args();
+        args.host = Some("broker.example.com".to_string());
+        args.serve = true;
+        args.mode = Some(Mode::Record);
+
+        args.apply_defaults();
+        assert_eq!(args.mode, Some(Mode::Record)); // Not overridden to Mirror
+    }
+
+    // === is_standalone_broker tests ===
+
+    #[test]
+    fn test_standalone_broker_serve_only() {
+        let mut args = default_args();
+        args.serve = true;
+        assert!(args.is_standalone_broker());
+    }
+
+    #[test]
+    fn test_not_standalone_broker_with_host() {
+        let mut args = default_args();
+        args.serve = true;
+        args.host = Some("broker.example.com".to_string());
+        assert!(!args.is_standalone_broker());
+    }
+
+    #[test]
+    fn test_not_standalone_broker_with_mode_set() {
+        let mut args = default_args();
+        args.serve = true;
+        args.mode = Some(Mode::Mirror);
+        args.host = Some("localhost".to_string());
+        assert!(!args.is_standalone_broker());
+    }
+
+    // === apply_defaults + validate integration ===
+
+    #[test]
+    fn test_defaults_then_validate_host_only() {
+        let mut args = default_args();
+        args.host = Some("localhost".to_string());
+
+        args.apply_defaults();
+        assert!(args.validate().is_ok());
+        assert_eq!(args.mode, Some(Mode::Record));
+    }
+
+    #[test]
+    fn test_defaults_then_validate_host_and_serve() {
+        let mut args = default_args();
+        args.host = Some("localhost".to_string());
+        args.serve = true;
+
+        args.apply_defaults();
+        assert!(args.validate().is_ok());
+        assert_eq!(args.mode, Some(Mode::Mirror));
+    }
+
+    #[test]
+    fn test_defaults_then_validate_serve_only_standalone() {
+        let mut args = default_args();
+        args.serve = true;
+
+        args.apply_defaults();
+        assert!(args.validate().is_ok());
+        assert!(args.is_standalone_broker());
     }
 }

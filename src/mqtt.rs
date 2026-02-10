@@ -684,6 +684,11 @@ impl MqttClientV5 {
         self.client.disconnect().await?;
         Ok(())
     }
+
+    /// Get a clone of the eventloop Arc for spawning a background poll task.
+    pub fn eventloop(&self) -> Arc<Mutex<rumqttc::v5::EventLoop>> {
+        Arc::clone(&self.eventloop)
+    }
 }
 
 /// Protocol-agnostic MQTT client that wraps either a v4 or v5 client.
@@ -1009,5 +1014,30 @@ mod tests {
         } else {
             panic!("Expected TLS error");
         }
+    }
+
+    #[tokio::test]
+    async fn test_mqtt_client_v5_eventloop_accessor() {
+        let config = MqttClientConfig::new("127.0.0.1".to_string(), 1883, "test".to_string());
+        let client = MqttClientV5::new(config).await.unwrap();
+        let el = client.eventloop();
+        // Should be able to clone the Arc and lock it
+        assert!(el.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mqtt_client_v5_keep_alive() {
+        let config = MqttClientConfig::new("127.0.0.1".to_string(), 1883, "test".to_string());
+        // Just verify construction succeeds with the configured keep_alive
+        let client = MqttClientV5::new(config).await;
+        assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mqtt_client_channel_capacity() {
+        let config = MqttClientConfig::new("127.0.0.1".to_string(), 1883, "test".to_string());
+        // Verify client creates successfully with 256 channel capacity
+        let client = MqttClient::new(config).await;
+        assert!(client.is_ok());
     }
 }

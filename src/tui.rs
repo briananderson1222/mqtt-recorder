@@ -19,6 +19,16 @@ use std::{
 };
 use tokio::sync::broadcast;
 
+/// Generate a default CSV filename from an optional host and current timestamp.
+pub fn generate_default_filename(host: Option<&str>) -> String {
+    let safe_host: String = host.unwrap_or("recording")
+        .chars()
+        .map(|c| if c == '.' || c == ':' { '-' } else { c })
+        .collect();
+    let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+    format!("{}-{}.csv", safe_host, timestamp)
+}
+
 /// Application mode (for compatibility, but mirroring/recording are now separate flags)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
@@ -91,6 +101,7 @@ impl AuditArea {
 
 /// Shared state for the TUI
 pub struct TuiState {
+    pub session_id: String,
     pub received_count: AtomicU64,
     pub mirrored_count: AtomicU64,
     pub replayed_count: AtomicU64,
@@ -115,16 +126,26 @@ pub struct TuiState {
     last_error: std::sync::Mutex<Option<String>>,
     broker_connections: AtomicUsize,
     // Timing fields
+    first_connected_at: std::sync::Mutex<Option<Instant>>,
     connected_at: std::sync::Mutex<Option<Instant>>,
+    source_enabled_at: std::sync::Mutex<Option<Instant>>,
+    mirror_enabled_at: std::sync::Mutex<Option<Instant>>,
+    mirror_start_count: std::sync::Mutex<(u64, u64)>, // (mirrored, published) at session start
     broker_started_at: Instant,
     recording_started: std::sync::Mutex<Option<Instant>>,
     recording_start_count: std::sync::Mutex<u64>,
     playback_started: std::sync::Mutex<Option<Instant>>,
+    playback_start_count: std::sync::Mutex<u64>,
+    // Playback mode
+    pub playback_looping: AtomicBool,
+    pub playback_finished: AtomicBool,
+    // Audit
     audit_log: std::sync::Mutex<Vec<AuditEntry>>,
     audit_file: std::sync::Mutex<Option<std::fs::File>>,
     audit_file_path: std::sync::Mutex<Option<String>>,
     audit_file_enabled: AtomicBool,
     audit_enabled: AtomicBool,
+    file_line_cache: std::sync::Mutex<std::collections::HashMap<String, (usize, Instant)>>,
 }
 
 impl TuiState {
@@ -142,7 +163,10 @@ impl TuiState {
     ) -> Self {
         // Default recording to ON if file path provided, unless explicitly set
         let recording = initial_record.unwrap_or(file_path.is_some());
+        let session_id = format!("{:08x}", std::process::id() as u64 ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() as u64);
         Self {
+            session_id,
             received_count: AtomicU64::new(0),
             mirrored_count: AtomicU64::new(0),
             replayed_count: AtomicU64::new(0),
@@ -165,16 +189,24 @@ impl TuiState {
             quit_requested: AtomicBool::new(false),
             last_error: std::sync::Mutex::new(None),
             broker_connections: AtomicUsize::new(0),
+            first_connected_at: std::sync::Mutex::new(None),
             connected_at: std::sync::Mutex::new(None),
+            source_enabled_at: std::sync::Mutex::new(Some(Instant::now())),
+            mirror_enabled_at: std::sync::Mutex::new(if initial_mirror { Some(Instant::now()) } else { None }),
+            mirror_start_count: std::sync::Mutex::new((0, 0)),
             broker_started_at: Instant::now(),
             recording_started: std::sync::Mutex::new(None),
             recording_start_count: std::sync::Mutex::new(0),
             playback_started: std::sync::Mutex::new(None),
+            playback_start_count: std::sync::Mutex::new(0),
+            playback_looping: AtomicBool::new(false),
+            playback_finished: AtomicBool::new(false),
             audit_log: std::sync::Mutex::new(Vec::new()),
             audit_file: std::sync::Mutex::new(None),
             audit_file_path: std::sync::Mutex::new(None),
             audit_file_enabled: AtomicBool::new(false),
             audit_enabled: AtomicBool::new(audit_enabled),
+            file_line_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -188,12 +220,17 @@ impl TuiState {
             self.push_audit(AuditArea::Source, severity, format!(
                 "{} to {}:{}", label, self.source_host.as_deref().unwrap_or("?"), self.source_port
             ));
-            // Clear error on reconnect
             if let Ok(mut guard) = self.last_error.lock() {
                 *guard = None;
             }
             if let Ok(mut guard) = self.connected_at.lock() {
                 *guard = Some(Instant::now());
+            }
+            // Track first-ever connection
+            if let Ok(mut guard) = self.first_connected_at.lock() {
+                if guard.is_none() {
+                    *guard = Some(Instant::now());
+                }
             }
         } else if !connected && was_connected {
             let uptime = self.connected_at.lock().ok()
@@ -224,8 +261,61 @@ impl TuiState {
     }
 
     /// Get the time when connection was established
+    #[allow(dead_code)]
     pub fn get_connected_since(&self) -> Option<chrono::DateTime<chrono::Local>> {
         self.get_connection_duration().map(|d| chrono::Local::now() - chrono::Duration::from_std(d).unwrap_or_default())
+    }
+
+    /// Get the time of first-ever connection (never resets)
+    pub fn get_first_connected_since(&self) -> Option<chrono::DateTime<chrono::Local>> {
+        self.first_connected_at.lock().ok()
+            .and_then(|g| g.map(|t| t.elapsed()))
+            .map(|d| chrono::Local::now() - chrono::Duration::from_std(d).unwrap_or_default())
+    }
+
+    /// Get elapsed since source was last enabled (resets on toggle)
+    pub fn get_source_enabled_elapsed(&self) -> Option<Duration> {
+        if self.source_enabled.load(Ordering::Relaxed) {
+            self.source_enabled_at.lock().ok().and_then(|g| g.map(|t| t.elapsed()))
+        } else {
+            None
+        }
+    }
+
+    /// Reset source enabled timer
+    pub fn reset_source_enabled_at(&self) {
+        if let Ok(mut guard) = self.source_enabled_at.lock() {
+            *guard = Some(Instant::now());
+        }
+    }
+
+    /// Get elapsed since mirror was last enabled (resets on toggle)
+    pub fn get_mirror_enabled_elapsed(&self) -> Option<Duration> {
+        if self.mirroring_enabled.load(Ordering::Relaxed) {
+            self.mirror_enabled_at.lock().ok().and_then(|g| g.map(|t| t.elapsed()))
+        } else {
+            None
+        }
+    }
+
+    /// Reset mirror enabled timer
+    pub fn set_mirror_enabled_at(&self, enabled: bool) {
+        if let Ok(mut guard) = self.mirror_enabled_at.lock() {
+            *guard = if enabled { Some(Instant::now()) } else { None };
+        }
+        if enabled {
+            if let Ok(mut guard) = self.mirror_start_count.lock() {
+                *guard = (self.mirrored_count.load(Ordering::Relaxed), self.published_count.load(Ordering::Relaxed));
+            }
+        }
+    }
+
+    /// Get mirror session counts: (mirrored_this_session, published_this_session)
+    pub fn get_mirror_session_counts(&self) -> (u64, u64) {
+        let m_total = self.mirrored_count.load(Ordering::Relaxed);
+        let p_total = self.published_count.load(Ordering::Relaxed);
+        let (m_start, p_start) = self.mirror_start_count.lock().ok().map(|g| *g).unwrap_or((0, 0));
+        (m_total.saturating_sub(m_start), p_total.saturating_sub(p_start))
     }
 
     // === Broker timing ===
@@ -262,17 +352,35 @@ impl TuiState {
         None
     }
 
+    /// Get the number of messages recorded in the current session
+    pub fn get_recording_session_count(&self) -> u64 {
+        let total = self.recorded_count.load(Ordering::Relaxed);
+        let start = self.recording_start_count.lock().ok().map(|g| *g).unwrap_or(0);
+        total.saturating_sub(start)
+    }
+
     // === Playback timing ===
     pub fn start_playback_session(&self) {
         if let Ok(mut guard) = self.playback_started.lock() {
             *guard = Some(Instant::now());
         }
+        if let Ok(mut guard) = self.playback_start_count.lock() {
+            *guard = self.replayed_count.load(Ordering::Relaxed);
+        }
+        self.playback_finished.store(false, Ordering::Relaxed);
     }
 
     pub fn stop_playback_session(&self) {
         if let Ok(mut guard) = self.playback_started.lock() {
             *guard = None;
         }
+    }
+
+    /// Get the number of messages replayed in the current session
+    pub fn get_playback_session_count(&self) -> u64 {
+        let total = self.replayed_count.load(Ordering::Relaxed);
+        let start = self.playback_start_count.lock().ok().map(|g| *g).unwrap_or(0);
+        total.saturating_sub(start)
     }
 
     pub fn get_playback_duration(&self) -> Option<Duration> {
@@ -282,6 +390,19 @@ impl TuiState {
             }
         }
         None
+    }
+
+    #[allow(dead_code)]
+    pub fn is_playback_active(&self) -> bool {
+        self.loop_enabled.load(Ordering::Relaxed) && !self.is_recording()
+    }
+
+    pub fn is_playback_looping(&self) -> bool {
+        self.playback_looping.load(Ordering::Relaxed)
+    }
+
+    pub fn is_playback_finished(&self) -> bool {
+        self.playback_finished.load(Ordering::Relaxed)
     }
 
     /// Add a file to the playlist (used when switching files)
@@ -377,7 +498,7 @@ impl TuiState {
             AuditSeverity::Warn => "WARN",
             AuditSeverity::Error => "ERR ",
         };
-        let flat = format!("{} [{}] [{}] {}", ts, area.label(), sev, message);
+        let flat = format!("{} [{}] [{}] [{}] {}", ts, self.session_id, area.label(), sev, message);
         let entry = AuditEntry { timestamp: ts, area, severity, message };
         if let Ok(mut log) = self.audit_log.lock() {
             log.push(entry);
@@ -402,9 +523,23 @@ impl TuiState {
         }
     }
 
+    pub fn get_audit_file_path(&self) -> Option<String> {
+        self.audit_file_path.lock().ok().and_then(|g| g.clone())
+    }
+
+    pub fn is_audit_enabled(&self) -> bool {
+        self.audit_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn is_audit_file_enabled(&self) -> bool {
+        self.audit_file_enabled.load(Ordering::Relaxed)
+    }
+
     pub fn enable_audit_file(&self) {
         let path = self.audit_file_path.lock().ok().and_then(|g| g.clone());
         if let Some(path) = path {
+            // Preload existing file content into TUI log
+            self.preload_audit_file(&path);
             use std::fs::OpenOptions;
             match OpenOptions::new().create(true).append(true).open(&path) {
                 Ok(file) => {
@@ -416,6 +551,45 @@ impl TuiState {
                 Err(e) => {
                     self.set_error(format!("Failed to open audit log file: {}", e));
                 }
+            }
+        }
+    }
+
+    fn preload_audit_file(&self, path: &str) {
+        use std::io::BufRead;
+        let file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let reader = std::io::BufReader::new(file);
+        if let Ok(mut log) = self.audit_log.lock() {
+            for line in reader.lines().map_while(Result::ok) {
+                // Parse: "HH:MM:SS [session_id] [AREA] [SEV] message"
+                let parts: Vec<&str> = line.splitn(5, ' ').collect();
+                if parts.len() >= 5 {
+                    let timestamp = parts[0].to_string();
+                    let area_str = parts[2].trim_matches(|c| c == '[' || c == ']');
+                    let sev_str = parts[3].trim_matches(|c| c == '[' || c == ']').trim();
+                    let message = parts[4].to_string();
+                    let area = match area_str {
+                        "SRC" => AuditArea::Source,
+                        "BRK" => AuditArea::Broker,
+                        "REC" => AuditArea::Record,
+                        "PLY" => AuditArea::Playback,
+                        "MIR" => AuditArea::Mirror,
+                        _ => AuditArea::System,
+                    };
+                    let severity = match sev_str {
+                        "WARN" => AuditSeverity::Warn,
+                        "ERR" => AuditSeverity::Error,
+                        _ => AuditSeverity::Info,
+                    };
+                    log.push(AuditEntry { timestamp, area, severity, message });
+                }
+            }
+            // Trim to last 200 entries
+            while log.len() > 200 {
+                log.remove(0);
             }
         }
     }
@@ -445,6 +619,25 @@ impl TuiState {
         self.audit_log.lock().ok().map(|g| g.clone()).unwrap_or_default()
     }
 
+    /// Get line count for a file, cached for 2 seconds.
+    pub fn get_file_line_count(&self, path: &str) -> Option<usize> {
+        if let Ok(mut cache) = self.file_line_cache.lock() {
+            if let Some((count, checked)) = cache.get(path) {
+                if checked.elapsed() < Duration::from_secs(2) {
+                    return Some(*count);
+                }
+            }
+            // Count lines (subtract 1 for CSV header)
+            if let Ok(file) = std::fs::File::open(path) {
+                use std::io::BufRead;
+                let count = std::io::BufReader::new(file).lines().count().saturating_sub(1);
+                cache.insert(path.to_string(), (count, Instant::now()));
+                return Some(count);
+            }
+        }
+        None
+    }
+
     pub fn set_broker_connections(&self, count: usize) {
         let old = self.broker_connections.swap(count, Ordering::Relaxed);
         if old != count {
@@ -469,14 +662,7 @@ impl TuiState {
 
     /// Generate a default filename based on source host and current timestamp
     pub fn generate_default_filename(&self) -> String {
-        let host = self.source_host.as_deref().unwrap_or("recording");
-        // Sanitize host for filename (replace dots and colons)
-        let safe_host: String = host
-            .chars()
-            .map(|c| if c == '.' || c == ':' { '-' } else { c })
-            .collect();
-        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        format!("{}-{}.csv", safe_host, timestamp)
+        generate_default_filename(self.source_host.as_deref())
     }
 
     /// Set a new file path - appends .csv if not present, adds old file to playlist
@@ -573,10 +759,22 @@ impl TuiState {
     }
 
     pub fn request_quit(&self) {
+        let uptime = self.get_broker_uptime();
+        let secs = uptime.as_secs();
+        let uptime_str = if secs >= 3600 {
+            format!("{}h{}m{}s", secs / 3600, (secs % 3600) / 60, secs % 60)
+        } else if secs >= 60 {
+            format!("{}m{}s", secs / 60, secs % 60)
+        } else {
+            format!("{}s", secs)
+        };
         self.push_audit(AuditArea::System, AuditSeverity::Info, format!(
-            "Quit requested — received {}, mirrored {}, recorded {}, replayed {}",
+            "Session {} shutting down — uptime {}, received {}, mirrored {}, published {}, recorded {}, replayed {}",
+            self.session_id,
+            uptime_str,
             self.get_received_count(),
             self.get_mirrored_count(),
+            self.get_published_count(),
             self.get_recorded_count(),
             self.get_replayed_count(),
         ));
@@ -617,6 +815,7 @@ impl Terminal {
         &mut self,
         state: &TuiState,
         input_mode: bool,
+        input_target_audit: bool,
         input_buffer: &str,
         log_scroll: usize,
     ) -> std::io::Result<()> {
@@ -639,12 +838,17 @@ impl Terminal {
             let loop_on = state.loop_enabled.load(Ordering::Relaxed);
             let record_on = state.is_recording();
             let playback_on = loop_on && !record_on;
+            let playback_finished = state.is_playback_finished();
+            let playback_looping = state.is_playback_looping();
             let broker_clients = state.get_broker_connections();
 
             // Get timing info
-            let conn_duration = state.get_connection_duration();
+            let _conn_duration = state.get_connection_duration();
+            let source_elapsed = state.get_source_enabled_elapsed();
+            let mirror_elapsed = state.get_mirror_enabled_elapsed();
             let rec_duration = state.get_recording_duration();
             let play_duration = state.get_playback_duration();
+            let first_connected = state.get_first_connected_since();
 
             let has_error = error.is_some();
             let dim = Style::default().fg(Color::DarkGray);
@@ -700,6 +904,10 @@ impl Terminal {
             // Outer frame
             let outer = Block::default()
                 .title(" mqtt-recorder ")
+                .title_bottom(Line::from(Span::styled(
+                    format!(" {} ", state.session_id),
+                    Style::default().fg(Color::DarkGray),
+                )).alignment(Alignment::Right))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan));
             let inner = outer.inner(area);
@@ -710,7 +918,7 @@ impl Terminal {
                 Constraint::Min(8),
                 Constraint::Length(6), // Audit log
                 Constraint::Length(1),
-                Constraint::Length(1),
+                Constraint::Length(2), // Controls (wraps)
             ])
             .split(inner);
 
@@ -729,35 +937,39 @@ impl Terminal {
             } else {
                 Span::styled("◐", Style::default().fg(Color::Yellow))
             };
+            // Timing for top-right: first connected date + elapsed since enabled
+            let source_timing: Vec<Span> = if let Some(dt) = first_connected {
+                let date_str = dt.format("%m/%d %H:%M").to_string();
+                let elapsed_str = source_elapsed.map(|d| format!(" (+{})", fmt_dur(d))).unwrap_or_default();
+                vec![
+                    Span::styled(date_str, dim),
+                    Span::styled(elapsed_str, Style::default().fg(Color::Green)),
+                    Span::raw(" "),
+                ]
+            } else {
+                vec![]
+            };
             let source_block = Block::default()
                 .title(Line::from(vec![
                     " Source ".into(),
                     source_health,
                     " ".into(),
                 ]))
+                .title(Line::from(source_timing).alignment(Alignment::Right))
+                .title_bottom(Line::from(Span::styled(format!(" {} ", source_url), dim)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(source_color))
                 .padding(Padding::horizontal(1));
             let si = source_block.inner(cols[0]);
             frame.render_widget(source_block, cols[0]);
 
-            // Source content with connection duration
-            let conn_status = if let Some(d) = conn_duration {
-                let since = state.get_connected_since();
-                let date_str = since
-                    .map(|dt| dt.format("%m/%d %H:%M").to_string())
-                    .unwrap_or_default();
-                Line::from(vec![
-                    Span::styled(format!("{} ", date_str), dim),
-                    Span::styled(fmt_dur(d), Style::default().fg(Color::Green)),
-                ])
-            } else if source_on {
-                Line::from(Span::styled(
-                    "Connecting...",
-                    Style::default().fg(Color::Yellow),
-                ))
-            } else {
+            // Source content
+            let conn_status = if !source_on {
                 Line::from(Span::styled("Disabled", dim))
+            } else if source_connected {
+                Line::from(Span::styled("Connected", Style::default().fg(Color::Green)))
+            } else {
+                Line::from(Span::styled("Connecting...", Style::default().fg(Color::Yellow)))
             };
             frame.render_widget(
                 Paragraph::new(vec![
@@ -766,7 +978,6 @@ impl Terminal {
                         Span::styled(format!("{}", received), bright),
                     ]),
                     conn_status,
-                    Line::from(Span::styled(&source_url, dim)),
                 ])
                 .wrap(Wrap { trim: false }),
                 si,
@@ -774,22 +985,26 @@ impl Terminal {
 
             // === BROKER (right, full height) ===
             let broker_health = Span::styled("●", Style::default().fg(broker_color));
+            let broker_uptime = state.get_broker_uptime();
+            let broker_started = state.get_broker_started_at();
+            let broker_date_str = broker_started.format("%m/%d %H:%M").to_string();
             let broker_block = Block::default()
                 .title(Line::from(vec![
                     " Broker ".into(),
                     broker_health,
                     " ".into(),
                 ]))
+                .title(Line::from(vec![
+                    Span::styled(broker_date_str, dim),
+                    Span::styled(format!(" (+{}) ", fmt_dur(broker_uptime)), Style::default().fg(Color::Green)),
+                ]).alignment(Alignment::Right))
+                .title_bottom(Line::from(Span::styled(format!(" {} ", broker_url), dim)))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(broker_color))
                 .padding(Padding::horizontal(1));
             let bi = broker_block.inner(cols[2]);
             frame.render_widget(broker_block, cols[2]);
 
-            // Broker uptime
-            let broker_uptime = state.get_broker_uptime();
-            let broker_started = state.get_broker_started_at();
-            let broker_date_str = broker_started.format("%m/%d %H:%M").to_string();
             let clients_style = if broker_clients > 0 { bright } else { dim };
             frame.render_widget(
                 Paragraph::new(vec![
@@ -801,11 +1016,6 @@ impl Terminal {
                         "Clients: ".into(),
                         Span::styled(format!("{}", broker_clients), clients_style),
                     ]),
-                    Line::from(vec![
-                        Span::styled(format!("{} ", broker_date_str), dim),
-                        Span::styled(fmt_dur(broker_uptime), Style::default().fg(Color::Green)),
-                    ]),
-                    Line::from(Span::styled(&broker_url, dim)),
                 ])
                 .wrap(Wrap { trim: false }),
                 bi,
@@ -822,17 +1032,24 @@ impl Terminal {
             // --- Path 1: Mirror (Source → Mirror → Broker) ---
             let m_arrow_l = if mirror_on && source_on { "→" } else { " " };
             let m_arrow_r = if mirror_on { "→" } else { " " };
+            let mirror_elapsed_spans: Vec<Span> = if let Some(d) = mirror_elapsed {
+                vec![Span::styled(format!(" +{} ", fmt_dur(d)), Style::default().fg(Color::Yellow))]
+            } else {
+                vec![]
+            };
             let mirror_block = Block::default()
                 .title(Line::from(vec![
                     Span::styled(m_arrow_l, Style::default().fg(mirror_color)),
                     " Mirror ".into(),
                     if mirror_on {
-                        Span::styled("● ON ", Style::default().fg(mirror_color).bold())
+                        Span::styled("●", Style::default().fg(mirror_color).bold())
                     } else {
-                        Span::styled("○ off ", dim)
+                        Span::styled("○", dim)
                     },
+                    " ".into(),
                     Span::styled(m_arrow_r, Style::default().fg(mirror_color)),
                 ]))
+                .title(Line::from(mirror_elapsed_spans).alignment(Alignment::Right))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(mirror_color))
                 .padding(Padding::horizontal(1));
@@ -910,10 +1127,12 @@ impl Terminal {
             let active_idx = state.get_playlist_index();
             let file_lines: Vec<Line> = if all_files.is_empty() {
                 let f = state.get_file_path().unwrap_or_else(|| "none".to_string());
-                vec![Line::from(Span::styled(
-                    f,
-                    Style::default().fg(Color::White),
-                ))]
+                let count_str = state.get_file_line_count(&f)
+                    .map(|c| format!(" ({})", c)).unwrap_or_default();
+                vec![Line::from(vec![
+                    Span::styled(f.clone(), Style::default().fg(Color::White)),
+                    Span::styled(count_str, dim),
+                ])]
             } else {
                 all_files
                     .iter()
@@ -934,7 +1153,12 @@ impl Terminal {
                         } else {
                             dim
                         };
-                        Line::from(Span::styled(format!("{}{}", prefix, f), style))
+                        let count_str = state.get_file_line_count(f)
+                            .map(|c| format!(" ({})", c)).unwrap_or_default();
+                        Line::from(vec![
+                            Span::styled(format!("{}{}", prefix, f), style),
+                            Span::styled(count_str, dim),
+                        ])
                     })
                     .collect()
             };
@@ -942,19 +1166,24 @@ impl Terminal {
 
             // Playback (Playback → Broker)
             let p_arrow = if playback_on { "→" } else { " " };
-            let pb_label = if playback_on { "◆ on " } else { "○ off " };
+            let pb_label = if playback_finished {
+                ("◇ done ", dim)
+            } else if playback_on && playback_looping {
+                ("◆ loop ", Style::default().fg(playback_color).bold())
+            } else if playback_on {
+                ("◆ once ", Style::default().fg(playback_color).bold())
+            } else {
+                ("○ off ", dim)
+            };
             let playback_block = Block::default()
                 .title(Line::from(vec![
                     " Playback ".into(),
-                    if playback_on {
-                        Span::styled(pb_label, Style::default().fg(playback_color).bold())
-                    } else {
-                        Span::styled(pb_label, dim)
-                    },
+                    Span::styled(pb_label.0, pb_label.1),
+                    " ".into(),
                     Span::styled(p_arrow, Style::default().fg(playback_color)),
                 ]))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(playback_color))
+                .border_style(Style::default().fg(if playback_finished { Color::DarkGray } else { playback_color }))
                 .padding(Padding::horizontal(1));
             let pi = playback_block.inner(path2[2]);
             frame.render_widget(playback_block, path2[2]);
@@ -974,15 +1203,32 @@ impl Terminal {
 
             // === AUDIT LOG ===
             let audit_entries = state.get_audit_log();
+            let audit_on = state.is_audit_enabled();
+            let audit_file_on = state.is_audit_file_enabled();
             let scroll_indicator = if log_scroll > 0 {
                 format!(" Log ↑{} ", log_scroll)
             } else {
                 " Log ".to_string()
             };
+            let mut title_spans: Vec<Span> = vec![Span::raw(scroll_indicator)];
+            if audit_on {
+                title_spans.push(Span::styled("●", Style::default().fg(Color::Green).bold()));
+            } else {
+                title_spans.push(Span::styled("○", dim));
+            }
+            title_spans.push(Span::raw(" "));
+            if let Some(path) = state.get_audit_file_path() {
+                if audit_file_on {
+                    title_spans.push(Span::styled(format!("{} ", path), Style::default().fg(Color::Green)));
+                } else {
+                    title_spans.push(Span::styled(format!("{} ", path), dim));
+                }
+            }
+            let audit_color = if audit_on { Color::DarkGray } else { Color::Red };
             let audit_block = Block::default()
-                .title(scroll_indicator)
+                .title(Line::from(title_spans).alignment(Alignment::Center))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray));
+                .border_style(Style::default().fg(audit_color));
             let audit_inner = audit_block.inner(vert[1]);
             frame.render_widget(audit_block, vert[1]);
             let visible = audit_inner.height as usize;
@@ -1026,7 +1272,14 @@ impl Terminal {
             }
 
             // === CONTROLS ===
-            let controls = if input_mode {
+            let controls = if input_mode && input_target_audit {
+                Line::from(vec![
+                    " Audit log: ".into(),
+                    Span::styled(input_buffer, Style::default().fg(Color::White)),
+                    Span::styled("█", Style::default().fg(Color::White)),
+                    "  [Enter] Save  [Esc] Cancel".into(),
+                ])
+            } else if input_mode {
                 Line::from(vec![
                     " New file: ".into(),
                     Span::styled(input_buffer, Style::default().fg(Color::White)),
@@ -1035,19 +1288,31 @@ impl Terminal {
                     "  [Enter] Save  [Esc] Cancel".into(),
                 ])
             } else {
+                let audit_on = state.is_audit_enabled();
+                let audit_color = if audit_on { Color::Green } else { Color::DarkGray };
+                let loop_ind = if loop_on { "●" } else { "○" };
+                let src_ind = if source_on { "●" } else { "○" };
+                let mir_ind = if mirror_on { "●" } else { "○" };
+                let rec_ind = if record_on { "●" } else { "○" };
+                let ply_ind = if playback_on { "●" } else { "○" };
+                let aud_ind = if audit_on { "●" } else { "○" };
                 Line::from(vec![
-                    Span::styled(" [s]", Style::default().fg(Color::Cyan)),
-                    " Source  ".into(),
-                    Span::styled("[m]", Style::default().fg(Color::Yellow)),
-                    " Mirror  ".into(),
-                    Span::styled("[r]", Style::default().fg(Color::Green)),
-                    " Record  ".into(),
-                    Span::styled("[p]", Style::default().fg(Color::Magenta)),
-                    " Playback  ".into(),
+                    Span::styled(" [s]", Style::default().fg(source_color)),
+                    Span::styled(format!(" Source {} ", src_ind), Style::default().fg(source_color)),
+                    Span::styled("[m]", Style::default().fg(mirror_color)),
+                    Span::styled(format!(" Mirror {} ", mir_ind), Style::default().fg(mirror_color)),
+                    Span::styled("[r]", Style::default().fg(record_color)),
+                    Span::styled(format!(" Record {} ", rec_ind), Style::default().fg(record_color)),
+                    Span::styled("[p]", Style::default().fg(playback_color)),
+                    Span::styled(format!(" Play {} ", ply_ind), Style::default().fg(playback_color)),
+                    Span::styled("[l]", Style::default().fg(playback_color)),
+                    Span::styled(format!(" Loop {} ", loop_ind), Style::default().fg(playback_color)),
                     Span::styled("[f]", Style::default().fg(Color::White)),
-                    " File  ".into(),
-                    Span::styled("[a]", Style::default().fg(Color::DarkGray)),
-                    " Audit  ".into(),
+                    " New File  ".into(),
+                    Span::styled("[a]", Style::default().fg(audit_color)),
+                    Span::styled(format!(" Audit {} ", aud_ind), Style::default().fg(audit_color)),
+                    Span::styled("[A]", Style::default().fg(audit_color)),
+                    " Log File  ".into(),
                     Span::styled("[↑↓]", dim),
                     " Select  ".into(),
                     Span::styled("[j/k]", dim),
@@ -1056,7 +1321,7 @@ impl Terminal {
                     " Quit".into(),
                 ])
             };
-            frame.render_widget(Paragraph::new(controls), vert[3]);
+            frame.render_widget(Paragraph::new(controls).wrap(Wrap { trim: false }), vert[3]);
         })?;
         Ok(())
     }
@@ -1079,7 +1344,7 @@ pub async fn run_tui(
 
     // Log session start
     {
-        let mut info = format!("Session started — broker :{}", state.broker_port);
+        let mut info = format!("Session {} started — broker localhost:{}", state.session_id, state.broker_port);
         if let Some(ref host) = state.source_host {
             info.push_str(&format!(", source {}:{}", host, state.source_port));
         }
@@ -1089,6 +1354,7 @@ pub async fn run_tui(
         state.push_audit(AuditArea::System, AuditSeverity::Info, info);
     }
     let mut input_mode = false;
+    let mut input_target_audit = false; // false = file, true = audit log path
     let mut input_buffer = String::new();
     let mut log_scroll: usize = 0;
     let mut log_pinned_bottom = true;
@@ -1097,7 +1363,7 @@ pub async fn run_tui(
         if log_pinned_bottom {
             log_scroll = 0;
         }
-        terminal.draw(&state, input_mode, &input_buffer, log_scroll)?;
+        terminal.draw(&state, input_mode, input_target_audit, &input_buffer, log_scroll)?;
 
         // Poll for events with timeout
         if event::poll(Duration::from_millis(100))? {
@@ -1108,7 +1374,25 @@ pub async fn run_tui(
                         match key.code {
                             KeyCode::Enter => {
                                 if !input_buffer.is_empty() {
-                                    state.set_new_file(input_buffer.clone());
+                                    if input_target_audit {
+                                        let prev = state.get_audit_file_path();
+                                        if let Some(ref p) = prev {
+                                            if *p != input_buffer {
+                                                // Write transition message to OLD file before switching
+                                                state.push_audit(AuditArea::System, AuditSeverity::Info,
+                                                    format!("Audit log file switching to {}", input_buffer));
+                                            }
+                                        }
+                                        state.set_audit_file_path(input_buffer.clone());
+                                        state.enable_audit_file();
+                                        let msg = match prev {
+                                            Some(p) if p != input_buffer => format!("Audit log file set to {} (was {})", input_buffer, p),
+                                            _ => format!("Audit log file set to {}", input_buffer),
+                                        };
+                                        state.push_audit(AuditArea::System, AuditSeverity::Info, msg);
+                                    } else {
+                                        state.set_new_file(input_buffer.clone());
+                                    }
                                 }
                                 input_buffer.clear();
                                 input_mode = false;
@@ -1144,21 +1428,34 @@ pub async fn run_tui(
                             }
                             KeyCode::Char('m') => {
                                 let enabling = !state.is_mirroring();
+                                if !enabling {
+                                    // Capture session stats before toggling
+                                    let (m_session, p_session) = state.get_mirror_session_counts();
+                                    let elapsed = state.get_mirror_enabled_elapsed();
+                                    let dur_str = elapsed.map(|d| format!(" in {}s", d.as_secs())).unwrap_or_default();
+                                    state.push_audit(AuditArea::Mirror, AuditSeverity::Info, format!(
+                                        "Mirror OFF ({} mirrored, {} published this session{}, {} total)",
+                                        m_session, p_session, dur_str, state.get_mirrored_count()
+                                    ));
+                                }
                                 state.set_mirroring(enabling);
-                                state.push_audit(AuditArea::Mirror, AuditSeverity::Info, format!(
-                                    "Mirror {} (mirrored: {}, published: {})",
-                                    if enabling { "ON" } else { "OFF" },
-                                    state.get_mirrored_count(), state.get_published_count()
-                                ));
+                                state.set_mirror_enabled_at(enabling);
+                                if enabling {
+                                    state.push_audit(AuditArea::Mirror, AuditSeverity::Info, format!(
+                                        "Mirror ON (total: {} mirrored, {} published)",
+                                        state.get_mirrored_count(), state.get_published_count()
+                                    ));
+                                }
                             }
                             KeyCode::Char('r') => {
                                 let enabling = !state.is_recording();
                                 if enabling {
                                     // Record and Playback are mutually exclusive
                                     if state.loop_enabled.load(Ordering::Relaxed) {
-                                        let replayed = state.get_replayed_count();
+                                        let session = state.get_playback_session_count();
+                                        let total = state.get_replayed_count();
                                         state.push_audit(AuditArea::Playback, AuditSeverity::Info, format!(
-                                            "Playback OFF ({} replayed) — recording enabled", replayed
+                                            "Playback OFF ({} this session, {} total) — recording enabled", session, total
                                         ));
                                     }
                                     state.loop_enabled.store(false, Ordering::Relaxed);
@@ -1172,61 +1469,104 @@ pub async fn run_tui(
                                         "Recording ON → {}", file
                                     ));
                                 } else {
-                                    let recorded = state.get_recorded_count();
+                                    let session = state.get_recording_session_count();
+                                    let total = state.get_recorded_count();
                                     let dur = state.get_recording_duration();
                                     let dur_str = dur.map(|d| format!(" in {}s", d.as_secs())).unwrap_or_default();
                                     state.stop_recording_session();
                                     state.push_audit(AuditArea::Record, AuditSeverity::Info, format!(
-                                        "Recording OFF ({} msgs{})", recorded, dur_str
+                                        "Recording OFF ({} this session{}, {} total)", session, dur_str, total
                                     ));
                                 }
                                 state.set_recording(enabling);
                             }
                             KeyCode::Char('s') => {
                                 let enabling = !state.is_source_enabled();
+                                if !enabling {
+                                    let elapsed = state.get_source_enabled_elapsed();
+                                    let dur_str = elapsed.map(|d| format!(" in {}s", d.as_secs())).unwrap_or_default();
+                                    state.push_audit(AuditArea::Source, AuditSeverity::Info, format!(
+                                        "Source disabled (received: {}{}, connected: {})",
+                                        state.get_received_count(), dur_str,
+                                        if state.is_source_connected() { "yes" } else { "no" }
+                                    ));
+                                }
                                 state.set_source_enabled(enabling);
-                                state.push_audit(AuditArea::Source, AuditSeverity::Info, format!(
-                                    "Source {} (received: {})",
-                                    if enabling { "enabled" } else { "disabled" },
-                                    state.get_received_count()
-                                ));
+                                if enabling {
+                                    state.reset_source_enabled_at();
+                                    state.push_audit(AuditArea::Source, AuditSeverity::Info, format!(
+                                        "Source enabled (received: {})",
+                                        state.get_received_count()
+                                    ));
+                                }
                             }
                             KeyCode::Char('f') => {
                                 input_mode = true;
+                                input_target_audit = false;
                                 input_buffer.clear();
+                            }
+                            KeyCode::Char('A') => {
+                                input_mode = true;
+                                input_target_audit = true;
+                                input_buffer = state.get_audit_file_path().unwrap_or_default();
                             }
                             KeyCode::Char('p') => {
                                 // Only allow playback if there's an active file
                                 if state.get_active_file().is_some() {
-                                    let enabling = !state.loop_enabled.load(Ordering::Relaxed);
-                                    if enabling {
-                                        // Playback and Record are mutually exclusive
-                                        if state.is_recording() {
-                                            let recorded = state.get_recorded_count();
-                                            let dur = state.get_recording_duration();
-                                            let dur_str = dur.map(|d| format!(" in {}s", d.as_secs())).unwrap_or_default();
-                                            state.stop_recording_session();
-                                            state.push_audit(AuditArea::Record, AuditSeverity::Info, format!(
-                                                "Recording OFF ({} msgs{}) — playback enabled", recorded, dur_str
+                                    let is_finished = state.is_playback_finished();
+                                    let is_on = state.loop_enabled.load(Ordering::Relaxed);
+
+                                    if is_finished || !is_on {
+                                        // Starting playback (or restarting after done)
+                                        if is_on && is_finished {
+                                            // Restart: clear finished, reset session
+                                            state.start_playback_session();
+                                            let file = state.get_active_file().unwrap_or_default();
+                                            state.push_audit(AuditArea::Playback, AuditSeverity::Info, format!(
+                                                "Playback restarted → {}", file
                                             ));
+                                        } else {
+                                            // Fresh start
+                                            if state.is_recording() {
+                                                let session = state.get_recording_session_count();
+                                                let total = state.get_recorded_count();
+                                                let dur = state.get_recording_duration();
+                                                let dur_str = dur.map(|d| format!(" in {}s", d.as_secs())).unwrap_or_default();
+                                                state.stop_recording_session();
+                                                state.push_audit(AuditArea::Record, AuditSeverity::Info, format!(
+                                                    "Recording OFF ({} this session{}, {} total) — playback enabled", session, dur_str, total
+                                                ));
+                                            }
+                                            state.set_recording(false);
+                                            state.start_playback_session();
+                                            let mode = if state.is_playback_looping() { "loop" } else { "once" };
+                                            let file = state.get_active_file().unwrap_or_default();
+                                            state.push_audit(AuditArea::Playback, AuditSeverity::Info, format!(
+                                                "Playback ON ({}) → {}", mode, file
+                                            ));
+                                            state.loop_enabled.store(true, Ordering::Relaxed);
                                         }
-                                        state.set_recording(false);
-                                        state.start_playback_session();
-                                        let file = state.get_active_file().unwrap_or_default();
-                                        state.push_audit(AuditArea::Playback, AuditSeverity::Info, format!(
-                                            "Playback ON → {}", file
-                                        ));
                                     } else {
-                                        let replayed = state.get_replayed_count();
+                                        // Stopping playback
+                                        let session = state.get_playback_session_count();
+                                        let total = state.get_replayed_count();
                                         let dur = state.get_playback_duration();
                                         let dur_str = dur.map(|d| format!(" in {}s", d.as_secs())).unwrap_or_default();
                                         state.stop_playback_session();
                                         state.push_audit(AuditArea::Playback, AuditSeverity::Info, format!(
-                                            "Playback OFF ({} replayed{})", replayed, dur_str
+                                            "Playback OFF ({} this session, {} total{})", session, total, dur_str
                                         ));
+                                        state.loop_enabled.store(false, Ordering::Relaxed);
                                     }
-                                    state.loop_enabled.store(enabling, Ordering::Relaxed);
                                 }
+                            }
+                            KeyCode::Char('l') => {
+                                // Toggle loop mode for playback
+                                let was_looping = state.playback_looping.load(Ordering::Relaxed);
+                                state.playback_looping.store(!was_looping, Ordering::Relaxed);
+                                state.push_audit(AuditArea::Playback, AuditSeverity::Info, format!(
+                                    "Playback mode: {}", if !was_looping { "loop" } else { "once" }
+                                ));
                             }
                             KeyCode::Up => {
                                 state.navigate_selection(-1);
@@ -1260,8 +1600,8 @@ pub async fn run_tui(
             }
         }
 
-        // Check for external shutdown signal
-        if shutdown_rx.try_recv().is_ok() {
+        // Check for external shutdown signal or quit request
+        if shutdown_rx.try_recv().is_ok() || state.is_quit_requested() {
             break;
         }
     }
@@ -1572,5 +1912,366 @@ mod tests {
 
         state.navigate_selection(-1);
         assert_eq!(state.get_selected_index(), 1); // Wrapped backwards
+    }
+
+    // === generate_default_filename free function tests ===
+
+    #[test]
+    fn test_generate_default_filename_with_host() {
+        let filename = super::generate_default_filename(Some("broker.example.com"));
+        assert!(filename.starts_with("broker-example-com-"));
+        assert!(filename.ends_with(".csv"));
+    }
+
+    #[test]
+    fn test_generate_default_filename_no_host() {
+        let filename = super::generate_default_filename(None);
+        assert!(filename.starts_with("recording-"));
+        assert!(filename.ends_with(".csv"));
+    }
+
+    #[test]
+    fn test_generate_default_filename_sanitizes_colons() {
+        let filename = super::generate_default_filename(Some("host:8883"));
+        assert!(filename.starts_with("host-8883-"));
+    }
+
+    #[test]
+    fn test_generate_default_filename_matches_tui_state() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None,
+            Some("test.host".to_string()), 1883, None, true, vec![], true,
+        );
+        let from_state = state.generate_default_filename();
+        let from_fn = super::generate_default_filename(Some("test.host"));
+        // Both should have same prefix (timestamp may differ by a ms)
+        assert_eq!(&from_state[..10], &from_fn[..10]);
+    }
+
+    // === Playback mode tests ===
+
+    #[test]
+    fn test_playback_looping_default_false() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        assert!(!state.is_playback_looping());
+    }
+
+    #[test]
+    fn test_playback_looping_toggle() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.playback_looping.store(true, Ordering::Relaxed);
+        assert!(state.is_playback_looping());
+        state.playback_looping.store(false, Ordering::Relaxed);
+        assert!(!state.is_playback_looping());
+    }
+
+    #[test]
+    fn test_playback_finished_default_false() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        assert!(!state.is_playback_finished());
+    }
+
+    #[test]
+    fn test_playback_finished_cleared_on_start() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.playback_finished.store(true, Ordering::Relaxed);
+        assert!(state.is_playback_finished());
+
+        state.start_playback_session();
+        assert!(!state.is_playback_finished());
+    }
+
+    // === Timing reset tests ===
+
+    #[test]
+    fn test_source_enabled_elapsed_starts_immediately() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        // Source starts enabled, so elapsed should be Some
+        assert!(state.get_source_enabled_elapsed().is_some());
+    }
+
+    #[test]
+    fn test_source_enabled_elapsed_none_when_disabled() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.set_source_enabled(false);
+        assert!(state.get_source_enabled_elapsed().is_none());
+    }
+
+    #[test]
+    fn test_source_enabled_elapsed_resets_on_reenable() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let before = state.get_source_enabled_elapsed().unwrap();
+
+        state.set_source_enabled(false);
+        state.reset_source_enabled_at();
+        state.set_source_enabled(true);
+
+        let after = state.get_source_enabled_elapsed().unwrap();
+        assert!(after < before);
+    }
+
+    #[test]
+    fn test_mirror_enabled_elapsed_some_when_enabled() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        // mirror starts enabled (initial_mirror=true)
+        assert!(state.get_mirror_enabled_elapsed().is_some());
+    }
+
+    #[test]
+    fn test_mirror_enabled_elapsed_none_when_disabled() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.set_mirroring(false);
+        state.set_mirror_enabled_at(false);
+        assert!(state.get_mirror_enabled_elapsed().is_none());
+    }
+
+    #[test]
+    fn test_mirror_enabled_elapsed_resets_on_toggle() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let before = state.get_mirror_enabled_elapsed().unwrap();
+
+        state.set_mirror_enabled_at(false);
+        state.set_mirroring(false);
+        state.set_mirror_enabled_at(true);
+        state.set_mirroring(true);
+
+        let after = state.get_mirror_enabled_elapsed().unwrap();
+        assert!(after < before);
+    }
+
+    // === first_connected_at tests ===
+
+    #[test]
+    fn test_first_connected_at_none_initially() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None,
+            Some("host".to_string()), 1883, None, true, vec![], true,
+        );
+        assert!(state.get_first_connected_since().is_none());
+    }
+
+    #[test]
+    fn test_first_connected_at_set_on_connect() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None,
+            Some("host".to_string()), 1883, None, true, vec![], true,
+        );
+        state.set_source_connected(true);
+        assert!(state.get_first_connected_since().is_some());
+    }
+
+    #[test]
+    fn test_first_connected_at_not_reset_on_reconnect() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None,
+            Some("host".to_string()), 1883, None, true, vec![], true,
+        );
+        state.set_source_connected(true);
+        let first = state.get_first_connected_since().unwrap();
+
+        state.set_source_connected(false);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        state.set_source_connected(true);
+
+        let after_reconnect = state.get_first_connected_since().unwrap();
+        // first_connected_since should be the same (or very close) — not reset
+        let diff = (first - after_reconnect).num_milliseconds().abs();
+        assert!(diff < 10, "first_connected_at should not reset on reconnect, diff={}ms", diff);
+    }
+
+    // === Broker connection audit tests ===
+
+    #[test]
+    fn test_broker_connections_audited_on_change() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.set_broker_connections(1);
+        state.set_broker_connections(2);
+
+        let log = state.get_audit_log();
+        let conn_entries: Vec<_> = log.iter()
+            .filter(|e| matches!(e.area, AuditArea::Broker) && e.message.contains("Connections"))
+            .collect();
+        assert_eq!(conn_entries.len(), 2);
+        assert!(conn_entries[0].message.contains("0 → 1"));
+        assert!(conn_entries[1].message.contains("1 → 2"));
+    }
+
+    #[test]
+    fn test_broker_connections_not_audited_when_unchanged() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.set_broker_connections(3);
+        state.set_broker_connections(3); // Same value
+
+        let log = state.get_audit_log();
+        let conn_entries: Vec<_> = log.iter()
+            .filter(|e| matches!(e.area, AuditArea::Broker) && e.message.contains("Connections"))
+            .collect();
+        assert_eq!(conn_entries.len(), 1); // Only one audit entry
+    }
+
+    // === Recording session count tests ===
+
+    #[test]
+    fn test_recording_session_count_starts_at_zero() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.start_recording_session();
+        assert_eq!(state.get_recording_session_count(), 0);
+    }
+
+    #[test]
+    fn test_recording_session_count_tracks_delta() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        // Simulate some pre-existing records
+        for _ in 0..10 {
+            state.increment_recorded();
+        }
+        state.start_recording_session(); // snapshot at 10
+        for _ in 0..5 {
+            state.increment_recorded();
+        }
+        assert_eq!(state.get_recording_session_count(), 5);
+        assert_eq!(state.get_recorded_count(), 15);
+    }
+
+    // === Playback session count tests ===
+
+    #[test]
+    fn test_playback_session_count_starts_at_zero() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.start_playback_session();
+        assert_eq!(state.get_playback_session_count(), 0);
+    }
+
+    #[test]
+    fn test_playback_session_count_tracks_delta() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        for _ in 0..20 {
+            state.increment_replayed();
+        }
+        state.start_playback_session(); // snapshot at 20
+        for _ in 0..7 {
+            state.increment_replayed();
+        }
+        assert_eq!(state.get_playback_session_count(), 7);
+        assert_eq!(state.get_replayed_count(), 27);
+    }
+
+    #[test]
+    fn test_playback_session_count_resets_on_new_session() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.start_playback_session();
+        for _ in 0..10 {
+            state.increment_replayed();
+        }
+        assert_eq!(state.get_playback_session_count(), 10);
+
+        // Start new session
+        state.start_playback_session(); // snapshot at 10
+        for _ in 0..3 {
+            state.increment_replayed();
+        }
+        assert_eq!(state.get_playback_session_count(), 3);
+        assert_eq!(state.get_replayed_count(), 13);
+    }
+
+    // === Mirror session count tests ===
+
+    #[test]
+    fn test_mirror_session_counts_start_at_zero() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        let (m, p) = state.get_mirror_session_counts();
+        assert_eq!(m, 0);
+        assert_eq!(p, 0);
+    }
+
+    #[test]
+    fn test_mirror_session_counts_track_delta() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        for _ in 0..10 {
+            state.increment_mirrored();
+            state.increment_published();
+        }
+        // Re-enable mirror to snapshot at (10, 10)
+        state.set_mirror_enabled_at(true);
+        for _ in 0..5 {
+            state.increment_mirrored();
+            state.increment_published();
+        }
+        let (m, p) = state.get_mirror_session_counts();
+        assert_eq!(m, 5);
+        assert_eq!(p, 5);
+    }
+
+    #[test]
+    fn test_mirror_session_counts_published_includes_playback() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.set_mirror_enabled_at(true); // snapshot at (0, 0)
+        for _ in 0..5 {
+            state.increment_mirrored();
+            state.increment_published();
+        }
+        // Playback also increments published
+        for _ in 0..3 {
+            state.increment_published();
+        }
+        let (m, p) = state.get_mirror_session_counts();
+        assert_eq!(m, 5);
+        assert_eq!(p, 8); // 5 mirror + 3 playback
+    }
+
+    // === Shutdown summary test ===
+
+    #[test]
+    fn test_request_quit_audit_includes_uptime() {
+        let state = TuiState::new(
+            AppMode::Record, 1883, None, None, 1883, None, true, vec![], true,
+        );
+        state.request_quit();
+        let log = state.get_audit_log();
+        let shutdown = log.iter().find(|e| e.message.contains("shutting down")).unwrap();
+        assert!(shutdown.message.contains("uptime"));
+        assert!(shutdown.message.contains("published"));
     }
 }
