@@ -155,7 +155,11 @@ pub struct Args {
     #[arg(long = "playlist")]
     pub playlist: Vec<PathBuf>,
 
-    /// Path to write audit log file (use 'a' key in TUI to toggle writing)
+    /// Enable audit logging in TUI (default: true)
+    #[arg(long, default_value = "true")]
+    pub audit: bool,
+
+    /// Path to write audit log file (auto-enables file writing)
     #[arg(long)]
     pub audit_log: Option<PathBuf>,
 }
@@ -370,6 +374,7 @@ mod tests {
             record: None,
             mirror: true,
             playlist: vec![],
+            audit: true,
             audit_log: None,
         }
     }

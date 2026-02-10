@@ -43,7 +43,7 @@ use tokio::time::{Duration, Instant};
 
 use crate::csv_handler::{CsvReader, MessageRecord};
 use crate::error::MqttRecorderError;
-use crate::mqtt::MqttClient;
+use crate::mqtt::AnyMqttClient;
 use crate::tui::TuiState;
 
 /// Replayer for publishing MQTT messages from a CSV file.
@@ -66,7 +66,7 @@ use crate::tui::TuiState;
 /// - **5.11**: Handle interrupt signals for graceful shutdown
 pub struct Replayer {
     /// The MQTT client for broker communication.
-    client: MqttClient,
+    client: AnyMqttClient,
     /// The CSV reader for reading recorded messages.
     reader: CsvReader,
     /// Whether to loop replay continuously.
@@ -100,7 +100,7 @@ impl Replayer {
     ///
     /// let replayer = Replayer::new(client, reader, false).await;
     /// ```
-    pub async fn new(client: MqttClient, reader: CsvReader, loop_replay: bool) -> Self {
+    pub async fn new(client: AnyMqttClient, reader: CsvReader, loop_replay: bool) -> Self {
         Self {
             client,
             reader,

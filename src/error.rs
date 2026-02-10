@@ -112,6 +112,20 @@ impl From<rumqttc::ClientError> for MqttRecorderError {
     }
 }
 
+// V5 error conversions — map to string-based variants to avoid
+// needing separate enum variants for v4 vs v5 error types.
+impl From<rumqttc::v5::ConnectionError> for MqttRecorderError {
+    fn from(err: rumqttc::v5::ConnectionError) -> Self {
+        MqttRecorderError::Broker(format!("MQTT v5 connection error: {}", err))
+    }
+}
+
+impl From<rumqttc::v5::ClientError> for MqttRecorderError {
+    fn from(err: rumqttc::v5::ClientError) -> Self {
+        MqttRecorderError::Broker(format!("MQTT v5 client error: {}", err))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

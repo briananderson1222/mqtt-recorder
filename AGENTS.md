@@ -205,6 +205,15 @@ When modifying core logic, ensure property tests still pass.
 - `rumqttd` provides an embedded broker for mirror/replay modes
 - Both are from the same project, ensuring compatibility
 
+### MQTT v4/v5 Split
+
+- The embedded broker runs an MQTT v5 listener (rumqttd v5 config)
+- Internal clients connecting to the embedded broker use `MqttClientV5` (rumqttc v5 module)
+- External-facing clients (record mode, mirror source) use `MqttClient` (rumqttc v4) for maximum compatibility with third-party brokers
+- `AnyMqttClient` enum wraps either client type for components that connect to both (Replayer, Recorder, Mirror source)
+- `MqttIncoming` provides a unified event type so consumers don't depend on v4/v5 packet types directly
+- QoS types differ between v4 and v5 in rumqttc; `MqttClientV5` converts internally
+
 ### Why CSV for Storage?
 
 - Human-readable and editable

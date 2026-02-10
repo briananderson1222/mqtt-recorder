@@ -20,7 +20,7 @@
 //! - 10.10: Display its current mode (standalone, replay, or mirror) on startup
 
 use crate::error::MqttRecorderError;
-use crate::mqtt::{MqttClient, MqttClientConfig};
+use crate::mqtt::{MqttClientConfig, MqttClientV5};
 use rumqttd::{Broker, Config, ConnectionSettings, RouterConfig, ServerSettings};
 use std::collections::HashMap;
 use std::fmt;
@@ -202,7 +202,7 @@ impl EmbeddedBroker {
             dynamic_filters: true, // Allow dynamic topic creation
         };
 
-        // Create server settings for MQTT v4 (3.1.1)
+        // Create server settings for MQTT v5
         let listen_addr: SocketAddr = format!("0.0.0.0:{}", port)
             .parse()
             .map_err(|e| MqttRecorderError::Broker(format!("Invalid port {}: {}", port, e)))?;
@@ -215,16 +215,16 @@ impl EmbeddedBroker {
             connections: connection_settings,
         };
 
-        // Create the v4 servers map
-        let mut v4_servers = HashMap::new();
-        v4_servers.insert("1".to_string(), server_settings);
+        // Create the v5 servers map
+        let mut v5_servers = HashMap::new();
+        v5_servers.insert("1".to_string(), server_settings);
 
         // Create the final configuration
         let config = Config {
             id: 0,
             router,
-            v4: Some(v4_servers),
-            v5: None,
+            v4: None,
+            v5: Some(v5_servers),
             ws: None,
             cluster: None,
             console: None,
@@ -257,16 +257,14 @@ impl EmbeddedBroker {
     /// // Use client to publish messages
     /// client.publish("topic", b"payload", QoS::AtMostOnce, false).await?;
     /// ```
-    pub async fn get_local_client(&self) -> Result<MqttClient, MqttRecorderError> {
-        // Create a client configuration for connecting to localhost
+    pub async fn get_local_client(&self) -> Result<MqttClientV5, MqttRecorderError> {
         let config = MqttClientConfig::new(
             "127.0.0.1".to_string(),
             self.port,
             format!("mqtt-recorder-internal-{}", std::process::id()),
         );
 
-        // Create and return the client
-        MqttClient::new(config).await
+        MqttClientV5::new(config).await
     }
 
     /// Shutdown the broker gracefully.
@@ -396,12 +394,12 @@ mod tests {
         assert!(result.is_ok());
 
         let config = result.unwrap();
-        assert!(config.v4.is_some());
+        assert!(config.v5.is_some());
 
-        let v4 = config.v4.unwrap();
-        assert!(v4.contains_key("1"));
+        let v5 = config.v5.unwrap();
+        assert!(v5.contains_key("1"));
 
-        let server = v4.get("1").unwrap();
+        let server = v5.get("1").unwrap();
         assert_eq!(server.name, "mqtt-recorder-broker");
         assert_eq!(server.listen.port(), 1883);
     }
@@ -412,8 +410,8 @@ mod tests {
         assert!(result.is_ok());
 
         let config = result.unwrap();
-        let v4 = config.v4.unwrap();
-        let server = v4.get("1").unwrap();
+        let v5 = config.v5.unwrap();
+        let server = v5.get("1").unwrap();
         assert_eq!(server.listen.port(), 9883);
     }
 
@@ -430,8 +428,8 @@ mod tests {
     #[test]
     fn test_create_config_connection_settings() {
         let config = EmbeddedBroker::create_config(1883).unwrap();
-        let v4 = config.v4.unwrap();
-        let server = v4.get("1").unwrap();
+        let v5 = config.v5.unwrap();
+        let server = v5.get("1").unwrap();
 
         assert!(server.connections.connection_timeout_ms > 0);
         assert!(server.connections.max_payload_size > 0);

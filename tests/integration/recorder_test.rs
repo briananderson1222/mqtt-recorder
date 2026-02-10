@@ -2,7 +2,7 @@
 
 use mqtt_recorder::broker::{BrokerMode, EmbeddedBroker};
 use mqtt_recorder::csv_handler::{CsvReader, CsvWriter};
-use mqtt_recorder::mqtt::{MqttClient, MqttClientConfig};
+use mqtt_recorder::mqtt::{AnyMqttClient, MqttClientConfig, MqttClientV5};
 use mqtt_recorder::recorder::Recorder;
 use mqtt_recorder::topics::TopicFilter;
 use rumqttc::QoS;
@@ -12,9 +12,9 @@ use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
-/// Helper: create an MQTT client connected to the given port
-async fn make_client(port: u16, id: &str) -> MqttClient {
-    MqttClient::new(MqttClientConfig::new(
+/// Helper: create an MQTT v5 client connected to the given port
+async fn make_client(port: u16, id: &str) -> MqttClientV5 {
+    MqttClientV5::new(MqttClientConfig::new(
         "127.0.0.1".to_string(),
         port,
         id.to_string(),
@@ -24,7 +24,7 @@ async fn make_client(port: u16, id: &str) -> MqttClient {
 }
 
 /// Helper: publish a text message and poll to flush
-async fn publish(client: &MqttClient, topic: &str, payload: &[u8], qos: QoS, retain: bool) {
+async fn publish(client: &MqttClientV5, topic: &str, payload: &[u8], qos: QoS, retain: bool) {
     client
         .publish(topic, payload, qos, retain)
         .await
@@ -53,7 +53,7 @@ async fn test_recorder_captures_published_messages() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = make_client(18850, "recorder").await;
+    let recorder_client = AnyMqttClient::V5(make_client(18850, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
@@ -117,7 +117,7 @@ async fn test_recorder_preserves_message_fields() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = make_client(18851, "recorder").await;
+    let recorder_client = AnyMqttClient::V5(make_client(18851, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
@@ -179,7 +179,7 @@ async fn test_recorder_handles_graceful_shutdown() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = make_client(18852, "recorder").await;
+    let recorder_client = AnyMqttClient::V5(make_client(18852, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
@@ -224,7 +224,7 @@ async fn test_recorder_auto_encodes_binary_payloads() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = make_client(18853, "recorder").await;
+    let recorder_client = AnyMqttClient::V5(make_client(18853, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
@@ -290,7 +290,7 @@ async fn test_recorder_topic_filter() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = make_client(18854, "recorder").await;
+    let recorder_client = AnyMqttClient::V5(make_client(18854, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::from_single("sensors/#".to_string());
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;

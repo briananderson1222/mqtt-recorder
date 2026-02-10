@@ -2,9 +2,9 @@
 
 use mqtt_recorder::broker::{BrokerMode, EmbeddedBroker};
 use mqtt_recorder::csv_handler::{CsvReader, CsvWriter, MessageRecord};
-use mqtt_recorder::mqtt::{MqttClient, MqttClientConfig};
+use mqtt_recorder::mqtt::{AnyMqttClient, MqttClientConfig, MqttClientV5};
 use mqtt_recorder::replayer::Replayer;
-use rumqttc::{Event, Packet, QoS};
+use rumqttc::QoS;
 
 use chrono::Utc;
 use std::time::Duration;
@@ -12,9 +12,9 @@ use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
-/// Helper: create an MQTT client connected to the given port
-async fn make_client(port: u16, id: &str) -> MqttClient {
-    MqttClient::new(MqttClientConfig::new(
+/// Helper: create an MQTT v5 client connected to the given port
+async fn make_client(port: u16, id: &str) -> MqttClientV5 {
+    MqttClientV5::new(MqttClientConfig::new(
         "127.0.0.1".to_string(),
         port,
         id.to_string(),
@@ -42,7 +42,7 @@ fn create_test_csv(path: &std::path::Path, messages: &[(&str, &str, u8, bool)]) 
 
 /// Helper: subscribe and collect messages from broker
 async fn collect_messages(
-    client: &MqttClient,
+    client: &MqttClientV5,
     topic: &str,
     expected: usize,
     timeout_ms: u64,
@@ -51,7 +51,6 @@ async fn collect_messages(
         .subscribe(&[topic.to_string()], QoS::AtMostOnce)
         .await
         .expect("Failed to subscribe");
-    // Poll to process subscription
     let _ = client.poll().await;
 
     let mut messages = Vec::new();
@@ -59,8 +58,14 @@ async fn collect_messages(
 
     while messages.len() < expected && tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(200), client.poll()).await {
-            Ok(Ok(Event::Incoming(Packet::Publish(p)))) => {
-                messages.push((p.topic.clone(), p.payload.to_vec()));
+            Ok(Ok(event)) => {
+                use rumqttc::v5::mqttbytes::v5::Packet;
+                if let rumqttc::v5::Event::Incoming(Packet::Publish(p)) = event {
+                    messages.push((
+                        String::from_utf8_lossy(&p.topic).into_owned(),
+                        p.payload.to_vec(),
+                    ));
+                }
             }
             _ => {}
         }
@@ -102,7 +107,7 @@ async fn test_replayer_publishes_csv_messages() {
     let _ = subscriber.poll().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let replayer_client = make_client(18860, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(18860, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 
@@ -159,7 +164,7 @@ async fn test_replayer_preserves_message_fields() {
     let _ = subscriber.poll().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let replayer_client = make_client(18861, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(18861, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 
@@ -208,7 +213,7 @@ async fn test_replayer_exits_after_all_messages() {
         ],
     );
 
-    let replayer_client = make_client(18862, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(18862, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 
@@ -253,7 +258,7 @@ async fn test_replayer_loops_continuously() {
     let _ = subscriber.poll().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let replayer_client = make_client(18863, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(18863, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
     let mut replayer = Replayer::new(replayer_client, reader, true).await;
 
@@ -305,7 +310,7 @@ async fn test_replayer_handles_shutdown_during_replay() {
     writer.write(&MessageRecord::new(base + chrono::Duration::seconds(4), "test/3".into(), "third".into(), 0, false)).unwrap();
     writer.flush().unwrap();
 
-    let replayer_client = make_client(18864, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(18864, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 
@@ -349,13 +354,7 @@ async fn test_record_then_replay_roundtrip() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("roundtrip.csv");
 
-    let recorder_client = MqttClient::new(MqttClientConfig::new(
-        "127.0.0.1".to_string(),
-        18870,
-        "recorder".to_string(),
-    ))
-    .await
-    .expect("Failed to create recorder client");
+    let recorder_client = AnyMqttClient::V5(make_client(18870, "recorder").await);
 
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
@@ -435,7 +434,7 @@ async fn test_record_then_replay_roundtrip() {
     let _ = subscriber.poll().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let replayer_client = make_client(18871, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(18871, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 

@@ -39,13 +39,13 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use chrono::Utc;
-use rumqttc::{Event, Packet, QoS};
+use rumqttc::QoS;
 use tokio::sync::broadcast;
 
 use crate::broker::EmbeddedBroker;
 use crate::csv_handler::{CsvReader, CsvWriter, MessageRecord};
 use crate::error::MqttRecorderError;
-use crate::mqtt::MqttClient;
+use crate::mqtt::{AnyMqttClient, MqttClientV5, MqttIncoming};
 use crate::topics::TopicFilter;
 use crate::tui::{AuditArea, AuditSeverity, TuiState};
 
@@ -76,11 +76,11 @@ const LOG_INTERVAL: u64 = 100;
 /// - **11.9**: Handle interrupt signals for graceful shutdown
 pub struct Mirror {
     /// The MQTT client connected to the external broker (source).
-    source_client: MqttClient,
+    source_client: AnyMqttClient,
     /// The embedded broker instance.
     broker: EmbeddedBroker,
-    /// The MQTT client connected to the embedded broker for publishing.
-    local_client: MqttClient,
+    /// The MQTT v5 client connected to the embedded broker for publishing.
+    local_client: MqttClientV5,
     /// Optional CSV writer for recording messages.
     writer: Option<CsvWriter>,
     /// The topic filter specifying which topics to subscribe to.
@@ -136,7 +136,7 @@ impl Mirror {
     ///
     /// - **11.2**: Mirror mode requires the embedded broker to be enabled
     pub async fn new(
-        source_client: MqttClient,
+        source_client: AnyMqttClient,
         broker: EmbeddedBroker,
         writer: Option<CsvWriter>,
         topics: TopicFilter,
@@ -252,7 +252,7 @@ impl Mirror {
                     match event_result {
                         Ok(event) => {
                             // Re-subscribe on reconnection
-                            if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
+                            if matches!(event, MqttIncoming::ConnAck) {
                                 let topics = self.topics.topics();
                                 if !topics.is_empty() {
                                     if let Err(e) = self.source_client.subscribe(topics, self.qos).await {
@@ -496,7 +496,7 @@ impl Mirror {
                     match event_result {
                         Ok(event) => {
                             // Re-subscribe on reconnection
-                            if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
+                            if matches!(event, MqttIncoming::ConnAck) {
                                 let topics = self.topics.topics();
                                 if !topics.is_empty() {
                                     if let Err(e) = self.source_client.subscribe(topics, self.qos).await {
@@ -600,7 +600,7 @@ impl Mirror {
                         }
                         Err(e) => {
                             if let Some(ref state) = tui_state {
-                                state.push_audit(AuditArea::Source, AuditSeverity::Error, format!("{}", e));
+                                state.push_audit(AuditArea::Source, AuditSeverity::Error, format!("MQTT connection error: {}", e));
                                 state.set_source_connected(false);
                             }
                             if !tui_active {
@@ -657,32 +657,23 @@ impl Mirror {
     ///
     /// Returns `Some(MessageRecord)` if the event contains a publish message,
     /// or `None` for other event types.
-    fn process_event(&self, event: Event) -> Option<MessageRecord> {
+    fn process_event(&self, event: MqttIncoming) -> Option<MessageRecord> {
         match event {
-            Event::Incoming(Packet::Publish(publish)) => {
-                // Extract message details (Requirement 11.6)
+            MqttIncoming::Publish {
+                topic,
+                payload,
+                qos,
+                retain,
+            } => {
                 let timestamp = Utc::now();
-                let topic = publish.topic.clone();
-
-                // Convert payload bytes to string
-                // If the payload is not valid UTF-8, use lossy conversion
-                let payload = String::from_utf8_lossy(&publish.payload).to_string();
-
-                // Map rumqttc QoS to u8
-                let qos = match publish.qos {
+                let payload_str = String::from_utf8_lossy(&payload).to_string();
+                let qos_u8 = match qos {
                     QoS::AtMostOnce => 0,
                     QoS::AtLeastOnce => 1,
                     QoS::ExactlyOnce => 2,
                 };
-
-                let retain = publish.retain;
-
-                Some(MessageRecord::new(timestamp, topic, payload, qos, retain))
+                Some(MessageRecord::new(timestamp, topic, payload_str, qos_u8, retain))
             }
-            // Log connection events for debugging (only in non-TUI mode)
-            Event::Incoming(Packet::ConnAck(_)) => None,
-            Event::Incoming(Packet::SubAck(_)) => None,
-            // Ignore other events
             _ => None,
         }
     }

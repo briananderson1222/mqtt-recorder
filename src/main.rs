@@ -45,7 +45,7 @@ use csv_handler::{CsvReader, CsvWriter};
 use error::MqttRecorderError;
 use fixer::CsvFixer;
 use mirror::Mirror;
-use mqtt::{MqttClient, MqttClientConfig, TlsConfig};
+use mqtt::{AnyMqttClient, MqttClient, MqttClientConfig, MqttClientV5, TlsConfig};
 use recorder::Recorder;
 use replayer::Replayer;
 use topics::TopicFilter;
@@ -148,9 +148,11 @@ async fn run(args: Args) -> Result<(), MqttRecorderError> {
             args.record,
             args.mirror,
             playlist,
+            args.audit,
         ));
         if let Some(ref path) = args.audit_log {
             tui.set_audit_file_path(path.display().to_string());
+            tui.enable_audit_file();
         }
         Some(tui)
     } else {
@@ -434,7 +436,7 @@ async fn run_record_mode(
     let topics = create_topic_filter(args)?;
 
     // Create and run recorder
-    let mut recorder = Recorder::new(client, writer, topics, args.get_qos()).await;
+    let mut recorder = Recorder::new(AnyMqttClient::V4(client), writer, topics, args.get_qos()).await;
 
     // Run the recording loop (Requirements 4.1-4.9)
     let message_count = recorder.run_with_tui(shutdown, tui_state).await?;
@@ -482,13 +484,14 @@ async fn run_replay_mode(
         if !tui_active {
             eprintln!("Connecting to MQTT broker at {}:{}...", host, args.port);
         }
-        MqttClient::new(client_config).await.map_err(|e| {
+        let c = MqttClient::new(client_config).await.map_err(|e| {
             eprintln!("Error: Connection failed: {}", e);
             eprintln!("  Hint: Verify the broker is running and the host/port are correct");
             e
-        })?
+        })?;
+        AnyMqttClient::V4(c)
     } else if args.serve {
-        // Connect to embedded broker (Requirement 1.22: host optional with --serve)
+        // Connect to embedded broker via v5 (Requirement 1.22: host optional with --serve)
         let config = MqttClientConfig::new(
             "127.0.0.1".to_string(),
             args.serve_port,
@@ -500,11 +503,11 @@ async fn run_replay_mode(
                 args.serve_port
             );
         }
-        let client = MqttClient::new(config).await?;
+        let c = MqttClientV5::new(config).await?;
         if let Some(ref b) = broker {
             b.register_internal_client();
         }
-        client
+        AnyMqttClient::V5(c)
     } else {
         // This shouldn't happen due to validation, but handle it anyway
         return Err(MqttRecorderError::InvalidArgument(
@@ -593,7 +596,7 @@ async fn run_mirror_mode(
     let topics = create_topic_filter(args)?;
 
     // Create and run mirror
-    let mut mirror = Mirror::new(source_client, broker, writer, topics, args.get_qos()).await?;
+    let mut mirror = Mirror::new(AnyMqttClient::V4(source_client), broker, writer, topics, args.get_qos()).await?;
 
     // Run the mirror loop with TUI support (Requirements 11.3-11.9)
     let message_count = if tui_active {
@@ -752,6 +755,7 @@ mod tests {
             record: None,
             mirror: true,
             playlist: vec![],
+            audit: true,
             audit_log: None,
         }
     }

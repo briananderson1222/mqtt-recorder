@@ -384,8 +384,8 @@ impl MqttClient {
         // Create MQTT options (Requirement 2.1, 2.2)
         let mut mqtt_options = MqttOptions::new(&client_id, &config.host, config.port);
 
-        // Set keep alive to 15 seconds for faster disconnection detection
-        mqtt_options.set_keep_alive(Duration::from_secs(15));
+        // Set keep alive to 30 seconds to tolerate high-throughput message bursts
+        mqtt_options.set_keep_alive(Duration::from_secs(30));
 
         // Set max packet size from config (Requirement 1.19, 1.28)
         mqtt_options.set_max_packet_size(config.max_packet_size, config.max_packet_size);
@@ -402,7 +402,8 @@ impl MqttClient {
         }
 
         // Create the async client and event loop
-        let (client, eventloop) = AsyncClient::new(mqtt_options, 10);
+        // Use a large channel capacity to prevent backpressure from blocking ping handling
+        let (client, eventloop) = AsyncClient::new(mqtt_options, 256);
 
         Ok(Self {
             client,
@@ -588,6 +589,198 @@ impl MqttClient {
     #[allow(dead_code)]
     pub fn client(&self) -> &AsyncClient {
         &self.client
+    }
+}
+
+/// MQTT v5 client wrapper around rumqttc::v5.
+///
+/// Used for connections to the embedded broker which runs a v5 listener.
+/// Provides the same public API as `MqttClient` but uses MQTT v5 protocol.
+pub struct MqttClientV5 {
+    client: rumqttc::v5::AsyncClient,
+    eventloop: Arc<Mutex<rumqttc::v5::EventLoop>>,
+}
+
+impl MqttClientV5 {
+    /// Convert v4 QoS to v5 QoS (they're separate types in rumqttc)
+    fn to_v5_qos(qos: QoS) -> rumqttc::v5::mqttbytes::QoS {
+        match qos {
+            QoS::AtMostOnce => rumqttc::v5::mqttbytes::QoS::AtMostOnce,
+            QoS::AtLeastOnce => rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+            QoS::ExactlyOnce => rumqttc::v5::mqttbytes::QoS::ExactlyOnce,
+        }
+    }
+
+    /// Convert v5 QoS to v4 QoS
+    fn from_v5_qos(qos: rumqttc::v5::mqttbytes::QoS) -> QoS {
+        match qos {
+            rumqttc::v5::mqttbytes::QoS::AtMostOnce => QoS::AtMostOnce,
+            rumqttc::v5::mqttbytes::QoS::AtLeastOnce => QoS::AtLeastOnce,
+            rumqttc::v5::mqttbytes::QoS::ExactlyOnce => QoS::ExactlyOnce,
+        }
+    }
+
+    pub async fn new(config: MqttClientConfig) -> Result<Self, MqttRecorderError> {
+        let client_id = if config.client_id.is_empty() {
+            generate_client_id()
+        } else {
+            config.client_id.clone()
+        };
+
+        let mut mqtt_options =
+            rumqttc::v5::MqttOptions::new(&client_id, &config.host, config.port);
+        mqtt_options.set_keep_alive(Duration::from_secs(15));
+        mqtt_options.set_max_packet_size(Some(config.max_packet_size as u32));
+
+        if let (Some(username), Some(password)) = (&config.username, &config.password) {
+            mqtt_options.set_credentials(username, password);
+        }
+
+        if let Some(tls_config) = &config.tls {
+            let transport = MqttClient::build_tls_transport(tls_config)?;
+            mqtt_options.set_transport(transport);
+        }
+
+        let (client, eventloop) = rumqttc::v5::AsyncClient::new(mqtt_options, 256);
+
+        Ok(Self {
+            client,
+            eventloop: Arc::new(Mutex::new(eventloop)),
+        })
+    }
+
+    pub async fn subscribe(
+        &self,
+        topics: &[String],
+        qos: QoS,
+    ) -> Result<(), MqttRecorderError> {
+        let v5_qos = Self::to_v5_qos(qos);
+        for topic in topics {
+            self.client.subscribe(topic, v5_qos).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), MqttRecorderError> {
+        self.client
+            .publish(topic, Self::to_v5_qos(qos), retain, payload.to_vec())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn poll(&self) -> Result<rumqttc::v5::Event, MqttRecorderError> {
+        let mut eventloop = self.eventloop.lock().await;
+        let event = eventloop.poll().await?;
+        Ok(event)
+    }
+
+    pub async fn disconnect(&self) -> Result<(), MqttRecorderError> {
+        self.client.disconnect().await?;
+        Ok(())
+    }
+}
+
+/// Protocol-agnostic MQTT client that wraps either a v4 or v5 client.
+///
+/// Used by components (like Replayer) that need to connect to either
+/// an external broker (v4) or the embedded broker (v5).
+pub enum AnyMqttClient {
+    V4(MqttClient),
+    V5(MqttClientV5),
+}
+
+/// Unified incoming event extracted from either v4 or v5 MQTT events.
+pub enum MqttIncoming {
+    Publish {
+        topic: String,
+        payload: Vec<u8>,
+        qos: QoS,
+        retain: bool,
+    },
+    ConnAck,
+    SubAck,
+    Other,
+}
+
+impl AnyMqttClient {
+    pub async fn subscribe(
+        &self,
+        topics: &[String],
+        qos: QoS,
+    ) -> Result<(), MqttRecorderError> {
+        match self {
+            Self::V4(c) => c.subscribe(topics, qos).await,
+            Self::V5(c) => c.subscribe(topics, qos).await,
+        }
+    }
+
+    pub async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), MqttRecorderError> {
+        match self {
+            Self::V4(c) => c.publish(topic, payload, qos, retain).await,
+            Self::V5(c) => c.publish(topic, payload, qos, retain).await,
+        }
+    }
+
+    pub async fn poll(&self) -> Result<MqttIncoming, MqttRecorderError> {
+        match self {
+            Self::V4(c) => {
+                let event = c.poll().await?;
+                Ok(Self::convert_v4_event(event))
+            }
+            Self::V5(c) => {
+                let event = c.poll().await?;
+                Ok(Self::convert_v5_event(event))
+            }
+        }
+    }
+
+    pub async fn disconnect(&self) -> Result<(), MqttRecorderError> {
+        match self {
+            Self::V4(c) => c.disconnect().await,
+            Self::V5(c) => c.disconnect().await,
+        }
+    }
+
+    fn convert_v4_event(event: Event) -> MqttIncoming {
+        use rumqttc::Packet;
+        match event {
+            Event::Incoming(Packet::Publish(p)) => MqttIncoming::Publish {
+                topic: p.topic,
+                payload: p.payload.to_vec(),
+                qos: p.qos,
+                retain: p.retain,
+            },
+            Event::Incoming(Packet::ConnAck(_)) => MqttIncoming::ConnAck,
+            Event::Incoming(Packet::SubAck(_)) => MqttIncoming::SubAck,
+            _ => MqttIncoming::Other,
+        }
+    }
+
+    fn convert_v5_event(event: rumqttc::v5::Event) -> MqttIncoming {
+        use rumqttc::v5::mqttbytes::v5::Packet;
+        match event {
+            rumqttc::v5::Event::Incoming(Packet::Publish(p)) => MqttIncoming::Publish {
+                topic: String::from_utf8_lossy(&p.topic).into_owned(),
+                payload: p.payload.to_vec(),
+                qos: MqttClientV5::from_v5_qos(p.qos),
+                retain: p.retain,
+            },
+            rumqttc::v5::Event::Incoming(Packet::ConnAck(_)) => MqttIncoming::ConnAck,
+            rumqttc::v5::Event::Incoming(Packet::SubAck(_)) => MqttIncoming::SubAck,
+            _ => MqttIncoming::Other,
+        }
     }
 }
 

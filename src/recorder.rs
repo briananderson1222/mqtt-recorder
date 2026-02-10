@@ -35,13 +35,13 @@
 //! - **4.9**: WHEN the user sends an interrupt signal (Ctrl+C), gracefully close the file and disconnect from the broker
 
 use chrono::{DateTime, Utc};
-use rumqttc::{Event, Packet, QoS};
+use rumqttc::QoS;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::csv_handler::CsvWriter;
 use crate::error::MqttRecorderError;
-use crate::mqtt::MqttClient;
+use crate::mqtt::{AnyMqttClient, MqttIncoming};
 use crate::topics::TopicFilter;
 use crate::tui::TuiState;
 
@@ -77,7 +77,7 @@ struct RawMessage {
 /// - **4.9**: Handle interrupt signals for graceful shutdown
 pub struct Recorder {
     /// The MQTT client for broker communication.
-    client: MqttClient,
+    client: AnyMqttClient,
     /// The CSV writer for persisting messages.
     writer: CsvWriter,
     /// The topic filter specifying which topics to subscribe to.
@@ -117,7 +117,7 @@ impl Recorder {
     ///
     /// let recorder = Recorder::new(client, writer, topics, QoS::AtMostOnce).await;
     /// ```
-    pub async fn new(client: MqttClient, writer: CsvWriter, topics: TopicFilter, qos: QoS) -> Self {
+    pub async fn new(client: AnyMqttClient, writer: CsvWriter, topics: TopicFilter, qos: QoS) -> Self {
         Self {
             client,
             writer,
@@ -279,45 +279,38 @@ impl Recorder {
     ///
     /// Returns `Some(RawMessage)` if the event contains a publish message,
     /// or `None` for other event types.
-    fn process_event(&self, event: Event) -> Option<RawMessage> {
+    fn process_event(&self, event: MqttIncoming) -> Option<RawMessage> {
         match event {
-            Event::Incoming(Packet::Publish(publish)) => {
-                // Extract message details (Requirement 4.2)
+            MqttIncoming::Publish {
+                topic,
+                payload,
+                qos,
+                retain,
+            } => {
                 let timestamp = Utc::now();
-                let topic = publish.topic.clone();
-
-                // Keep payload as raw bytes - let the CSV writer handle encoding
-                // This enables proper binary detection and auto-encoding (Requirements 2.1, 2.2)
-                let payload = publish.payload.to_vec();
-
-                // Map rumqttc QoS to u8
-                let qos = match publish.qos {
+                let qos_u8 = match qos {
                     QoS::AtMostOnce => 0,
                     QoS::AtLeastOnce => 1,
                     QoS::ExactlyOnce => 2,
                 };
 
-                let retain = publish.retain;
-
                 Some(RawMessage {
                     timestamp,
                     topic,
-                    payload,
-                    qos,
+                    payload: payload.to_vec(),
+                    qos: qos_u8,
                     retain,
                 })
             }
-            // Log connection events for debugging
-            Event::Incoming(Packet::ConnAck(_)) => {
+            MqttIncoming::ConnAck => {
                 eprintln!("Connected to MQTT broker");
                 None
             }
-            Event::Incoming(Packet::SubAck(_)) => {
+            MqttIncoming::SubAck => {
                 eprintln!("Subscription acknowledged");
                 None
             }
-            // Ignore other events
-            _ => None,
+            MqttIncoming::Other => None,
         }
     }
 

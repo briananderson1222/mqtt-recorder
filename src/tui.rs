@@ -124,6 +124,7 @@ pub struct TuiState {
     audit_file: std::sync::Mutex<Option<std::fs::File>>,
     audit_file_path: std::sync::Mutex<Option<String>>,
     audit_file_enabled: AtomicBool,
+    audit_enabled: AtomicBool,
 }
 
 impl TuiState {
@@ -137,6 +138,7 @@ impl TuiState {
         initial_record: Option<bool>,
         initial_mirror: bool,
         playlist: Vec<String>,
+        audit_enabled: bool,
     ) -> Self {
         // Default recording to ON if file path provided, unless explicitly set
         let recording = initial_record.unwrap_or(file_path.is_some());
@@ -172,6 +174,7 @@ impl TuiState {
             audit_file: std::sync::Mutex::new(None),
             audit_file_path: std::sync::Mutex::new(None),
             audit_file_enabled: AtomicBool::new(false),
+            audit_enabled: AtomicBool::new(audit_enabled),
         }
     }
 
@@ -193,8 +196,14 @@ impl TuiState {
                 *guard = Some(Instant::now());
             }
         } else if !connected && was_connected {
+            let uptime = self.get_connection_duration().map(|d| {
+                let secs = d.as_secs();
+                if secs >= 3600 { format!("{}h{}m{}s", secs / 3600, (secs % 3600) / 60, secs % 60) }
+                else if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) }
+                else { format!("{}s", secs) }
+            }).unwrap_or_else(|| "?".into());
             self.push_audit(AuditArea::Source, AuditSeverity::Warn, format!(
-                "Disconnected (received {} msgs)", self.received_count.load(Ordering::Relaxed)
+                "Disconnected (received {} msgs, uptime {})", self.received_count.load(Ordering::Relaxed), uptime
             ));
         }
     }
@@ -357,8 +366,16 @@ impl TuiState {
     }
 
     pub fn push_audit(&self, area: AuditArea, severity: AuditSeverity, message: String) {
+        if !self.audit_enabled.load(Ordering::Relaxed) {
+            return;
+        }
         let ts = chrono::Local::now().format("%H:%M:%S").to_string();
-        let flat = format!("{} [{}] {}", ts, area.label(), message);
+        let sev = match severity {
+            AuditSeverity::Info => "INFO",
+            AuditSeverity::Warn => "WARN",
+            AuditSeverity::Error => "ERR ",
+        };
+        let flat = format!("{} [{}] [{}] {}", ts, area.label(), sev, message);
         let entry = AuditEntry { timestamp: ts, area, severity, message };
         if let Ok(mut log) = self.audit_log.lock() {
             log.push(entry);
@@ -383,35 +400,43 @@ impl TuiState {
         }
     }
 
-    pub fn toggle_audit_file(&self) -> bool {
-        let enabling = !self.audit_file_enabled.load(Ordering::Relaxed);
-        if enabling {
-            let path = self.audit_file_path.lock().ok().and_then(|g| g.clone());
-            if let Some(path) = path {
-                use std::fs::OpenOptions;
-                match OpenOptions::new().create(true).append(true).open(&path) {
-                    Ok(file) => {
-                        if let Ok(mut guard) = self.audit_file.lock() {
-                            *guard = Some(file);
-                        }
-                        self.audit_file_enabled.store(true, Ordering::Relaxed);
+    pub fn enable_audit_file(&self) {
+        let path = self.audit_file_path.lock().ok().and_then(|g| g.clone());
+        if let Some(path) = path {
+            use std::fs::OpenOptions;
+            match OpenOptions::new().create(true).append(true).open(&path) {
+                Ok(file) => {
+                    if let Ok(mut guard) = self.audit_file.lock() {
+                        *guard = Some(file);
                     }
-                    Err(e) => {
-                        self.set_error(format!("Failed to open audit log file: {}", e));
-                        return false;
-                    }
+                    self.audit_file_enabled.store(true, Ordering::Relaxed);
                 }
-            } else {
-                self.set_error("No --audit_log path configured".into());
-                return false;
+                Err(e) => {
+                    self.set_error(format!("Failed to open audit log file: {}", e));
+                }
             }
-        } else {
+        }
+    }
+
+    pub fn toggle_audit(&self) -> bool {
+        let was_enabled = self.audit_enabled.load(Ordering::Relaxed);
+        if was_enabled {
+            // Push final entry before disabling
+            self.push_audit(AuditArea::System, AuditSeverity::Info, "Auditing disabled".into());
+            self.audit_enabled.store(false, Ordering::Relaxed);
+            // Close audit file if open
             self.audit_file_enabled.store(false, Ordering::Relaxed);
             if let Ok(mut guard) = self.audit_file.lock() {
                 *guard = None;
             }
+            false
+        } else {
+            self.audit_enabled.store(true, Ordering::Relaxed);
+            // Re-open audit file if path configured
+            self.enable_audit_file();
+            self.push_audit(AuditArea::System, AuditSeverity::Info, "Auditing enabled".into());
+            true
         }
-        enabling
     }
 
     pub fn get_audit_log(&self) -> Vec<AuditEntry> {
@@ -419,7 +444,12 @@ impl TuiState {
     }
 
     pub fn set_broker_connections(&self, count: usize) {
-        self.broker_connections.store(count, Ordering::Relaxed);
+        let old = self.broker_connections.swap(count, Ordering::Relaxed);
+        if old != count {
+            self.push_audit(AuditArea::Broker, AuditSeverity::Info, format!(
+                "Connections: {} → {}", old, count
+            ));
+        }
     }
 
     pub fn get_broker_connections(&self) -> usize {
@@ -1200,10 +1230,7 @@ pub async fn run_tui(
                                 }
                             }
                             KeyCode::Char('a') => {
-                                let enabled = state.toggle_audit_file();
-                                state.push_audit(AuditArea::System, AuditSeverity::Info, format!(
-                                    "Audit file {}", if enabled { "ON" } else { "OFF" }
-                                ));
+                                state.toggle_audit();
                             }
                             _ => {}
                         }
@@ -1265,6 +1292,7 @@ mod tests {
             None,
             true,
             vec![],
+            true,
         );
         assert_eq!(state.broker_port, 1883);
         assert_eq!(state.get_file_path(), Some("test.csv".to_string()));
@@ -1293,6 +1321,7 @@ mod tests {
             Some(false),
             false,
             vec![],
+            true,
         );
         assert!(!state.is_recording()); // explicitly disabled
         assert!(!state.is_mirroring()); // explicitly disabled
@@ -1309,6 +1338,7 @@ mod tests {
             None,
             true,
             vec![],
+            true,
         );
 
         assert!(state.is_recording());
@@ -1320,7 +1350,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_mirroring_toggle() {
-        let state = TuiState::new(AppMode::Mirror, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Mirror, 1883, None, None, 1883, None, true, vec![], true);
 
         assert!(state.is_mirroring());
         state.set_mirroring(false);
@@ -1331,7 +1361,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_source_toggle() {
-        let state = TuiState::new(AppMode::Mirror, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Mirror, 1883, None, None, 1883, None, true, vec![], true);
 
         assert!(state.is_source_enabled());
         state.set_source_enabled(false);
@@ -1342,7 +1372,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_counters() {
-        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![], true);
 
         assert_eq!(state.get_received_count(), 0);
         state.increment_received();
@@ -1367,7 +1397,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_quit_requested() {
-        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![], true);
         assert!(!state.is_quit_requested());
         state.request_quit();
         assert!(state.is_quit_requested());
@@ -1375,7 +1405,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_loop_enabled() {
-        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![], true);
         assert!(!state.loop_enabled.load(Ordering::Relaxed));
 
         state.loop_enabled.store(true, Ordering::Relaxed);
@@ -1389,7 +1419,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_none_file_path() {
-        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![], true);
         assert!(state.get_file_path().is_none());
     }
 
@@ -1404,6 +1434,7 @@ mod tests {
             None,
             true,
             vec![],
+            true,
         );
         assert_eq!(state.get_file_path(), Some("original.csv".to_string()));
 
@@ -1419,7 +1450,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_set_new_file_from_none() {
-        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![], true);
         assert!(state.get_file_path().is_none());
 
         state.set_new_file("first_file.csv".to_string());
@@ -1429,7 +1460,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_set_new_file_appends_csv() {
-        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![], true);
 
         state.set_new_file("myfile".to_string());
         assert_eq!(state.get_file_path(), Some("myfile.csv".to_string()));
@@ -1449,6 +1480,7 @@ mod tests {
             None,
             true,
             vec![],
+            true,
         );
         let filename = state.generate_default_filename();
 
@@ -1458,7 +1490,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_generate_default_filename_no_host() {
-        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![]);
+        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![], true);
         let filename = state.generate_default_filename();
 
         assert!(filename.starts_with("recording-"));
@@ -1476,6 +1508,7 @@ mod tests {
             None,
             true,
             vec!["file2.csv".to_string(), "file3.csv".to_string()],
+            true,
         );
 
         // Initially both at 0
@@ -1508,9 +1541,8 @@ mod tests {
             None,
             true,
             vec!["b.csv".to_string()],
+            true,
         );
-
-        // 2 files total
         assert_eq!(state.get_selected_index(), 0);
         state.navigate_selection(1);
         assert_eq!(state.get_selected_index(), 1);
