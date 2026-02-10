@@ -317,11 +317,10 @@ impl Replayer {
             }
         }
 
-        if let Err(e) = self.client.disconnect().await {
-            if !tui_active {
-                eprintln!("Warning: Error disconnecting from broker: {}", e);
-            }
-        }
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            self.client.disconnect(),
+        ).await;
 
         if !tui_active {
             eprintln!("Replay complete. {} messages replayed.", message_count);

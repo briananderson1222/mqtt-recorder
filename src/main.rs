@@ -49,7 +49,7 @@ use mqtt::{AnyMqttClient, MqttClient, MqttClientConfig, MqttClientV5, TlsConfig}
 use recorder::Recorder;
 use replayer::Replayer;
 use topics::TopicFilter;
-use tui::{should_enable_interactive, AppMode, TuiState};
+use tui::{should_enable_interactive, AppMode, AuditArea, AuditSeverity, TuiState};
 use validator::CsvValidator;
 
 /// Exit code for success (including graceful shutdown)
@@ -68,7 +68,8 @@ const EXIT_RUNTIME_ERROR: u8 = 4;
 #[tokio::main]
 async fn main() -> ExitCode {
     // Parse CLI arguments (Requirements 1.1-1.18)
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.apply_defaults();
 
     // Validate argument combinations (Requirements 1.19-1.26)
     if let Err(e) = args.validate() {
@@ -380,7 +381,13 @@ async fn run_standalone_broker(
     }
 
     // Graceful shutdown (Requirement 9.5)
+    if let Some(ref state) = tui_state {
+        state.push_audit(AuditArea::Broker, AuditSeverity::Info, "Broker shutting down".into());
+    }
     broker.shutdown().await?;
+    if let Some(ref state) = tui_state {
+        state.push_audit(AuditArea::Broker, AuditSeverity::Info, "Broker shutdown complete".into());
+    }
 
     eprintln!("Standalone broker shutdown complete.");
     Ok(())
@@ -434,8 +441,10 @@ async fn run_record_mode(
     };
 
     // Create CSV writer (Requirement 4.5: writes header row)
-    let file_path = args.file.as_ref().unwrap();
-    let writer = CsvWriter::new(file_path, args.encode_b64).map_err(|e| {
+    let file_path = args.file.clone().unwrap_or_else(|| {
+        std::path::PathBuf::from(crate::tui::generate_default_filename(args.host.as_deref()))
+    });
+    let writer = CsvWriter::new(&file_path, args.encode_b64).map_err(|e| {
         eprintln!("Error: Failed to create output file {:?}: {}", file_path, e);
         e
     })?;
@@ -545,6 +554,7 @@ async fn run_replay_mode(
     let mut replayer = Replayer::new(client, reader, args.loop_replay).await;
 
     // Run the replay loop (Requirements 5.1-5.11)
+    let tui_ref = tui_state.clone();
     let message_count = replayer.run_with_tui(shutdown, tui_state).await?;
 
     // Log completion (Requirement 8.4)
@@ -554,7 +564,13 @@ async fn run_replay_mode(
 
     // Shutdown embedded broker if started
     if let Some(broker) = broker {
+        if let Some(ref state) = tui_ref {
+            state.push_audit(AuditArea::Broker, AuditSeverity::Info, "Broker shutting down".into());
+        }
         broker.shutdown().await?;
+        if let Some(ref state) = tui_ref {
+            state.push_audit(AuditArea::Broker, AuditSeverity::Info, "Broker shutdown complete".into());
+        }
     }
 
     Ok(())
@@ -625,6 +641,7 @@ async fn run_mirror_mode(
     let mut mirror = Mirror::new(source_client, broker, writer, topics, args.get_qos()).await?;
 
     // Run the mirror loop with TUI support (Requirements 11.3-11.9)
+    let tui_ref = tui_state.clone();
     let message_count = if tui_active {
         mirror.run_with_tui(shutdown, tui_state).await?
     } else {
@@ -637,8 +654,14 @@ async fn run_mirror_mode(
     }
 
     // Shutdown embedded broker
+    if let Some(ref state) = tui_ref {
+        state.push_audit(AuditArea::Broker, AuditSeverity::Info, "Broker shutting down".into());
+    }
     let broker = mirror.into_broker();
     broker.shutdown().await?;
+    if let Some(ref state) = tui_ref {
+        state.push_audit(AuditArea::Broker, AuditSeverity::Info, "Broker shutdown complete".into());
+    }
 
     Ok(())
 }

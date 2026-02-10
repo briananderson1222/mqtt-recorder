@@ -258,9 +258,10 @@ impl Recorder {
 
         self.writer.flush()?;
 
-        if let Err(e) = self.client.disconnect().await {
-            eprintln!("Warning: Error disconnecting from broker: {}", e);
-        }
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            self.client.disconnect(),
+        ).await;
 
         Ok(message_count)
     }

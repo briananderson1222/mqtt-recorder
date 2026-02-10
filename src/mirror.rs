@@ -222,14 +222,20 @@ impl Mirror {
             eprintln!("Subscribed to {} topic(s) on external broker", topics.len());
         }
 
-        // Initial connection to local broker - poll once to establish connection
-        match self.local_client.poll().await {
-            Ok(_) => eprintln!("Connected to embedded broker for publishing"),
-            Err(e) => {
-                // Log but continue - connection might be established on first publish
-                eprintln!("Initial local broker connection status: {}", e);
+        // Spawn background task to drive the local client event loop
+        // Small delay lets the embedded broker finish binding its listener
+        let local_eventloop = self.local_client.eventloop();
+        let local_poll_handle = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            loop {
+                let mut el = local_eventloop.lock().await;
+                if let Err(e) = el.poll().await {
+                    eprintln!("Local broker event loop error: {}", e);
+                    drop(el);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
             }
-        }
+        });
 
         let mut message_count: u64 = 0;
         let mut flush_counter: u64 = 0;
@@ -283,13 +289,6 @@ impl Mirror {
 
                                 message_count += 1;
 
-                                // Poll local client to process any pending events
-                                if let Err(e) = self.poll_local_events().await {
-                                    if Self::is_fatal_error(&e) {
-                                        return Err(e);
-                                    }
-                                }
-
                                 // Poll broker metrics periodically
                                 if message_count.is_multiple_of(LOG_INTERVAL) {
                                     if let Some((old, new)) = self.broker.poll_metrics() {
@@ -314,15 +313,19 @@ impl Mirror {
             writer.flush()?;
         }
 
+        local_poll_handle.abort();
+
         // Disconnect from the source broker (Requirement 11.9)
-        if let Err(e) = self.source_client.disconnect().await {
-            eprintln!("Warning: Error disconnecting from source broker: {}", e);
-        }
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            self.source_client.disconnect(),
+        ).await;
 
         // Disconnect local client
-        if let Err(e) = self.local_client.disconnect().await {
-            eprintln!("Warning: Error disconnecting local client: {}", e);
-        }
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            self.local_client.disconnect(),
+        ).await;
 
         // Shutdown the embedded broker (Requirement 11.9)
         // Note: We need to take ownership of the broker to shut it down
@@ -363,18 +366,45 @@ impl Mirror {
             }
         }
 
-        match self.local_client.poll().await {
-            Ok(_) => {
-                if !tui_active {
-                    eprintln!("Connected to embedded broker for publishing")
+        // Spawn background task to drive the local client event loop
+        // Small delay lets the embedded broker finish binding its listener
+        let local_eventloop = self.local_client.eventloop();
+        let broker_port = self.broker.port();
+        let tui_state_bg = tui_state.clone();
+        let local_poll_handle = tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let mut connected = false;
+            loop {
+                let mut el = local_eventloop.lock().await;
+                match el.poll().await {
+                    Ok(event) => {
+                        if matches!(event, rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::ConnAck(_))) {
+                            let label = if connected { "Reconnected" } else { "Connected" };
+                            let severity = if connected { AuditSeverity::Warn } else { AuditSeverity::Info };
+                            if let Some(ref state) = tui_state_bg {
+                                state.push_audit(AuditArea::Broker, severity,
+                                    format!("Local client: {} to localhost:{}", label, broker_port));
+                            }
+                            connected = true;
+                        }
+                    }
+                    Err(e) => {
+                        if connected {
+                            if let Some(ref state) = tui_state_bg {
+                                state.push_audit(AuditArea::Broker, AuditSeverity::Warn,
+                                    format!("Local client disconnected: {}", e));
+                            }
+                            connected = false;
+                        } else if let Some(ref state) = tui_state_bg {
+                            state.push_audit(AuditArea::Broker, AuditSeverity::Error,
+                                format!("Local client: {}", e));
+                        }
+                        drop(el);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                    }
                 }
             }
-            Err(e) => {
-                if !tui_active {
-                    eprintln!("Initial local broker connection status: {}", e)
-                }
-            }
-        }
+        });
 
         let mut message_count: u64 = 0;
         let mut flush_counter: u64 = 0;
@@ -392,6 +422,7 @@ impl Mirror {
 
         let mut playback_reader: Option<CsvReader> = None;
         let mut was_playback_on = false;
+        let mut was_recording = tui_state.as_ref().map(|s| s.is_recording()).unwrap_or(true);
 
         loop {
             if let Some(ref state) = tui_state {
@@ -415,6 +446,23 @@ impl Mirror {
                                 state.push_audit(AuditArea::Playback, AuditSeverity::Error, format!(
                                     "Failed to open file: {}", e
                                 ));
+                            }
+                        }
+                    }
+                }
+            } else if playback_on && playback_reader.is_none() {
+                // Restart after one-time completion (playback_finished was cleared)
+                let finished = tui_state.as_ref().map(|s| s.is_playback_finished()).unwrap_or(true);
+                if !finished {
+                    if let Some(ref state) = tui_state {
+                        if let Some(file_path) = state.get_active_file() {
+                            match CsvReader::new(Path::new(&file_path), false, None) {
+                                Ok(reader) => playback_reader = Some(reader),
+                                Err(e) => {
+                                    state.push_audit(AuditArea::Playback, AuditSeverity::Error, format!(
+                                        "Failed to open file: {}", e
+                                    ));
+                                }
                             }
                         }
                     }
@@ -454,8 +502,9 @@ impl Mirror {
                         // Skip bad record, continue playback
                     }
                     None => {
-                        // End of file - loop or stop
-                        if playback_on {
+                        // End of file - loop or stop based on mode
+                        let looping = tui_state.as_ref().map(|s| s.is_playback_looping()).unwrap_or(false);
+                        if looping {
                             if let Err(e) = reader.reset() {
                                 if let Some(ref state) = tui_state {
                                     state.push_audit(AuditArea::Playback, AuditSeverity::Error, format!(
@@ -465,6 +514,15 @@ impl Mirror {
                                 playback_reader = None;
                             }
                         } else {
+                            // One-time mode: mark finished
+                            if let Some(ref state) = tui_state {
+                                state.playback_finished.store(true, Ordering::Relaxed);
+                                let session = state.get_playback_session_count();
+                                let total = state.get_replayed_count();
+                                state.push_audit(AuditArea::Playback, AuditSeverity::Info, format!(
+                                    "Playback complete ({} this session, {} total)", session, total
+                                ));
+                            }
                             playback_reader = None;
                         }
                     }
@@ -477,8 +535,6 @@ impl Mirror {
                 .map(|s| s.is_source_enabled())
                 .unwrap_or(true);
             if !source_enabled {
-                // Still need to poll local client for playback publishes
-                let _ = self.poll_local_events().await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 continue;
             }
@@ -500,6 +556,10 @@ impl Mirror {
                                 let topics = self.topics.topics();
                                 if !topics.is_empty() {
                                     if let Err(e) = self.source_client.subscribe(topics, self.qos).await {
+                                        if let Some(ref state) = tui_state {
+                                            state.push_audit(AuditArea::Source, AuditSeverity::Error,
+                                                format!("Re-subscribe failed: {}", e));
+                                        }
                                         if !tui_active {
                                             eprintln!("Error re-subscribing after reconnect: {}", e);
                                         }
@@ -518,6 +578,10 @@ impl Mirror {
 
                                 if should_mirror {
                                     if let Err(e) = self.republish_message(&record).await {
+                                        if let Some(ref state) = tui_state {
+                                            state.push_audit(AuditArea::Mirror, AuditSeverity::Error,
+                                                format!("Publish failed: {}", e));
+                                        }
                                         if !tui_active {
                                             eprintln!("Error republishing message: {}", e);
                                         }
@@ -556,6 +620,14 @@ impl Mirror {
                                     .as_ref()
                                     .map(|s| s.is_recording())
                                     .unwrap_or(true);
+
+                                // Flush on recording toggle off
+                                if was_recording && !should_record {
+                                    if let Some(ref mut writer) = self.writer {
+                                        let _ = writer.flush();
+                                    }
+                                }
+                                was_recording = should_record;
 
                                 if should_record {
                                     if let Some(ref mut writer) = self.writer {
@@ -618,17 +690,18 @@ impl Mirror {
             writer.flush()?;
         }
 
-        if let Err(e) = self.source_client.disconnect().await {
-            if !tui_active {
-                eprintln!("Warning: Error disconnecting from source broker: {}", e);
-            }
-        }
+        local_poll_handle.abort();
 
-        if let Err(e) = self.local_client.disconnect().await {
-            if !tui_active {
-                eprintln!("Warning: Error disconnecting local client: {}", e);
-            }
-        }
+        // Disconnect with timeouts to avoid hanging on unreachable brokers
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            self.source_client.disconnect(),
+        ).await;
+
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            self.local_client.disconnect(),
+        ).await;
 
         if !tui_active {
             eprintln!("Shutting down embedded broker...");
@@ -700,23 +773,6 @@ impl Mirror {
             .await?;
 
         Ok(())
-    }
-
-    /// Polls the local MQTT event loop to process pending events.
-    ///
-    /// This is needed to maintain the connection to the embedded broker
-    /// and handle acknowledgments.
-    async fn poll_local_events(&self) -> Result<(), MqttRecorderError> {
-        // Use a short timeout to avoid blocking
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(10),
-            self.local_client.poll(),
-        )
-        .await
-        {
-            Ok(result) => result.map(|_| ()),
-            Err(_) => Ok(()), // Timeout is fine, just means no events pending
-        }
     }
 
     /// Converts a u8 QoS value to rumqttc QoS enum.
