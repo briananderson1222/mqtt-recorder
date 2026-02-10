@@ -362,6 +362,45 @@ cargo clippy
 cargo fmt
 ```
 
+### Using Make
+
+A Makefile is provided for common tasks:
+
+```bash
+make build          # Debug build
+make release        # Release build
+make test           # Run all tests
+make test-unit      # Run unit tests only
+make test-property  # Run property-based tests
+make clippy         # Run clippy lints
+make fmt            # Format code
+make coverage       # Show coverage summary
+make coverage-html  # Generate HTML coverage report
+```
+
+### Code Coverage
+
+To generate coverage reports, install `cargo-llvm-cov`:
+
+```bash
+cargo install cargo-llvm-cov
+```
+
+Then run:
+
+```bash
+# Summary only
+make coverage
+
+# HTML report (opens target/llvm-cov/html/index.html)
+make coverage-html
+```
+
+Note: On macOS with Homebrew Rust, you may need LLVM tools:
+```bash
+brew install llvm
+```
+
 ## License
 
 This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.

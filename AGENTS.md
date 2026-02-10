@@ -8,6 +8,7 @@ This file serves as persistent context/memory for AI agents. Update it when:
 - Adding new modules, features, or architectural changes
 - The user repeatedly corrects the same behavior (capture the lesson here)
 - Important patterns or conventions are established
+- You learn something unique about this repository through trial and error
 
 **Do not** reference this file in user-facing documentation (README, doc comments, etc.) unless explicitly requested.
 
@@ -121,6 +122,41 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) format:
 
 ## Testing Guidelines
 
+### Development Approach: Test-Driven Development (TDD)
+
+This project follows strict TDD practices with property-based testing at its core:
+
+1. **Write properties first**: Before implementing a feature, define the properties it must satisfy
+2. **Add property tests**: Create property-based tests in `tests/property/` that encode these properties
+3. **Implement the feature**: Write the minimal code to make properties pass
+4. **Add integration tests**: For features involving external systems (MQTT broker, file I/O)
+5. **Refactor**: Clean up while keeping all tests green
+
+### Property-Based Testing (Required)
+
+Property tests are the primary verification mechanism. When adding new functionality:
+
+1. Identify invariants and properties the code must maintain
+2. Look at existing property tests for patterns (e.g., `tests/property/csv_props.rs`)
+3. Use `proptest` crate with appropriate strategies
+4. Test edge cases through property generation, not manual enumeration
+
+Example workflow for a new CSV feature:
+```rust
+// 1. Define the property
+proptest! {
+    #[test]
+    fn roundtrip_preserves_data(record in any_message_record()) {
+        // Write then read should return identical data
+        let written = write_record(&record);
+        let read = read_record(&written);
+        prop_assert_eq!(record, read);
+    }
+}
+
+// 2. Then implement the feature to satisfy this property
+```
+
 ### Running Tests
 
 ```bash
@@ -209,3 +245,14 @@ When modifying core logic, ensure property tests still pass.
 For questions about this codebase, refer to:
 - [README.md](README.md) for usage documentation
 - [CONTRIBUTING.md](CONTRIBUTING.md) for contribution guidelines
+
+## Lessons Learned
+
+Capture corrections and unique patterns discovered while working in this repo:
+
+### TUI and Logging
+
+- When TUI is active (`--serve` without `--no-interactive`), suppress all `eprintln!` logging
+- Use `tui_state.is_some()` or a `tui_active` boolean to conditionally log
+- Logging interferes with ratatui terminal rendering and corrupts the display
+- Keep logging enabled for `--no-interactive` and CI modes

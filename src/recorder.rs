@@ -36,12 +36,14 @@
 
 use chrono::{DateTime, Utc};
 use rumqttc::{Event, Packet, QoS};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 use crate::csv_handler::CsvWriter;
 use crate::error::MqttRecorderError;
 use crate::mqtt::MqttClient;
 use crate::topics::TopicFilter;
+use crate::tui::TuiState;
 
 /// Raw message data extracted from an MQTT publish event.
 ///
@@ -175,9 +177,22 @@ impl Recorder {
     /// let count = handle.await??;
     /// println!("Recorded {} messages", count);
     /// ```
+    #[allow(dead_code)] // Public API for library users
     pub async fn run(
         &mut self,
+        shutdown: broadcast::Receiver<()>,
+    ) -> Result<u64, MqttRecorderError> {
+        self.run_with_tui(shutdown, None).await
+    }
+
+    /// Runs the recording loop with optional TUI state updates.
+    ///
+    /// This is a wrapper around `run` that also updates the TUI state
+    /// with the message count as messages are recorded.
+    pub async fn run_with_tui(
+        &mut self,
         mut shutdown: broadcast::Receiver<()>,
+        tui_state: Option<Arc<TuiState>>,
     ) -> Result<u64, MqttRecorderError> {
         // Subscribe to the configured topics (Requirement 4.1)
         let topics = self.topics.topics();
@@ -188,23 +203,26 @@ impl Recorder {
 
         let mut message_count: u64 = 0;
         let mut flush_counter: u64 = 0;
-        const FLUSH_INTERVAL: u64 = 100; // Flush every 100 messages
+        const FLUSH_INTERVAL: u64 = 100;
 
         loop {
+            // Check if TUI requested quit
+            if let Some(ref state) = tui_state {
+                if state.is_quit_requested() {
+                    eprintln!("Quit requested from TUI, stopping recorder...");
+                    break;
+                }
+            }
+
             tokio::select! {
-                // Check for shutdown signal
                 _ = shutdown.recv() => {
                     eprintln!("Shutdown signal received, stopping recorder...");
                     break;
                 }
-
-                // Poll for MQTT events
                 event_result = self.client.poll() => {
                     match event_result {
                         Ok(event) => {
                             if let Some(msg) = self.process_event(event) {
-                                // Write the message using write_bytes to handle binary payloads
-                                // (Requirements 2.1, 2.2, 4.2-4.6)
                                 self.writer.write_bytes(
                                     msg.timestamp,
                                     &msg.topic,
@@ -215,7 +233,12 @@ impl Recorder {
                                 message_count += 1;
                                 flush_counter += 1;
 
-                                // Periodic flush for data persistence (Requirement 4.7)
+                                // Update TUI state
+                                if let Some(ref state) = tui_state {
+                                    state.increment_received();
+                                    state.increment_recorded();
+                                }
+
                                 if flush_counter >= FLUSH_INTERVAL {
                                     self.writer.flush()?;
                                     flush_counter = 0;
@@ -223,9 +246,7 @@ impl Recorder {
                             }
                         }
                         Err(e) => {
-                            // Log recoverable errors and continue (Requirement 8.5)
                             eprintln!("MQTT error: {}", e);
-                            // Check if this is a fatal connection error
                             if Self::is_fatal_error(&e) {
                                 return Err(e);
                             }
@@ -235,16 +256,11 @@ impl Recorder {
             }
         }
 
-        // Final flush before closing (Requirement 4.7, 4.9)
         self.writer.flush()?;
 
-        // Disconnect from the broker (Requirement 4.9)
         if let Err(e) = self.client.disconnect().await {
             eprintln!("Warning: Error disconnecting from broker: {}", e);
         }
-
-        // Log message count on completion (Requirement 8.4)
-        eprintln!("Recording complete. {} messages recorded.", message_count);
 
         Ok(message_count)
     }

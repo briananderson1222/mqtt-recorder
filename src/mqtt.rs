@@ -384,8 +384,8 @@ impl MqttClient {
         // Create MQTT options (Requirement 2.1, 2.2)
         let mut mqtt_options = MqttOptions::new(&client_id, &config.host, config.port);
 
-        // Set keep alive to 30 seconds
-        mqtt_options.set_keep_alive(Duration::from_secs(30));
+        // Set keep alive to 15 seconds for faster disconnection detection
+        mqtt_options.set_keep_alive(Duration::from_secs(15));
 
         // Set max packet size from config (Requirement 1.19, 1.28)
         mqtt_options.set_max_packet_size(config.max_packet_size, config.max_packet_size);

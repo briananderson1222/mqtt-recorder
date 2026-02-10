@@ -35,15 +35,19 @@
 //! - **11.8**: Log the number of messages mirrored periodically to stderr
 //! - **11.9**: WHEN the user sends an interrupt signal in mirror mode, gracefully disconnect from the external broker and shut down the embedded broker
 
+use std::path::Path;
+use std::sync::atomic::Ordering;
+
 use chrono::Utc;
 use rumqttc::{Event, Packet, QoS};
 use tokio::sync::broadcast;
 
 use crate::broker::EmbeddedBroker;
-use crate::csv_handler::{CsvWriter, MessageRecord};
+use crate::csv_handler::{CsvReader, CsvWriter, MessageRecord};
 use crate::error::MqttRecorderError;
 use crate::mqtt::MqttClient;
 use crate::topics::TopicFilter;
+use crate::tui::{AuditArea, AuditSeverity, TuiState};
 
 /// Interval for logging mirrored message count (in number of messages).
 const LOG_INTERVAL: u64 = 100;
@@ -140,6 +144,7 @@ impl Mirror {
     ) -> Result<Self, MqttRecorderError> {
         // Get a local client for publishing to the embedded broker
         let local_client = broker.get_local_client().await?;
+        broker.register_internal_client();
 
         Ok(Self {
             source_client,
@@ -246,6 +251,15 @@ impl Mirror {
                 event_result = self.source_client.poll() => {
                     match event_result {
                         Ok(event) => {
+                            // Re-subscribe on reconnection
+                            if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
+                                let topics = self.topics.topics();
+                                if !topics.is_empty() {
+                                    if let Err(e) = self.source_client.subscribe(topics, self.qos).await {
+                                        eprintln!("Error re-subscribing after reconnect: {}", e);
+                                    }
+                                }
+                            }
                             if let Some(record) = self.process_event(event) {
                                 // Republish to embedded broker (Requirements 11.4, 11.6)
                                 if let Err(e) = self.republish_message(&record).await {
@@ -269,23 +283,23 @@ impl Mirror {
 
                                 message_count += 1;
 
-                                // Log message count periodically (Requirement 11.8)
-                                if message_count.is_multiple_of(LOG_INTERVAL) {
-                                    eprintln!("Mirrored {} messages so far...", message_count);
-                                }
-
                                 // Poll local client to process any pending events
                                 if let Err(e) = self.poll_local_events().await {
                                     if Self::is_fatal_error(&e) {
                                         return Err(e);
                                     }
                                 }
+
+                                // Poll broker metrics periodically
+                                if message_count.is_multiple_of(LOG_INTERVAL) {
+                                    if let Some((old, new)) = self.broker.poll_metrics() {
+                                        eprintln!("Broker connections: {} → {}", old, new);
+                                    }
+                                }
                             }
                         }
                         Err(e) => {
-                            // Log recoverable errors and continue
                             eprintln!("MQTT error from source broker: {}", e);
-                            // Check if this is a fatal connection error
                             if Self::is_fatal_error(&e) {
                                 return Err(e);
                             }
@@ -318,6 +332,314 @@ impl Mirror {
 
         // Log message count on completion
         eprintln!("Mirror complete. {} messages mirrored.", message_count);
+
+        Ok(message_count)
+    }
+
+    /// Runs the mirror loop with TUI state support for record/passthrough toggle.
+    ///
+    /// This method is similar to `run` but checks the TUI state to determine
+    /// whether to record messages to CSV. Messages are always republished to
+    /// the embedded broker regardless of the TUI mode.
+    ///
+    /// - `AppMode::Record` - Republish AND write to CSV
+    /// - `AppMode::Passthrough` - Republish only (no CSV)
+    /// - Other modes - Same as Passthrough
+    pub async fn run_with_tui(
+        &mut self,
+        mut shutdown: broadcast::Receiver<()>,
+        tui_state: Option<std::sync::Arc<TuiState>>,
+    ) -> Result<u64, MqttRecorderError> {
+        let tui_active = tui_state.is_some();
+        let topics = self.topics.topics();
+        if !topics.is_empty() {
+            self.source_client.subscribe(topics, self.qos).await?;
+            // Mark source as connected after successful subscribe
+            if let Some(ref state) = tui_state {
+                state.set_source_connected(true);
+            }
+            if !tui_active {
+                eprintln!("Subscribed to {} topic(s) on external broker", topics.len());
+            }
+        }
+
+        match self.local_client.poll().await {
+            Ok(_) => {
+                if !tui_active {
+                    eprintln!("Connected to embedded broker for publishing")
+                }
+            }
+            Err(e) => {
+                if !tui_active {
+                    eprintln!("Initial local broker connection status: {}", e)
+                }
+            }
+        }
+
+        let mut message_count: u64 = 0;
+        let mut flush_counter: u64 = 0;
+
+        if !tui_active {
+            eprintln!(
+                "Mirror mode started. Recording to file: {}",
+                if self.writer.is_some() {
+                    "yes (toggleable)"
+                } else {
+                    "no"
+                }
+            );
+        }
+
+        let mut playback_reader: Option<CsvReader> = None;
+        let mut was_playback_on = false;
+
+        loop {
+            if let Some(ref state) = tui_state {
+                if state.is_quit_requested() {
+                    break;
+                }
+            }
+
+            // Handle playback state transitions
+            let playback_on = tui_state
+                .as_ref()
+                .map(|s| s.loop_enabled.load(Ordering::Relaxed) && !s.is_recording())
+                .unwrap_or(false);
+
+            if playback_on && !was_playback_on {
+                if let Some(ref state) = tui_state {
+                    if let Some(file_path) = state.get_active_file() {
+                        match CsvReader::new(Path::new(&file_path), false, None) {
+                            Ok(reader) => playback_reader = Some(reader),
+                            Err(e) => {
+                                state.push_audit(AuditArea::Playback, AuditSeverity::Error, format!(
+                                    "Failed to open file: {}", e
+                                ));
+                            }
+                        }
+                    }
+                }
+            } else if !playback_on && was_playback_on {
+                playback_reader = None;
+            }
+            was_playback_on = playback_on;
+
+            // Process one playback record if active
+            if let Some(ref mut reader) = playback_reader {
+                match reader.read_next() {
+                    Some(Ok(record)) => {
+                        match self.republish_message(&record).await {
+                            Ok(()) => {
+                                if let Some(ref state) = tui_state {
+                                    state.increment_replayed();
+                                    state.increment_published();
+                                }
+                            }
+                            Err(e) => {
+                                if !tui_active {
+                                    eprintln!("Playback publish error: {}", e);
+                                }
+                                if Self::is_fatal_error(&e) {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                    Some(Err(e)) => {
+                        if let Some(ref state) = tui_state {
+                            state.push_audit(AuditArea::Playback, AuditSeverity::Warn, format!(
+                                "Skipped bad CSV record: {}", e
+                            ));
+                        }
+                        // Skip bad record, continue playback
+                    }
+                    None => {
+                        // End of file - loop or stop
+                        if playback_on {
+                            if let Err(e) = reader.reset() {
+                                if let Some(ref state) = tui_state {
+                                    state.push_audit(AuditArea::Playback, AuditSeverity::Error, format!(
+                                        "Failed to reset reader: {}", e
+                                    ));
+                                }
+                                playback_reader = None;
+                            }
+                        } else {
+                            playback_reader = None;
+                        }
+                    }
+                }
+            }
+
+            // Check if source is enabled (pause incoming messages)
+            let source_enabled = tui_state
+                .as_ref()
+                .map(|s| s.is_source_enabled())
+                .unwrap_or(true);
+            if !source_enabled {
+                // Still need to poll local client for playback publishes
+                let _ = self.poll_local_events().await;
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                continue;
+            }
+
+            tokio::select! {
+                _ = shutdown.recv() => {
+                    break;
+                }
+
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)), if playback_reader.is_some() => {
+                    // Yield to process playback records at top of loop
+                }
+
+                event_result = self.source_client.poll() => {
+                    match event_result {
+                        Ok(event) => {
+                            // Re-subscribe on reconnection
+                            if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
+                                let topics = self.topics.topics();
+                                if !topics.is_empty() {
+                                    if let Err(e) = self.source_client.subscribe(topics, self.qos).await {
+                                        if !tui_active {
+                                            eprintln!("Error re-subscribing after reconnect: {}", e);
+                                        }
+                                    }
+                                }
+                                if let Some(ref state) = tui_state {
+                                    state.set_source_connected(true);
+                                }
+                            }
+                            if let Some(record) = self.process_event(event) {
+                                // Check if mirroring is enabled
+                                let should_mirror = tui_state
+                                    .as_ref()
+                                    .map(|s| s.is_mirroring())
+                                    .unwrap_or(true);
+
+                                if should_mirror {
+                                    if let Err(e) = self.republish_message(&record).await {
+                                        if !tui_active {
+                                            eprintln!("Error republishing message: {}", e);
+                                        }
+                                        if Self::is_fatal_error(&e) {
+                                            return Err(e);
+                                        }
+                                    } else if let Some(ref state) = tui_state {
+                                        state.increment_mirrored();
+                                        state.increment_published();
+                                    }
+                                }
+
+                                // Check for file path change
+                                if let Some(ref state) = tui_state {
+                                    if let Some(new_path) = state.take_new_file() {
+                                        // Flush and close old writer
+                                        if let Some(ref mut writer) = self.writer {
+                                            let _ = writer.flush();
+                                        }
+                                        // Create new writer
+                                        match CsvWriter::new(std::path::Path::new(&new_path), false) {
+                                            Ok(new_writer) => {
+                                                self.writer = Some(new_writer);
+                                            }
+                                            Err(e) => {
+                                                if !tui_active {
+                                                    eprintln!("Error creating new file: {}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check if recording is enabled
+                                let should_record = tui_state
+                                    .as_ref()
+                                    .map(|s| s.is_recording())
+                                    .unwrap_or(true);
+
+                                if should_record {
+                                    if let Some(ref mut writer) = self.writer {
+                                        writer.write(&record)?;
+                                        flush_counter += 1;
+
+                                        if let Some(ref state) = tui_state {
+                                            state.increment_recorded();
+                                        }
+
+                                        if flush_counter >= LOG_INTERVAL {
+                                            writer.flush()?;
+                                            flush_counter = 0;
+                                        }
+                                    }
+                                }
+
+                                message_count += 1;
+
+                                if let Some(ref state) = tui_state {
+                                    state.increment_received();
+                                }
+
+                                if let Err(e) = self.poll_local_events().await {
+                                    if Self::is_fatal_error(&e) {
+                                        return Err(e);
+                                    }
+                                }
+
+                                // Poll broker metrics periodically
+                                if message_count.is_multiple_of(LOG_INTERVAL) {
+                                    if let Some((old, new)) = self.broker.poll_metrics() {
+                                        if let Some(ref state) = tui_state {
+                                            state.set_broker_connections(new);
+                                        }
+                                        if !tui_active {
+                                            eprintln!("Broker connections: {} → {}", old, new);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(ref state) = tui_state {
+                                state.push_audit(AuditArea::Source, AuditSeverity::Error, format!("{}", e));
+                                state.set_source_connected(false);
+                            }
+                            if !tui_active {
+                                eprintln!("MQTT error from source broker: {}", e);
+                            }
+                            if Self::is_fatal_error(&e) {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Mark disconnected on exit
+        if let Some(ref state) = tui_state {
+            state.set_source_connected(false);
+        }
+
+        if let Some(ref mut writer) = self.writer {
+            writer.flush()?;
+        }
+
+        if let Err(e) = self.source_client.disconnect().await {
+            if !tui_active {
+                eprintln!("Warning: Error disconnecting from source broker: {}", e);
+            }
+        }
+
+        if let Err(e) = self.local_client.disconnect().await {
+            if !tui_active {
+                eprintln!("Warning: Error disconnecting local client: {}", e);
+            }
+        }
+
+        if !tui_active {
+            eprintln!("Shutting down embedded broker...");
+            eprintln!("Mirror complete. {} messages mirrored.", message_count);
+        }
 
         Ok(message_count)
     }
@@ -357,15 +679,9 @@ impl Mirror {
 
                 Some(MessageRecord::new(timestamp, topic, payload, qos, retain))
             }
-            // Log connection events for debugging
-            Event::Incoming(Packet::ConnAck(_)) => {
-                eprintln!("Connected to external MQTT broker");
-                None
-            }
-            Event::Incoming(Packet::SubAck(_)) => {
-                eprintln!("Subscription acknowledged by external broker");
-                None
-            }
+            // Log connection events for debugging (only in non-TUI mode)
+            Event::Incoming(Packet::ConnAck(_)) => None,
+            Event::Incoming(Packet::SubAck(_)) => None,
             // Ignore other events
             _ => None,
         }
@@ -395,7 +711,12 @@ impl Mirror {
         // Publish with preserved topic, payload, QoS, and retain flag
         self.local_client
             .publish(&record.topic, record.payload.as_bytes(), qos, record.retain)
-            .await
+            .await?;
+
+        // Poll to actually send the message - rumqttc queues publishes until polled
+        let _ = self.local_client.poll().await;
+
+        Ok(())
     }
 
     /// Polls the local MQTT event loop to process pending events.
@@ -448,8 +769,8 @@ impl Mirror {
     /// Returns `true` if the error is fatal and mirroring should stop.
     fn is_fatal_error(error: &MqttRecorderError) -> bool {
         match error {
-            // Connection errors are typically fatal
-            MqttRecorderError::Connection(_) => true,
+            // Connection errors are recoverable (rumqttc auto-reconnects)
+            MqttRecorderError::Connection(_) => false,
             // Client errors might be recoverable
             MqttRecorderError::Client(_) => false,
             // IO errors are fatal

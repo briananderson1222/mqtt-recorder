@@ -25,6 +25,7 @@ use rumqttd::{Broker, Config, ConnectionSettings, RouterConfig, ServerSettings};
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 /// The operational mode of the embedded broker.
@@ -97,6 +98,14 @@ pub struct EmbeddedBroker {
     /// The port the broker is listening on
     #[allow(dead_code)]
     port: u16,
+    /// Metrics link for polling connection counts
+    meters_link: Option<rumqttd::meters::MetersLink>,
+    /// Cached connection count
+    connection_count: AtomicUsize,
+    /// Cached subscription count
+    subscription_count: AtomicUsize,
+    /// Number of internal clients to subtract from connection count
+    internal_clients: AtomicUsize,
 }
 
 impl EmbeddedBroker {
@@ -143,6 +152,9 @@ impl EmbeddedBroker {
         // Create and start the broker
         let mut broker = Broker::new(config);
 
+        // Capture metrics link before moving broker to thread
+        let meters_link = broker.meters().ok();
+
         // Start the broker in a separate thread (broker.start() is blocking)
         let handle = thread::spawn(move || {
             if let Err(e) = broker.start() {
@@ -157,6 +169,10 @@ impl EmbeddedBroker {
             _handle: BrokerHandle { _thread: handle },
             mode,
             port,
+            meters_link,
+            connection_count: AtomicUsize::new(0),
+            subscription_count: AtomicUsize::new(0),
+            internal_clients: AtomicUsize::new(0),
         })
     }
 
@@ -312,6 +328,31 @@ impl EmbeddedBroker {
     #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Poll broker metrics. Returns Some((old, new)) if connection count changed.
+    /// Connection count excludes internal clients.
+    pub fn poll_metrics(&self) -> Option<(usize, usize)> {
+        let link = self.meters_link.as_ref()?;
+        let meters = link.recv().ok()?;
+        let offset = self.internal_clients.load(Ordering::Relaxed);
+        for meter in meters {
+            if let rumqttd::Meter::Router(_, router_meter) = meter {
+                let new_conn = router_meter.total_connections.saturating_sub(offset);
+                let new_sub = router_meter.total_subscriptions;
+                self.subscription_count.store(new_sub, Ordering::Relaxed);
+                let old = self.connection_count.swap(new_conn, Ordering::Relaxed);
+                if old != new_conn {
+                    return Some((old, new_conn));
+                }
+            }
+        }
+        None
+    }
+
+    /// Register an internal client so it's excluded from the connection count.
+    pub fn register_internal_client(&self) {
+        self.internal_clients.fetch_add(1, Ordering::Relaxed);
     }
 }
 

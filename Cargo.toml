@@ -43,6 +43,11 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 anyhow = "1"
 
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+atty = "0.2"
+
 [dev-dependencies]
 # Property-based testing
 proptest = "1"
@@ -63,3 +68,16 @@ path = "tests/property/csv_props.rs"
 [[test]]
 name = "csv_validation_props"
 path = "tests/property/csv_validation_props.rs"
+
+[[test]]
+name = "tui_props"
+path = "tests/property/tui_props.rs"
+
+[[test]]
+name = "broker_metrics_props"
+path = "tests/property/broker_metrics_props.rs"
+
+
+[[test]]
+name = "mirror_test"
+path = "tests/integration/mirror_test.rs"

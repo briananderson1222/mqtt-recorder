@@ -32,6 +32,7 @@ mod mqtt;
 mod recorder;
 mod replayer;
 mod topics;
+mod tui;
 mod validator;
 
 use clap::Parser;
@@ -48,6 +49,7 @@ use mqtt::{MqttClient, MqttClientConfig, TlsConfig};
 use recorder::Recorder;
 use replayer::Replayer;
 use topics::TopicFilter;
+use tui::{should_enable_interactive, AppMode, TuiState};
 use validator::CsvValidator;
 
 /// Exit code for success (including graceful shutdown)
@@ -120,17 +122,77 @@ async fn run(args: Args) -> Result<(), MqttRecorderError> {
         let _ = shutdown_tx_signal.send(());
     });
 
+    // Determine if TUI should be enabled (only for long-running serve modes)
+    let enable_tui = args.serve && should_enable_interactive(args.no_interactive);
+
+    // Create TUI state if enabled
+    let tui_state = if enable_tui {
+        let initial_mode = match args.mode {
+            Some(Mode::Record) => AppMode::Record,
+            Some(Mode::Replay) => AppMode::Replay,
+            Some(Mode::Mirror) => AppMode::Mirror,
+            None => AppMode::Passthrough,
+        };
+        let file_path = args.file.as_ref().map(|p| p.display().to_string());
+        let playlist: Vec<String> = args
+            .playlist
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        let tui = std::sync::Arc::new(TuiState::new(
+            initial_mode,
+            args.serve_port,
+            file_path,
+            args.host.clone(),
+            args.port,
+            args.record,
+            args.mirror,
+            playlist,
+        ));
+        if let Some(ref path) = args.audit_log {
+            tui.set_audit_file_path(path.display().to_string());
+        }
+        Some(tui)
+    } else {
+        None
+    };
+
+    // Spawn TUI task if enabled
+    let tui_handle = if let Some(ref state) = tui_state {
+        let state_clone = state.clone();
+        let shutdown_tx_clone = shutdown_tx.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            if let Err(e) = tui::run_tui(state_clone, shutdown_tx_clone, shutdown_rx).await {
+                eprintln!("TUI error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
     // Dispatch to the appropriate mode handler
-    if args.is_standalone_broker() {
+    let result = if args.is_standalone_broker() {
         // Standalone broker mode (Requirement 1.26)
-        run_standalone_broker(&args, shutdown_tx.subscribe()).await
+        run_standalone_broker(&args, shutdown_tx.subscribe(), tui_state.clone()).await
     } else {
         match args.mode.as_ref().unwrap() {
-            Mode::Record => run_record_mode(&args, shutdown_tx.subscribe()).await,
-            Mode::Replay => run_replay_mode(&args, shutdown_tx.subscribe()).await,
-            Mode::Mirror => run_mirror_mode(&args, shutdown_tx.subscribe()).await,
+            Mode::Record => {
+                run_record_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
+            }
+            Mode::Replay => run_replay_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await,
+            Mode::Mirror => {
+                run_mirror_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
+            }
         }
+    };
+
+    // Wait for TUI to finish if it was running
+    if let Some(handle) = tui_handle {
+        let _ = handle.await;
     }
+
+    result
 }
 
 /// Wait for SIGINT (Ctrl+C) or SIGTERM signals.
@@ -285,19 +347,35 @@ fn run_fix_mode(args: &Args) -> Result<(), MqttRecorderError> {
 async fn run_standalone_broker(
     args: &Args,
     mut shutdown: broadcast::Receiver<()>,
+    tui_state: Option<std::sync::Arc<TuiState>>,
 ) -> Result<(), MqttRecorderError> {
     eprintln!("Starting standalone MQTT broker mode...");
 
     // Start the embedded broker
     let broker = EmbeddedBroker::new(args.serve_port, BrokerMode::Standalone).await?;
 
+    let tui_active = tui_state.is_some();
     eprintln!(
         "Embedded broker running on port {}. Press Ctrl+C to stop.",
         args.serve_port
     );
 
-    // Wait for shutdown signal
-    let _ = shutdown.recv().await;
+    // Poll metrics while waiting for shutdown
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+                if let Some((old, new)) = broker.poll_metrics() {
+                    if let Some(ref state) = tui_state {
+                        state.set_broker_connections(new);
+                    }
+                    if !tui_active {
+                        eprintln!("Broker connections: {} → {}", old, new);
+                    }
+                }
+            }
+        }
+    }
 
     // Graceful shutdown (Requirement 9.5)
     broker.shutdown().await?;
@@ -317,8 +395,17 @@ async fn run_standalone_broker(
 async fn run_record_mode(
     args: &Args,
     shutdown: broadcast::Receiver<()>,
+    tui_state: Option<std::sync::Arc<TuiState>>,
 ) -> Result<(), MqttRecorderError> {
     eprintln!("Starting record mode...");
+
+    // Optionally start embedded broker for passthrough
+    let _broker = if args.serve {
+        eprintln!("Starting embedded broker on port {}...", args.serve_port);
+        Some(EmbeddedBroker::new(args.serve_port, BrokerMode::Replay).await?)
+    } else {
+        None
+    };
 
     // Create MQTT client configuration
     let client_config = create_mqtt_client_config(args)?;
@@ -350,7 +437,7 @@ async fn run_record_mode(
     let mut recorder = Recorder::new(client, writer, topics, args.get_qos()).await;
 
     // Run the recording loop (Requirements 4.1-4.9)
-    let message_count = recorder.run(shutdown).await?;
+    let message_count = recorder.run_with_tui(shutdown, tui_state).await?;
 
     // Log completion (Requirement 8.4)
     eprintln!("Recording complete. {} messages recorded.", message_count);
@@ -371,12 +458,18 @@ async fn run_record_mode(
 async fn run_replay_mode(
     args: &Args,
     shutdown: broadcast::Receiver<()>,
+    tui_state: Option<std::sync::Arc<TuiState>>,
 ) -> Result<(), MqttRecorderError> {
-    eprintln!("Starting replay mode...");
+    let tui_active = tui_state.is_some();
+    if !tui_active {
+        eprintln!("Starting replay mode...");
+    }
 
     // Optionally start embedded broker (Requirement 10.3)
-    let _broker = if args.serve {
-        eprintln!("Starting embedded broker on port {}...", args.serve_port);
+    let broker = if args.serve {
+        if !tui_active {
+            eprintln!("Starting embedded broker on port {}...", args.serve_port);
+        }
         Some(EmbeddedBroker::new(args.serve_port, BrokerMode::Replay).await?)
     } else {
         None
@@ -386,7 +479,9 @@ async fn run_replay_mode(
     let client = if let Some(host) = &args.host {
         // Connect to external broker
         let client_config = create_mqtt_client_config(args)?;
-        eprintln!("Connecting to MQTT broker at {}:{}...", host, args.port);
+        if !tui_active {
+            eprintln!("Connecting to MQTT broker at {}:{}...", host, args.port);
+        }
         MqttClient::new(client_config).await.map_err(|e| {
             eprintln!("Error: Connection failed: {}", e);
             eprintln!("  Hint: Verify the broker is running and the host/port are correct");
@@ -399,11 +494,17 @@ async fn run_replay_mode(
             args.serve_port,
             generate_client_id(&args.client_id),
         );
-        eprintln!(
-            "Connecting to embedded broker on port {}...",
-            args.serve_port
-        );
-        MqttClient::new(config).await?
+        if !tui_active {
+            eprintln!(
+                "Connecting to embedded broker on port {}...",
+                args.serve_port
+            );
+        }
+        let client = MqttClient::new(config).await?;
+        if let Some(ref b) = broker {
+            b.register_internal_client();
+        }
+        client
     } else {
         // This shouldn't happen due to validation, but handle it anyway
         return Err(MqttRecorderError::InvalidArgument(
@@ -423,13 +524,15 @@ async fn run_replay_mode(
     let mut replayer = Replayer::new(client, reader, args.loop_replay).await;
 
     // Run the replay loop (Requirements 5.1-5.11)
-    let message_count = replayer.run(shutdown).await?;
+    let message_count = replayer.run_with_tui(shutdown, tui_state).await?;
 
     // Log completion (Requirement 8.4)
-    eprintln!("Replay complete. {} messages replayed.", message_count);
+    if !tui_active {
+        eprintln!("Replay complete. {} messages replayed.", message_count);
+    }
 
     // Shutdown embedded broker if started
-    if let Some(broker) = _broker {
+    if let Some(broker) = broker {
         broker.shutdown().await?;
     }
 
@@ -448,8 +551,12 @@ async fn run_replay_mode(
 async fn run_mirror_mode(
     args: &Args,
     shutdown: broadcast::Receiver<()>,
+    tui_state: Option<std::sync::Arc<TuiState>>,
 ) -> Result<(), MqttRecorderError> {
-    eprintln!("Starting mirror mode...");
+    let tui_active = tui_state.is_some();
+    if !tui_active {
+        eprintln!("Starting mirror mode...");
+    }
 
     // Start embedded broker (Requirement 11.2: mirror mode requires --serve)
     let broker = EmbeddedBroker::new(args.serve_port, BrokerMode::Mirror).await?;
@@ -458,10 +565,12 @@ async fn run_mirror_mode(
     let source_config = create_mqtt_client_config(args)?;
 
     // Log connection attempt (Requirement 8.3)
-    eprintln!(
-        "Connecting to source MQTT broker at {}:{}...",
-        source_config.host, source_config.port
-    );
+    if !tui_active {
+        eprintln!(
+            "Connecting to source MQTT broker at {}:{}...",
+            source_config.host, source_config.port
+        );
+    }
 
     // Create source MQTT client
     let source_client = MqttClient::new(source_config).await.map_err(|e| {
@@ -486,11 +595,17 @@ async fn run_mirror_mode(
     // Create and run mirror
     let mut mirror = Mirror::new(source_client, broker, writer, topics, args.get_qos()).await?;
 
-    // Run the mirror loop (Requirements 11.3-11.9)
-    let message_count = mirror.run(shutdown).await?;
+    // Run the mirror loop with TUI support (Requirements 11.3-11.9)
+    let message_count = if tui_active {
+        mirror.run_with_tui(shutdown, tui_state).await?
+    } else {
+        mirror.run(shutdown).await?
+    };
 
     // Log completion (Requirement 8.4)
-    eprintln!("Mirror complete. {} messages mirrored.", message_count);
+    if !tui_active {
+        eprintln!("Mirror complete. {} messages mirrored.", message_count);
+    }
 
     // Shutdown embedded broker
     let broker = mirror.into_broker();
@@ -633,6 +748,11 @@ mod tests {
             validate: false,
             fix: false,
             output: None,
+            no_interactive: false,
+            record: None,
+            mirror: true,
+            playlist: vec![],
+            audit_log: None,
         }
     }
 

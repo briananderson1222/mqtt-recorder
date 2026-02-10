@@ -34,14 +34,17 @@
 //! - **5.10**: IF the CSV file contains invalid data, report the parsing error and exit
 //! - **5.11**: WHEN the user sends an interrupt signal (Ctrl+C), gracefully disconnect from the broker
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use rumqttc::QoS;
 use tokio::sync::broadcast;
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, Instant};
 
 use crate::csv_handler::{CsvReader, MessageRecord};
 use crate::error::MqttRecorderError;
 use crate::mqtt::MqttClient;
+use crate::tui::TuiState;
 
 /// Replayer for publishing MQTT messages from a CSV file.
 ///
@@ -160,33 +163,56 @@ impl Replayer {
     /// let count = handle.await??;
     /// println!("Replayed {} messages", count);
     /// ```
+    #[allow(dead_code)]
     pub async fn run(
         &mut self,
-        mut shutdown: broadcast::Receiver<()>,
+        shutdown: broadcast::Receiver<()>,
     ) -> Result<u64, MqttRecorderError> {
+        self.run_with_tui(shutdown, None).await
+    }
+
+    pub async fn run_with_tui(
+        &mut self,
+        mut shutdown: broadcast::Receiver<()>,
+        tui_state: Option<Arc<TuiState>>,
+    ) -> Result<u64, MqttRecorderError> {
+        let tui_active = tui_state.is_some();
         let mut message_count: u64 = 0;
         let mut previous_timestamp: Option<DateTime<Utc>> = None;
 
-        eprintln!(
-            "Starting replay (loop: {})",
-            if self.loop_replay {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        );
+        if !tui_active {
+            eprintln!(
+                "Starting replay (loop: {})",
+                if self.loop_replay {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+        }
 
         // Initial connection check - poll once to establish connection
         match self.client.poll().await {
-            Ok(_) => eprintln!("Connected to MQTT broker"),
+            Ok(_) => {
+                if !tui_active {
+                    eprintln!("Connected to MQTT broker");
+                }
+            }
             Err(e) => {
-                // Log but continue - connection might be established on first publish
-                eprintln!("Initial connection status: {}", e);
+                if !tui_active {
+                    eprintln!("Initial connection status: {}", e);
+                }
             }
         }
 
         loop {
-            // Read the next message from CSV (Requirements 5.1, 5.9, 5.10)
+            // Check if TUI requested quit
+            if let Some(ref state) = tui_state {
+                if state.is_quit_requested() {
+                    break;
+                }
+            }
+
             let record_result = self.reader.next();
 
             match record_result {
@@ -195,38 +221,55 @@ impl Replayer {
                     if let Some(prev_ts) = previous_timestamp {
                         let delay = Self::calculate_delay(&prev_ts, &record.timestamp);
                         if delay > Duration::ZERO {
-                            // Use tokio::select to allow shutdown during delay
-                            tokio::select! {
-                                _ = shutdown.recv() => {
-                                    eprintln!("Shutdown signal received during delay, stopping replayer...");
+                            // Poll event loop continuously during delay to keep connection alive
+                            let deadline = Instant::now() + delay;
+                            loop {
+                                let remaining = deadline.saturating_duration_since(Instant::now());
+                                if remaining.is_zero() {
                                     break;
                                 }
-                                _ = sleep(delay) => {
-                                    // Delay completed, continue with publish
+                                tokio::select! {
+                                    _ = shutdown.recv() => {
+                                        if !tui_active {
+                                            eprintln!("Shutdown signal received during delay, stopping replayer...");
+                                        }
+                                        return Ok(message_count);
+                                    }
+                                    // Poll event loop to handle pings; this drives the connection
+                                    poll_result = self.client.poll() => {
+                                        match poll_result {
+                                            Ok(_) => {}
+                                            Err(e) if Self::is_fatal_error(&e) => return Err(e),
+                                            Err(_) => {}
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
 
-                    // Update previous timestamp for next iteration
                     previous_timestamp = Some(record.timestamp);
 
                     // Publish the message (Requirements 5.2, 5.3, 5.4)
                     match self.publish_message(&record).await {
                         Ok(()) => {
                             message_count += 1;
+                            if let Some(ref state) = tui_state {
+                                state.increment_replayed();
+                                state.increment_published();
+                            }
                         }
                         Err(e) => {
-                            eprintln!("Error publishing message: {}", e);
-                            // Check if this is a fatal error
+                            if !tui_active {
+                                eprintln!("Error publishing message: {}", e);
+                            }
                             if Self::is_fatal_error(&e) {
                                 return Err(e);
                             }
                         }
                     }
 
-                    // Poll the event loop to process any pending events
-                    // This is needed to maintain the connection
+                    // Poll to process pending events
                     if let Err(e) = self.poll_events().await {
                         if Self::is_fatal_error(&e) {
                             return Err(e);
@@ -236,52 +279,53 @@ impl Replayer {
                     // Check for shutdown signal (non-blocking)
                     match shutdown.try_recv() {
                         Ok(_) => {
-                            eprintln!("Shutdown signal received, stopping replayer...");
+                            if !tui_active {
+                                eprintln!("Shutdown signal received, stopping replayer...");
+                            }
                             break;
                         }
-                        Err(broadcast::error::TryRecvError::Empty) => {
-                            // No shutdown signal, continue
-                        }
+                        Err(broadcast::error::TryRecvError::Empty) => {}
                         Err(broadcast::error::TryRecvError::Closed) => {
-                            // Channel closed, treat as shutdown
-                            eprintln!("Shutdown channel closed, stopping replayer...");
+                            if !tui_active {
+                                eprintln!("Shutdown channel closed, stopping replayer...");
+                            }
                             break;
                         }
-                        Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                            // Missed some signals, but continue
-                        }
+                        Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                     }
                 }
                 Some(Err(e)) => {
-                    // CSV parsing error (Requirement 5.10)
-                    eprintln!("Error reading CSV record: {}", e);
+                    if !tui_active {
+                        eprintln!("Error reading CSV record: {}", e);
+                    }
                     return Err(e);
                 }
                 None => {
-                    // End of file reached
                     if self.loop_replay {
-                        // Reset reader and continue (Requirement 5.7)
-                        eprintln!(
-                            "End of file reached, restarting replay... ({} messages so far)",
-                            message_count
-                        );
+                        if !tui_active {
+                            eprintln!(
+                                "End of file reached, restarting replay... ({} messages so far)",
+                                message_count
+                            );
+                        }
                         self.reader.reset()?;
                         previous_timestamp = None;
                     } else {
-                        // Exit after replaying all messages (Requirement 5.8)
                         break;
                     }
                 }
             }
         }
 
-        // Disconnect from the broker (Requirement 5.11)
         if let Err(e) = self.client.disconnect().await {
-            eprintln!("Warning: Error disconnecting from broker: {}", e);
+            if !tui_active {
+                eprintln!("Warning: Error disconnecting from broker: {}", e);
+            }
         }
 
-        // Log message count on completion (Requirement 8.4)
-        eprintln!("Replay complete. {} messages replayed.", message_count);
+        if !tui_active {
+            eprintln!("Replay complete. {} messages replayed.", message_count);
+        }
 
         Ok(message_count)
     }

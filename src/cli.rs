@@ -138,6 +138,26 @@ pub struct Args {
     /// Output file path for --fix mode
     #[arg(long)]
     pub output: Option<PathBuf>,
+
+    /// Disable interactive TUI mode
+    #[arg(long, default_value = "false")]
+    pub no_interactive: bool,
+
+    /// Start with recording enabled (default: true if --file provided)
+    #[arg(long)]
+    pub record: Option<bool>,
+
+    /// Start with mirroring enabled (default: true)
+    #[arg(long, default_value = "true")]
+    pub mirror: bool,
+
+    /// Additional CSV files for playback selection (can be specified multiple times)
+    #[arg(long = "playlist")]
+    pub playlist: Vec<PathBuf>,
+
+    /// Path to write audit log file (use 'a' key in TUI to toggle writing)
+    #[arg(long)]
+    pub audit_log: Option<PathBuf>,
 }
 
 impl Args {
@@ -346,6 +366,11 @@ mod tests {
             validate: false,
             fix: false,
             output: None,
+            no_interactive: false,
+            record: None,
+            mirror: true,
+            playlist: vec![],
+            audit_log: None,
         }
     }
 
