@@ -414,16 +414,24 @@ async fn run_record_mode(
 
     // Log connection attempt (Requirement 8.3)
     eprintln!(
-        "Connecting to MQTT broker at {}:{}...",
-        client_config.host, client_config.port
+        "Connecting to MQTT broker at {}:{} (MQTT v{})...",
+        client_config.host, client_config.port, args.mqtt_version
     );
 
-    // Create MQTT client
-    let client = MqttClient::new(client_config).await.map_err(|e| {
-        eprintln!("Error: Connection failed: {}", e);
-        eprintln!("  Hint: Verify the broker is running and the host/port are correct");
-        e
-    })?;
+    // Create MQTT client (v5 by default, v4 if specified)
+    let client = if args.use_mqtt_v5() {
+        AnyMqttClient::V5(MqttClientV5::new(client_config).await.map_err(|e| {
+            eprintln!("Error: Connection failed: {}", e);
+            eprintln!("  Hint: Verify the broker is running and the host/port are correct");
+            e
+        })?)
+    } else {
+        AnyMqttClient::V4(MqttClient::new(client_config).await.map_err(|e| {
+            eprintln!("Error: Connection failed: {}", e);
+            eprintln!("  Hint: Verify the broker is running and the host/port are correct");
+            e
+        })?)
+    };
 
     // Create CSV writer (Requirement 4.5: writes header row)
     let file_path = args.file.as_ref().unwrap();
@@ -436,7 +444,7 @@ async fn run_record_mode(
     let topics = create_topic_filter(args)?;
 
     // Create and run recorder
-    let mut recorder = Recorder::new(AnyMqttClient::V4(client), writer, topics, args.get_qos()).await;
+    let mut recorder = Recorder::new(client, writer, topics, args.get_qos()).await;
 
     // Run the recording loop (Requirements 4.1-4.9)
     let message_count = recorder.run_with_tui(shutdown, tui_state).await?;
@@ -479,17 +487,27 @@ async fn run_replay_mode(
 
     // Determine which client to use for publishing
     let client = if let Some(host) = &args.host {
-        // Connect to external broker
+        // Connect to external broker (v5 by default, v4 if specified)
         let client_config = create_mqtt_client_config(args)?;
         if !tui_active {
-            eprintln!("Connecting to MQTT broker at {}:{}...", host, args.port);
+            eprintln!(
+                "Connecting to MQTT broker at {}:{} (MQTT v{})...",
+                host, args.port, args.mqtt_version
+            );
         }
-        let c = MqttClient::new(client_config).await.map_err(|e| {
-            eprintln!("Error: Connection failed: {}", e);
-            eprintln!("  Hint: Verify the broker is running and the host/port are correct");
-            e
-        })?;
-        AnyMqttClient::V4(c)
+        if args.use_mqtt_v5() {
+            AnyMqttClient::V5(MqttClientV5::new(client_config).await.map_err(|e| {
+                eprintln!("Error: Connection failed: {}", e);
+                eprintln!("  Hint: Verify the broker is running and the host/port are correct");
+                e
+            })?)
+        } else {
+            AnyMqttClient::V4(MqttClient::new(client_config).await.map_err(|e| {
+                eprintln!("Error: Connection failed: {}", e);
+                eprintln!("  Hint: Verify the broker is running and the host/port are correct");
+                e
+            })?)
+        }
     } else if args.serve {
         // Connect to embedded broker via v5 (Requirement 1.22: host optional with --serve)
         let config = MqttClientConfig::new(
@@ -570,17 +588,25 @@ async fn run_mirror_mode(
     // Log connection attempt (Requirement 8.3)
     if !tui_active {
         eprintln!(
-            "Connecting to source MQTT broker at {}:{}...",
-            source_config.host, source_config.port
+            "Connecting to source MQTT broker at {}:{} (MQTT v{})...",
+            source_config.host, source_config.port, args.mqtt_version
         );
     }
 
-    // Create source MQTT client
-    let source_client = MqttClient::new(source_config).await.map_err(|e| {
-        eprintln!("Error: Connection to source broker failed: {}", e);
-        eprintln!("  Hint: Verify the broker is running and the host/port are correct");
-        e
-    })?;
+    // Create source MQTT client (v5 by default, v4 if specified)
+    let source_client = if args.use_mqtt_v5() {
+        AnyMqttClient::V5(MqttClientV5::new(source_config).await.map_err(|e| {
+            eprintln!("Error: Connection to source broker failed: {}", e);
+            eprintln!("  Hint: Verify the broker is running and the host/port are correct");
+            e
+        })?)
+    } else {
+        AnyMqttClient::V4(MqttClient::new(source_config).await.map_err(|e| {
+            eprintln!("Error: Connection to source broker failed: {}", e);
+            eprintln!("  Hint: Verify the broker is running and the host/port are correct");
+            e
+        })?)
+    };
 
     // Optionally create CSV writer (Requirement 11.5)
     let writer = if let Some(file_path) = &args.file {
@@ -596,7 +622,7 @@ async fn run_mirror_mode(
     let topics = create_topic_filter(args)?;
 
     // Create and run mirror
-    let mut mirror = Mirror::new(AnyMqttClient::V4(source_client), broker, writer, topics, args.get_qos()).await?;
+    let mut mirror = Mirror::new(source_client, broker, writer, topics, args.get_qos()).await?;
 
     // Run the mirror loop with TUI support (Requirements 11.3-11.9)
     let message_count = if tui_active {
@@ -757,6 +783,7 @@ mod tests {
             playlist: vec![],
             audit: true,
             audit_log: None,
+            mqtt_version: "5".to_string(),
         }
     }
 

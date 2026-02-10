@@ -196,12 +196,14 @@ impl TuiState {
                 *guard = Some(Instant::now());
             }
         } else if !connected && was_connected {
-            let uptime = self.get_connection_duration().map(|d| {
-                let secs = d.as_secs();
-                if secs >= 3600 { format!("{}h{}m{}s", secs / 3600, (secs % 3600) / 60, secs % 60) }
-                else if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) }
-                else { format!("{}s", secs) }
-            }).unwrap_or_else(|| "?".into());
+            let uptime = self.connected_at.lock().ok()
+                .and_then(|g| g.map(|t| t.elapsed()))
+                .map(|d| {
+                    let secs = d.as_secs();
+                    if secs >= 3600 { format!("{}h{}m{}s", secs / 3600, (secs % 3600) / 60, secs % 60) }
+                    else if secs >= 60 { format!("{}m{}s", secs / 60, secs % 60) }
+                    else { format!("{}s", secs) }
+                }).unwrap_or_else(|| "?".into());
             self.push_audit(AuditArea::Source, AuditSeverity::Warn, format!(
                 "Disconnected (received {} msgs, uptime {})", self.received_count.load(Ordering::Relaxed), uptime
             ));
@@ -571,6 +573,13 @@ impl TuiState {
     }
 
     pub fn request_quit(&self) {
+        self.push_audit(AuditArea::System, AuditSeverity::Info, format!(
+            "Quit requested — received {}, mirrored {}, recorded {}, replayed {}",
+            self.get_received_count(),
+            self.get_mirrored_count(),
+            self.get_recorded_count(),
+            self.get_replayed_count(),
+        ));
         self.quit_requested.store(true, Ordering::Relaxed);
     }
 
@@ -1067,6 +1076,18 @@ pub async fn run_tui(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
     let mut terminal = Terminal::new()?;
+
+    // Log session start
+    {
+        let mut info = format!("Session started — broker :{}", state.broker_port);
+        if let Some(ref host) = state.source_host {
+            info.push_str(&format!(", source {}:{}", host, state.source_port));
+        }
+        if let Some(file) = state.get_file_path() {
+            info.push_str(&format!(", file {}", file));
+        }
+        state.push_audit(AuditArea::System, AuditSeverity::Info, info);
+    }
     let mut input_mode = false;
     let mut input_buffer = String::new();
     let mut log_scroll: usize = 0;

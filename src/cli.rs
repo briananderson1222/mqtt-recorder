@@ -162,6 +162,10 @@ pub struct Args {
     /// Path to write audit log file (auto-enables file writing)
     #[arg(long)]
     pub audit_log: Option<PathBuf>,
+
+    /// MQTT protocol version for external broker connections (3.1.1 or 5)
+    #[arg(long, default_value = "5")]
+    pub mqtt_version: String,
 }
 
 impl Args {
@@ -190,6 +194,14 @@ impl Args {
     /// }
     /// ```
     pub fn validate(&self) -> Result<(), String> {
+        // Validate MQTT version
+        if self.mqtt_version != "3.1.1" && self.mqtt_version != "5" {
+            return Err(format!(
+                "Invalid MQTT version: {}. Must be '3.1.1' or '5'.",
+                self.mqtt_version
+            ));
+        }
+
         // Validate QoS level
         if self.qos > 2 {
             return Err(format!(
@@ -317,6 +329,13 @@ impl Args {
         }
     }
 
+    /// Check if MQTT v5 should be used for external broker connections.
+    ///
+    /// Returns `true` if `--mqtt-version 5` (default), `false` if `--mqtt-version 3.1.1`.
+    pub fn use_mqtt_v5(&self) -> bool {
+        self.mqtt_version == "5"
+    }
+
     /// Check if running in standalone broker mode.
     ///
     /// Standalone broker mode is when `--serve` is enabled without specifying a mode.
@@ -376,6 +395,7 @@ mod tests {
             playlist: vec![],
             audit: true,
             audit_log: None,
+            mqtt_version: "5".to_string(),
         }
     }
 

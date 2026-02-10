@@ -579,12 +579,6 @@ impl Mirror {
                                     state.increment_received();
                                 }
 
-                                if let Err(e) = self.poll_local_events().await {
-                                    if Self::is_fatal_error(&e) {
-                                        return Err(e);
-                                    }
-                                }
-
                                 // Poll broker metrics periodically
                                 if message_count.is_multiple_of(LOG_INTERVAL) {
                                     if let Some((old, new)) = self.broker.poll_metrics() {
@@ -600,7 +594,7 @@ impl Mirror {
                         }
                         Err(e) => {
                             if let Some(ref state) = tui_state {
-                                state.push_audit(AuditArea::Source, AuditSeverity::Error, format!("MQTT connection error: {}", e));
+                                state.push_audit(AuditArea::Source, AuditSeverity::Error, format!("{}", e));
                                 state.set_source_connected(false);
                             }
                             if !tui_active {
@@ -700,12 +694,10 @@ impl Mirror {
         let qos = Self::u8_to_qos(record.qos);
 
         // Publish with preserved topic, payload, QoS, and retain flag
+        // The message is queued internally; the local event loop select branch drains it.
         self.local_client
             .publish(&record.topic, record.payload.as_bytes(), qos, record.retain)
             .await?;
-
-        // Poll to actually send the message - rumqttc queues publishes until polled
-        let _ = self.local_client.poll().await;
 
         Ok(())
     }

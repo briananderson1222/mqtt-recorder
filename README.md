@@ -255,12 +255,13 @@ mqtt-recorder --mode replay \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--max_packet_size` | Maximum MQTT packet size in bytes | `1048576` (1MB) |
+| `--mqtt_version` | MQTT protocol version for external brokers (`3.1.1` or `5`) | `5` |
 
 ### Embedded Broker Options
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--serve` | Start embedded MQTT broker | `false` |
+| `--serve` | Start embedded MQTT broker (MQTT v5) | `false` |
 | `--serve_port` | Embedded broker port | `1883` |
 
 ## CSV File Format
