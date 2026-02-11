@@ -19,7 +19,9 @@ impl MetricsTracker {
     }
 
     fn update_and_check(&self, new_connections: usize) -> Option<(usize, usize)> {
-        let old = self.connection_count.swap(new_connections, Ordering::Relaxed);
+        let old = self
+            .connection_count
+            .swap(new_connections, Ordering::Relaxed);
         if old != new_connections {
             Some((old, new_connections))
         } else {

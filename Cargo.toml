@@ -43,10 +43,13 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "1"
 anyhow = "1"
 
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
-atty = "0.2"
 
 [dev-dependencies]
 # Property-based testing
@@ -89,3 +92,7 @@ path = "tests/integration/recorder_test.rs"
 [[test]]
 name = "replayer_test"
 path = "tests/integration/replayer_test.rs"
+
+[[test]]
+name = "verify_test"
+path = "tests/integration/verify_test.rs"

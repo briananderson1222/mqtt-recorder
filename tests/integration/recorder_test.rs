@@ -59,7 +59,7 @@ async fn test_recorder_captures_published_messages() {
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { recorder.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -123,13 +123,20 @@ async fn test_recorder_preserves_message_fields() {
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { recorder.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let publisher = make_client(18851, "publisher").await;
     publish(&publisher, "sensors/temp", b"22.5", QoS::AtMostOnce, false).await;
-    publish(&publisher, "sensors/humidity", b"65", QoS::AtMostOnce, false).await;
+    publish(
+        &publisher,
+        "sensors/humidity",
+        b"65",
+        QoS::AtMostOnce,
+        false,
+    )
+    .await;
 
     tokio::time::sleep(Duration::from_millis(1000)).await;
     let _ = shutdown_tx.send(());
@@ -149,8 +156,14 @@ async fn test_recorder_preserves_message_fields() {
     }
     assert_eq!(records.len(), 2);
 
-    let rec_temp = records.iter().find(|r| r.topic == "sensors/temp").expect("Should have temp");
-    let rec_hum = records.iter().find(|r| r.topic == "sensors/humidity").expect("Should have humidity");
+    let rec_temp = records
+        .iter()
+        .find(|r| r.topic == "sensors/temp")
+        .expect("Should have temp");
+    let rec_hum = records
+        .iter()
+        .find(|r| r.topic == "sensors/humidity")
+        .expect("Should have humidity");
 
     assert_eq!(rec_temp.payload, "22.5");
     assert_eq!(rec_hum.payload, "65");
@@ -185,12 +198,19 @@ async fn test_recorder_handles_graceful_shutdown() {
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { recorder.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let publisher = make_client(18852, "publisher").await;
-    publish(&publisher, "test/shutdown", b"before-shutdown", QoS::AtMostOnce, false).await;
+    publish(
+        &publisher,
+        "test/shutdown",
+        b"before-shutdown",
+        QoS::AtMostOnce,
+        false,
+    )
+    .await;
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     let _ = shutdown_tx.send(());
@@ -205,7 +225,10 @@ async fn test_recorder_handles_graceful_shutdown() {
 
     // Verify CSV is readable (flushed properly)
     let mut reader = CsvReader::new(&csv_path, false, None).expect("CSV should be readable");
-    let record = reader.next().expect("Should have a record").expect("Should parse");
+    let record = reader
+        .next()
+        .expect("Should have a record")
+        .expect("Should parse");
     assert_eq!(record.topic, "test/shutdown");
     assert_eq!(record.payload, "before-shutdown");
 }
@@ -230,13 +253,20 @@ async fn test_recorder_auto_encodes_binary_payloads() {
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { recorder.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let publisher = make_client(18853, "publisher").await;
     // Text payload
-    publish(&publisher, "test/text", b"hello world", QoS::AtMostOnce, false).await;
+    publish(
+        &publisher,
+        "test/text",
+        b"hello world",
+        QoS::AtMostOnce,
+        false,
+    )
+    .await;
     // Binary payload (invalid UTF-8)
     publish(
         &publisher,
@@ -296,27 +326,13 @@ async fn test_recorder_topic_filter() {
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { recorder.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     let publisher = make_client(18854, "publisher").await;
-    publish(
-        &publisher,
-        "sensors/temp",
-        b"22.5",
-        QoS::AtMostOnce,
-        false,
-    )
-    .await;
-    publish(
-        &publisher,
-        "actuators/fan",
-        b"on",
-        QoS::AtMostOnce,
-        false,
-    )
-    .await;
+    publish(&publisher, "sensors/temp", b"22.5", QoS::AtMostOnce, false).await;
+    publish(&publisher, "actuators/fan", b"on", QoS::AtMostOnce, false).await;
     publish(
         &publisher,
         "sensors/humidity",

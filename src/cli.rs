@@ -166,6 +166,14 @@ pub struct Args {
     /// MQTT protocol version for external broker connections (3.1.1 or 5)
     #[arg(long, default_value = "5")]
     pub mqtt_version: String,
+
+    /// Verify mirrored messages by subscribing to the embedded broker and comparing
+    #[arg(long, default_value = "false")]
+    pub verify: bool,
+
+    /// Health check interval in seconds (0 to disable)
+    #[arg(long, default_value = "60")]
+    pub health_check: u64,
 }
 
 impl Args {
@@ -299,6 +307,11 @@ impl Args {
             }
         }
 
+        // --verify is only valid with mirror mode
+        if self.verify && self.mode != Some(Mode::Mirror) {
+            return Err("--verify can only be used with --mode mirror".to_string());
+        }
+
         Ok(())
     }
 
@@ -357,17 +370,18 @@ impl Args {
     /// Apply default mode if none specified: mirror when --serve + --host, record when --host only.
     pub fn apply_defaults(&mut self) {
         if self.mode.is_none() && self.host.is_some() {
-            self.mode = Some(if self.serve { Mode::Mirror } else { Mode::Record });
+            self.mode = Some(if self.serve {
+                Mode::Mirror
+            } else {
+                Mode::Record
+            });
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Helper function to create Args with defaults for testing
-    fn default_args() -> Args {
+impl Default for Args {
+    fn default() -> Self {
         Args {
             host: None,
             port: 1883,
@@ -400,12 +414,19 @@ mod tests {
             audit: true,
             audit_log: None,
             mqtt_version: "5".to_string(),
+            verify: false,
+            health_check: 60,
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
 
     #[test]
     fn test_record_mode_requires_host() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Record);
         args.file = Some(PathBuf::from("test.csv"));
 
@@ -418,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_record_mode_file_optional() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Record);
         args.host = Some("localhost".to_string());
 
@@ -428,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_record_mode_valid() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Record);
         args.host = Some("localhost".to_string());
         args.file = Some(PathBuf::from("test.csv"));
@@ -438,7 +459,7 @@ mod tests {
 
     #[test]
     fn test_replay_mode_requires_host_without_serve() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Replay);
         args.file = Some(PathBuf::from("test.csv"));
 
@@ -451,7 +472,7 @@ mod tests {
 
     #[test]
     fn test_replay_mode_requires_file() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Replay);
         args.host = Some("localhost".to_string());
 
@@ -464,7 +485,7 @@ mod tests {
 
     #[test]
     fn test_replay_mode_valid_with_host() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Replay);
         args.host = Some("localhost".to_string());
         args.file = Some(PathBuf::from("test.csv"));
@@ -474,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_replay_mode_valid_with_serve_no_host() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Replay);
         args.serve = true;
         args.file = Some(PathBuf::from("test.csv"));
@@ -485,7 +506,7 @@ mod tests {
     #[test]
     fn test_replay_mode_valid_with_serve_and_host() {
         // Requirement 1.24: replay with --serve and --host publishes to both
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Replay);
         args.serve = true;
         args.host = Some("localhost".to_string());
@@ -496,7 +517,7 @@ mod tests {
 
     #[test]
     fn test_mirror_mode_requires_host() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Mirror);
         args.serve = true;
 
@@ -509,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_mirror_mode_requires_serve() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Mirror);
         args.host = Some("localhost".to_string());
 
@@ -522,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_mirror_mode_valid() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Mirror);
         args.host = Some("localhost".to_string());
         args.serve = true;
@@ -533,7 +554,7 @@ mod tests {
     #[test]
     fn test_mirror_mode_valid_with_file() {
         // File is optional for mirror mode (for recording while mirroring)
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Mirror);
         args.host = Some("localhost".to_string());
         args.serve = true;
@@ -544,7 +565,7 @@ mod tests {
 
     #[test]
     fn test_standalone_broker_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.serve = true;
         // No mode specified
 
@@ -554,7 +575,7 @@ mod tests {
 
     #[test]
     fn test_not_standalone_broker_with_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.serve = true;
         args.mode = Some(Mode::Replay);
         args.file = Some(PathBuf::from("test.csv"));
@@ -564,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_mode_required_without_serve() {
-        let args = default_args();
+        let args = Args::default();
         // No mode, no serve
 
         let result = args.validate();
@@ -574,7 +595,7 @@ mod tests {
 
     #[test]
     fn test_invalid_qos() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.mode = Some(Mode::Record);
         args.host = Some("localhost".to_string());
         args.file = Some(PathBuf::from("test.csv"));
@@ -587,21 +608,21 @@ mod tests {
 
     #[test]
     fn test_get_qos_at_most_once() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.qos = 0;
         assert_eq!(args.get_qos(), QoS::AtMostOnce);
     }
 
     #[test]
     fn test_get_qos_at_least_once() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.qos = 1;
         assert_eq!(args.get_qos(), QoS::AtLeastOnce);
     }
 
     #[test]
     fn test_get_qos_exactly_once() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.qos = 2;
         assert_eq!(args.get_qos(), QoS::ExactlyOnce);
     }
@@ -609,7 +630,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "Invalid QoS level")]
     fn test_get_qos_invalid_panics() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.qos = 3;
         args.get_qos();
     }
@@ -642,46 +663,46 @@ mod tests {
 
     #[test]
     fn test_args_debug() {
-        let args = default_args();
+        let args = Args::default();
         let debug_str = format!("{:?}", args);
         assert!(debug_str.contains("Args"));
     }
 
     #[test]
     fn test_validate_flag_default_false() {
-        let args = default_args();
+        let args = Args::default();
         assert!(!args.validate);
     }
 
     #[test]
     fn test_validate_flag_can_be_set() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.validate = true;
         assert!(args.validate);
     }
 
     #[test]
     fn test_fix_flag_default_false() {
-        let args = default_args();
+        let args = Args::default();
         assert!(!args.fix);
     }
 
     #[test]
     fn test_fix_flag_can_be_set() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.fix = true;
         assert!(args.fix);
     }
 
     #[test]
     fn test_output_default_none() {
-        let args = default_args();
+        let args = Args::default();
         assert!(args.output.is_none());
     }
 
     #[test]
     fn test_output_can_be_set() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.output = Some(PathBuf::from("repaired.csv"));
         assert_eq!(args.output, Some(PathBuf::from("repaired.csv")));
     }
@@ -690,7 +711,7 @@ mod tests {
 
     #[test]
     fn test_validate_requires_file() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.validate = true;
         // No file specified
 
@@ -701,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_validate_with_file_is_valid() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.validate = true;
         args.file = Some(PathBuf::from("test.csv"));
 
@@ -710,7 +731,7 @@ mod tests {
 
     #[test]
     fn test_validate_cannot_be_used_with_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.validate = true;
         args.file = Some(PathBuf::from("test.csv"));
         args.mode = Some(Mode::Record);
@@ -724,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_validate_cannot_be_used_with_replay_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.validate = true;
         args.file = Some(PathBuf::from("test.csv"));
         args.mode = Some(Mode::Replay);
@@ -738,7 +759,7 @@ mod tests {
 
     #[test]
     fn test_validate_cannot_be_used_with_mirror_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.validate = true;
         args.file = Some(PathBuf::from("test.csv"));
         args.mode = Some(Mode::Mirror);
@@ -754,7 +775,7 @@ mod tests {
 
     #[test]
     fn test_fix_requires_file() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.fix = true;
         args.output = Some(PathBuf::from("repaired.csv"));
         // No file specified
@@ -766,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_fix_requires_output() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.fix = true;
         args.file = Some(PathBuf::from("test.csv"));
         // No output specified
@@ -778,7 +799,7 @@ mod tests {
 
     #[test]
     fn test_fix_with_file_and_output_is_valid() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.fix = true;
         args.file = Some(PathBuf::from("test.csv"));
         args.output = Some(PathBuf::from("repaired.csv"));
@@ -788,7 +809,7 @@ mod tests {
 
     #[test]
     fn test_fix_cannot_be_used_with_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.fix = true;
         args.file = Some(PathBuf::from("test.csv"));
         args.output = Some(PathBuf::from("repaired.csv"));
@@ -803,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_fix_cannot_be_used_with_replay_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.fix = true;
         args.file = Some(PathBuf::from("test.csv"));
         args.output = Some(PathBuf::from("repaired.csv"));
@@ -818,7 +839,7 @@ mod tests {
 
     #[test]
     fn test_fix_cannot_be_used_with_mirror_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.fix = true;
         args.file = Some(PathBuf::from("test.csv"));
         args.output = Some(PathBuf::from("repaired.csv"));
@@ -835,7 +856,7 @@ mod tests {
 
     #[test]
     fn test_fix_cannot_be_used_with_validate() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.fix = true;
         args.validate = true;
         args.file = Some(PathBuf::from("test.csv"));
@@ -851,7 +872,7 @@ mod tests {
     #[test]
     fn test_validate_cannot_be_used_with_fix() {
         // Same test as above but from validate perspective
-        let mut args = default_args();
+        let mut args = Args::default();
         args.validate = true;
         args.fix = true;
         args.file = Some(PathBuf::from("test.csv"));
@@ -869,7 +890,7 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_host_only_becomes_record() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.host = Some("broker.example.com".to_string());
 
         args.apply_defaults();
@@ -878,7 +899,7 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_host_and_serve_becomes_mirror() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.host = Some("broker.example.com".to_string());
         args.serve = true;
 
@@ -888,7 +909,7 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_serve_only_no_mode_set() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.serve = true;
 
         args.apply_defaults();
@@ -897,7 +918,7 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_no_host_no_serve_no_mode_set() {
-        let mut args = default_args();
+        let mut args = Args::default();
 
         args.apply_defaults();
         assert_eq!(args.mode, None);
@@ -905,7 +926,7 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_does_not_override_explicit_mode() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.host = Some("broker.example.com".to_string());
         args.mode = Some(Mode::Replay);
         args.file = Some(PathBuf::from("test.csv"));
@@ -916,7 +937,7 @@ mod tests {
 
     #[test]
     fn test_apply_defaults_does_not_override_explicit_record() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.host = Some("broker.example.com".to_string());
         args.serve = true;
         args.mode = Some(Mode::Record);
@@ -929,14 +950,14 @@ mod tests {
 
     #[test]
     fn test_standalone_broker_serve_only() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.serve = true;
         assert!(args.is_standalone_broker());
     }
 
     #[test]
     fn test_not_standalone_broker_with_host() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.serve = true;
         args.host = Some("broker.example.com".to_string());
         assert!(!args.is_standalone_broker());
@@ -944,7 +965,7 @@ mod tests {
 
     #[test]
     fn test_not_standalone_broker_with_mode_set() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.serve = true;
         args.mode = Some(Mode::Mirror);
         args.host = Some("localhost".to_string());
@@ -955,7 +976,7 @@ mod tests {
 
     #[test]
     fn test_defaults_then_validate_host_only() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.host = Some("localhost".to_string());
 
         args.apply_defaults();
@@ -965,7 +986,7 @@ mod tests {
 
     #[test]
     fn test_defaults_then_validate_host_and_serve() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.host = Some("localhost".to_string());
         args.serve = true;
 
@@ -976,7 +997,7 @@ mod tests {
 
     #[test]
     fn test_defaults_then_validate_serve_only_standalone() {
-        let mut args = default_args();
+        let mut args = Args::default();
         args.serve = true;
 
         args.apply_defaults();

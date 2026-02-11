@@ -38,6 +38,7 @@ use chrono::{DateTime, Utc};
 use rumqttc::QoS;
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tracing::{error, info};
 
 use crate::csv_handler::CsvWriter;
 use crate::error::MqttRecorderError;
@@ -117,7 +118,12 @@ impl Recorder {
     ///
     /// let recorder = Recorder::new(client, writer, topics, QoS::AtMostOnce).await;
     /// ```
-    pub async fn new(client: AnyMqttClient, writer: CsvWriter, topics: TopicFilter, qos: QoS) -> Self {
+    pub async fn new(
+        client: AnyMqttClient,
+        writer: CsvWriter,
+        topics: TopicFilter,
+        qos: QoS,
+    ) -> Self {
         Self {
             client,
             writer,
@@ -139,6 +145,7 @@ impl Recorder {
     /// # Arguments
     ///
     /// * `shutdown` - A broadcast receiver for the shutdown signal
+    /// * `tui_state` - Optional TUI state for updating message counts
     ///
     /// # Returns
     ///
@@ -169,7 +176,7 @@ impl Recorder {
     ///
     /// // Run in a separate task
     /// let handle = tokio::spawn(async move {
-    ///     recorder.run(shutdown_rx).await
+    ///     recorder.run(shutdown_rx, None).await
     /// });
     ///
     /// // Later, trigger shutdown
@@ -177,19 +184,7 @@ impl Recorder {
     /// let count = handle.await??;
     /// println!("Recorded {} messages", count);
     /// ```
-    #[allow(dead_code)] // Public API for library users
     pub async fn run(
-        &mut self,
-        shutdown: broadcast::Receiver<()>,
-    ) -> Result<u64, MqttRecorderError> {
-        self.run_with_tui(shutdown, None).await
-    }
-
-    /// Runs the recording loop with optional TUI state updates.
-    ///
-    /// This is a wrapper around `run` that also updates the TUI state
-    /// with the message count as messages are recorded.
-    pub async fn run_with_tui(
         &mut self,
         mut shutdown: broadcast::Receiver<()>,
         tui_state: Option<Arc<TuiState>>,
@@ -198,25 +193,24 @@ impl Recorder {
         let topics = self.topics.topics();
         if !topics.is_empty() {
             self.client.subscribe(topics, self.qos).await?;
-            eprintln!("Subscribed to {} topic(s)", topics.len());
+            info!("Subscribed to {} topic(s)", topics.len());
         }
 
         let mut message_count: u64 = 0;
         let mut flush_counter: u64 = 0;
-        const FLUSH_INTERVAL: u64 = 100;
 
         loop {
             // Check if TUI requested quit
             if let Some(ref state) = tui_state {
                 if state.is_quit_requested() {
-                    eprintln!("Quit requested from TUI, stopping recorder...");
+                    info!("Quit requested from TUI, stopping recorder...");
                     break;
                 }
             }
 
             tokio::select! {
                 _ = shutdown.recv() => {
-                    eprintln!("Shutdown signal received, stopping recorder...");
+                    info!("Shutdown signal received, stopping recorder...");
                     break;
                 }
                 event_result = self.client.poll() => {
@@ -239,15 +233,15 @@ impl Recorder {
                                     state.increment_recorded();
                                 }
 
-                                if flush_counter >= FLUSH_INTERVAL {
+                                if flush_counter >= crate::util::FLUSH_INTERVAL {
                                     self.writer.flush()?;
                                     flush_counter = 0;
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("MQTT error: {}", e);
-                            if Self::is_fatal_error(&e) {
+                            error!("MQTT error: {}", e);
+                            if crate::util::is_fatal_error(&e, false) {
                                 return Err(e);
                             }
                         }
@@ -259,9 +253,10 @@ impl Recorder {
         self.writer.flush()?;
 
         let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
+            tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
             self.client.disconnect(),
-        ).await;
+        )
+        .await;
 
         Ok(message_count)
     }
@@ -281,65 +276,52 @@ impl Recorder {
     /// Returns `Some(RawMessage)` if the event contains a publish message,
     /// or `None` for other event types.
     fn process_event(&self, event: MqttIncoming) -> Option<RawMessage> {
-        match event {
-            MqttIncoming::Publish {
-                topic,
-                payload,
-                qos,
-                retain,
-            } => {
-                let timestamp = Utc::now();
-                let qos_u8 = match qos {
-                    QoS::AtMostOnce => 0,
-                    QoS::AtLeastOnce => 1,
-                    QoS::ExactlyOnce => 2,
-                };
-
-                Some(RawMessage {
-                    timestamp,
-                    topic,
-                    payload: payload.to_vec(),
-                    qos: qos_u8,
-                    retain,
-                })
-            }
-            MqttIncoming::ConnAck => {
-                eprintln!("Connected to MQTT broker");
-                None
-            }
-            MqttIncoming::SubAck => {
-                eprintln!("Subscription acknowledged");
-                None
-            }
-            MqttIncoming::Other => None,
-        }
+        process_event_impl(event)
     }
+}
 
-    /// Determines if an error is fatal and should stop recording.
-    ///
-    /// Some errors are recoverable (e.g., temporary network issues),
-    /// while others indicate a permanent failure.
-    ///
-    /// # Arguments
-    ///
-    /// * `error` - The error to check
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` if the error is fatal and recording should stop.
-    fn is_fatal_error(error: &MqttRecorderError) -> bool {
-        match error {
-            // Connection errors are typically fatal
-            MqttRecorderError::Connection(_) => true,
-            // Client errors might be recoverable
-            MqttRecorderError::Client(_) => false,
-            // IO errors are fatal
-            MqttRecorderError::Io(_) => true,
-            // CSV errors are fatal
-            MqttRecorderError::Csv(_) => true,
-            // Other errors
-            _ => false,
+/// Processes an MQTT event and extracts raw message data if applicable.
+///
+/// This function handles incoming MQTT events and converts publish messages
+/// into [`RawMessage`] instances for CSV storage. The payload is kept as
+/// raw bytes to allow proper binary detection and encoding by the CSV writer.
+///
+/// # Arguments
+///
+/// * `event` - The MQTT event to process
+///
+/// # Returns
+///
+/// Returns `Some(RawMessage)` if the event contains a publish message,
+/// or `None` for other event types.
+fn process_event_impl(event: MqttIncoming) -> Option<RawMessage> {
+    match event {
+        MqttIncoming::Publish {
+            topic,
+            payload,
+            qos,
+            retain,
+        } => {
+            let timestamp = Utc::now();
+            let qos_u8 = crate::util::qos_to_u8(qos);
+
+            Some(RawMessage {
+                timestamp,
+                topic,
+                payload: payload.to_vec(),
+                qos: qos_u8,
+                retain,
+            })
         }
+        MqttIncoming::ConnAck => {
+            info!("Connected to MQTT broker");
+            None
+        }
+        MqttIncoming::SubAck => {
+            info!("Subscription acknowledged");
+            None
+        }
+        MqttIncoming::Other => None,
     }
 }
 
@@ -348,50 +330,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_qos_conversion() {
-        // Test that QoS values are correctly mapped
-        assert_eq!(
-            match QoS::AtMostOnce {
-                QoS::AtMostOnce => 0u8,
-                QoS::AtLeastOnce => 1u8,
-                QoS::ExactlyOnce => 2u8,
-            },
-            0
-        );
-        assert_eq!(
-            match QoS::AtLeastOnce {
-                QoS::AtMostOnce => 0u8,
-                QoS::AtLeastOnce => 1u8,
-                QoS::ExactlyOnce => 2u8,
-            },
-            1
-        );
-        assert_eq!(
-            match QoS::ExactlyOnce {
-                QoS::AtMostOnce => 0u8,
-                QoS::AtLeastOnce => 1u8,
-                QoS::ExactlyOnce => 2u8,
-            },
-            2
-        );
+    fn test_process_event_publish() {
+        let event = MqttIncoming::Publish {
+            topic: "test/topic".to_string(),
+            payload: b"hello".to_vec(),
+            qos: QoS::AtLeastOnce,
+            retain: true,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let msg = result.unwrap();
+        assert_eq!(msg.topic, "test/topic");
+        assert_eq!(msg.payload, b"hello");
+        assert_eq!(msg.qos, 1);
+        assert!(msg.retain);
     }
 
     #[test]
-    fn test_is_fatal_error() {
-        // IO errors should be fatal
-        let io_error = MqttRecorderError::Io(std::io::Error::other("test"));
-        assert!(Recorder::is_fatal_error(&io_error));
+    fn test_process_event_publish_qos_levels() {
+        // Test QoS 0
+        let event = MqttIncoming::Publish {
+            topic: "test".to_string(),
+            payload: vec![],
+            qos: QoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event).unwrap();
+        assert_eq!(result.qos, 0);
 
-        // Invalid argument errors should not be fatal
-        let arg_error = MqttRecorderError::InvalidArgument("test".to_string());
-        assert!(!Recorder::is_fatal_error(&arg_error));
+        // Test QoS 2
+        let event = MqttIncoming::Publish {
+            topic: "test".to_string(),
+            payload: vec![],
+            qos: QoS::ExactlyOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event).unwrap();
+        assert_eq!(result.qos, 2);
+    }
 
-        // TLS errors should not be fatal (they occur during setup, not recording)
-        let tls_error = MqttRecorderError::Tls("test".to_string());
-        assert!(!Recorder::is_fatal_error(&tls_error));
+    #[test]
+    fn test_process_event_connack() {
+        assert!(process_event_impl(MqttIncoming::ConnAck).is_none());
+    }
 
-        // Broker errors should not be fatal
-        let broker_error = MqttRecorderError::Broker("test".to_string());
-        assert!(!Recorder::is_fatal_error(&broker_error));
+    #[test]
+    fn test_process_event_suback() {
+        assert!(process_event_impl(MqttIncoming::SubAck).is_none());
+    }
+
+    #[test]
+    fn test_process_event_other() {
+        assert!(process_event_impl(MqttIncoming::Other).is_none());
     }
 }

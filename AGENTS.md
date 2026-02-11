@@ -265,3 +265,12 @@ Capture corrections and unique patterns discovered while working in this repo:
 - Use `tui_state.is_some()` or a `tui_active` boolean to conditionally log
 - Logging interferes with ratatui terminal rendering and corrupts the display
 - Keep logging enabled for `--no-interactive` and CI modes
+
+### Verify Mode (`--verify` on mirror)
+
+- `--verify` spawns an independent MqttClientV5 subscriber on the embedded broker that subscribes to `#`
+- Compares raw `(topic, payload_bytes)` from the source against what actually arrives on the embedded broker — completely bypasses CSV
+- Three mismatch categories: **PAYLOAD MISMATCH** (same topic, different bytes), **UNEXPECTED** (message on broker not in expected queue), **MISSING** (expected but never received)
+- All mismatches log the actual payload content (text or hex) to the audit log for debugging
+- Use `--verify` as the primary debugging tool when investigating data integrity issues between source and embedded broker — if verify shows clean matches but CSV output differs, the bug is in the CSV layer
+- The verify subscriber is registered as an internal client so it doesn't inflate the broker connection count

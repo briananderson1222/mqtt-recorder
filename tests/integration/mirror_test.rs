@@ -56,15 +56,22 @@ async fn test_mirror_republishes_to_embedded_broker() {
 
     // Create mirror without CSV recording
     let topics = TopicFilter::wildcard();
-    let mut mirror = Mirror::new(AnyMqttClient::V5(source_client), mirror_broker, None, topics, QoS::AtMostOnce)
-        .await
-        .expect("Failed to create mirror");
+    let mut mirror = Mirror::new(
+        AnyMqttClient::V5(source_client),
+        mirror_broker,
+        None,
+        topics,
+        QoS::AtMostOnce,
+        false,
+    )
+    .await
+    .expect("Failed to create mirror");
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // Run mirror in background task
-    let mirror_handle = tokio::spawn(async move { mirror.run(shutdown_rx).await });
+    let mirror_handle = tokio::spawn(async move { mirror.run(shutdown_rx, None).await });
 
     // Give mirror time to subscribe
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -88,7 +95,9 @@ async fn test_mirror_republishes_to_embedded_broker() {
     // Poll subscriber to establish connection and subscription
     loop {
         match subscriber.poll().await {
-            Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::SubAck(_))) => break,
+            Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::SubAck(_))) => {
+                break
+            }
             Ok(_) => continue,
             Err(e) => panic!("Subscriber setup error: {}", e),
         }
@@ -110,8 +119,13 @@ async fn test_mirror_republishes_to_embedded_broker() {
     let received = timeout(Duration::from_secs(5), async {
         loop {
             match subscriber.poll().await {
-                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(publish))) => {
-                    return Some((String::from_utf8_lossy(&publish.topic).into_owned(), publish.payload.to_vec()));
+                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(
+                    publish,
+                ))) => {
+                    return Some((
+                        String::from_utf8_lossy(&publish.topic).into_owned(),
+                        publish.payload.to_vec(),
+                    ));
                 }
                 Ok(_) => continue,
                 Err(_) => return None,
@@ -183,16 +197,20 @@ async fn test_mirror_records_to_csv() {
 
     // Create mirror with CSV recording
     let topics = TopicFilter::wildcard();
-    let mut mirror = Mirror::new(AnyMqttClient::V5(source_client), mirror_broker,
-    Some(writer),
-    topics,
-    QoS::AtMostOnce,)
+    let mut mirror = Mirror::new(
+        AnyMqttClient::V5(source_client),
+        mirror_broker,
+        Some(writer),
+        topics,
+        QoS::AtMostOnce,
+        false,
+    )
     .await
     .expect("Failed to create mirror");
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
-    let mirror_handle = tokio::spawn(async move { mirror.run(shutdown_rx).await });
+    let mirror_handle = tokio::spawn(async move { mirror.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -285,15 +303,20 @@ async fn test_mirror_tui_record_toggle() {
         true,
         vec![],
         true,
+        60,
     ));
     tui_state.set_recording(false); // Start with recording OFF
 
     // Create mirror with TUI state
     let topics = TopicFilter::wildcard();
-    let mut mirror = Mirror::new(AnyMqttClient::V5(source_client), mirror_broker,
-    Some(writer),
-    topics,
-    QoS::AtMostOnce,)
+    let mut mirror = Mirror::new(
+        AnyMqttClient::V5(source_client),
+        mirror_broker,
+        Some(writer),
+        topics,
+        QoS::AtMostOnce,
+        false,
+    )
     .await
     .expect("Failed to create mirror");
 
@@ -301,11 +324,8 @@ async fn test_mirror_tui_record_toggle() {
 
     // Clone tui_state for the mirror task
     let mirror_tui_state = tui_state.clone();
-    let mirror_handle = tokio::spawn(async move {
-        mirror
-            .run_with_tui(shutdown_rx, Some(mirror_tui_state))
-            .await
-    });
+    let mirror_handle =
+        tokio::spawn(async move { mirror.run(shutdown_rx, Some(mirror_tui_state)).await });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -409,26 +429,28 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
         true,
         vec![],
         true,
+        60,
     ));
     tui_state.set_recording(true);
 
     // Create mirror
     let topics = TopicFilter::wildcard();
-    let mut mirror = Mirror::new(AnyMqttClient::V5(source_client), mirror_broker,
-    Some(writer),
-    topics,
-    QoS::AtMostOnce,)
+    let mut mirror = Mirror::new(
+        AnyMqttClient::V5(source_client),
+        mirror_broker,
+        Some(writer),
+        topics,
+        QoS::AtMostOnce,
+        false,
+    )
     .await
     .expect("Failed to create mirror");
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     let mirror_tui_state = tui_state.clone();
-    let mirror_handle = tokio::spawn(async move {
-        mirror
-            .run_with_tui(shutdown_rx, Some(mirror_tui_state))
-            .await
-    });
+    let mirror_handle =
+        tokio::spawn(async move { mirror.run(shutdown_rx, Some(mirror_tui_state)).await });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -450,7 +472,9 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     // Wait for subscription
     loop {
         match subscriber.poll().await {
-            Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::SubAck(_))) => break,
+            Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::SubAck(_))) => {
+                break
+            }
             Ok(_) => continue,
             Err(e) => panic!("Subscriber setup error: {}", e),
         }
@@ -474,7 +498,9 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     let received_mirrored = timeout(Duration::from_secs(2), async {
         loop {
             match subscriber.poll().await {
-                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(p))) => return Some(String::from_utf8_lossy(&p.topic).into_owned()),
+                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(
+                    p,
+                ))) => return Some(String::from_utf8_lossy(&p.topic).into_owned()),
                 Ok(_) => continue,
                 Err(_) => return None,
             }
@@ -510,7 +536,9 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     let received_not_mirrored = timeout(Duration::from_millis(500), async {
         loop {
             match subscriber.poll().await {
-                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(p))) => return Some(String::from_utf8_lossy(&p.topic).into_owned()),
+                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(
+                    p,
+                ))) => return Some(String::from_utf8_lossy(&p.topic).into_owned()),
                 Ok(_) => continue,
                 Err(_) => return None,
             }
@@ -596,22 +624,27 @@ async fn test_mirror_handles_source_broker_disconnect() {
         true,
         vec![],
         true,
+        60,
     ));
 
     // Create mirror
     let topics = TopicFilter::wildcard();
-    let mut mirror = Mirror::new(AnyMqttClient::V5(source_client), mirror_broker, None, topics, QoS::AtMostOnce)
-        .await
-        .expect("Failed to create mirror");
+    let mut mirror = Mirror::new(
+        AnyMqttClient::V5(source_client),
+        mirror_broker,
+        None,
+        topics,
+        QoS::AtMostOnce,
+        false,
+    )
+    .await
+    .expect("Failed to create mirror");
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     let mirror_tui_state = tui_state.clone();
-    let mirror_handle = tokio::spawn(async move {
-        mirror
-            .run_with_tui(shutdown_rx, Some(mirror_tui_state))
-            .await
-    });
+    let mirror_handle =
+        tokio::spawn(async move { mirror.run(shutdown_rx, Some(mirror_tui_state)).await });
 
     // Let mirror establish connection
     tokio::time::sleep(Duration::from_millis(500)).await;

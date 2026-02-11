@@ -295,26 +295,6 @@ impl Default for TlsConfig {
     }
 }
 
-/// Generates a unique client ID using a UUID-like format.
-///
-/// The generated ID has the format "mqtt-recorder-XXXXXXXX" where X is a
-/// random hexadecimal character.
-///
-/// # Requirements
-/// - 2.3: WHEN no client_id is provided, generate a unique client identifier
-fn generate_client_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    // Use timestamp and a simple hash to create a unique ID
-    let hash = timestamp ^ (timestamp >> 32);
-    format!("mqtt-recorder-{:08x}", hash as u32)
-}
-
 /// MQTT client wrapper around rumqttc.
 ///
 /// This struct provides a high-level interface for MQTT operations including
@@ -376,7 +356,7 @@ impl MqttClient {
     pub async fn new(config: MqttClientConfig) -> Result<Self, MqttRecorderError> {
         // Generate client_id if empty (Requirement 2.3)
         let client_id = if config.client_id.is_empty() {
-            generate_client_id()
+            crate::util::generate_client_id(&Some(config.client_id.clone()))
         } else {
             config.client_id.clone()
         };
@@ -403,6 +383,8 @@ impl MqttClient {
 
         // Create the async client and event loop
         // Use a large channel capacity to prevent backpressure from blocking ping handling
+        // Channel capacity 256: sufficient for v4 clients which are used for external broker
+        // connections with moderate throughput
         let (client, eventloop) = AsyncClient::new(mqtt_options, 256);
 
         Ok(Self {
@@ -435,8 +417,14 @@ impl MqttClient {
 
         // Read client certificate and key if provided (Requirement 2.7)
         let client_auth = if tls_config.has_client_auth() {
-            let cert_path = tls_config.client_cert.as_ref().unwrap();
-            let key_path = tls_config.client_key.as_ref().unwrap();
+            let cert_path = tls_config
+                .client_cert
+                .as_ref()
+                .expect("guaranteed by has_client_auth()");
+            let key_path = tls_config
+                .client_key
+                .as_ref()
+                .expect("guaranteed by has_client_auth()");
 
             let cert_data = fs::read(cert_path).map_err(|e| {
                 MqttRecorderError::Tls(format!(
@@ -620,15 +608,15 @@ impl MqttClientV5 {
         }
     }
 
+    /// Create a new MQTT v5 client with the given configuration.
     pub async fn new(config: MqttClientConfig) -> Result<Self, MqttRecorderError> {
         let client_id = if config.client_id.is_empty() {
-            generate_client_id()
+            crate::util::generate_client_id(&Some(config.client_id.clone()))
         } else {
             config.client_id.clone()
         };
 
-        let mut mqtt_options =
-            rumqttc::v5::MqttOptions::new(&client_id, &config.host, config.port);
+        let mut mqtt_options = rumqttc::v5::MqttOptions::new(&client_id, &config.host, config.port);
         mqtt_options.set_keep_alive(Duration::from_secs(15));
         mqtt_options.set_max_packet_size(Some(config.max_packet_size as u32));
 
@@ -641,7 +629,9 @@ impl MqttClientV5 {
             mqtt_options.set_transport(transport);
         }
 
-        let (client, eventloop) = rumqttc::v5::AsyncClient::new(mqtt_options, 256);
+        // Channel capacity 2048: v5 clients connect to the embedded broker which handles
+        // high-throughput mirroring and needs larger buffers to avoid backpressure
+        let (client, eventloop) = rumqttc::v5::AsyncClient::new(mqtt_options, 2048);
 
         Ok(Self {
             client,
@@ -649,11 +639,8 @@ impl MqttClientV5 {
         })
     }
 
-    pub async fn subscribe(
-        &self,
-        topics: &[String],
-        qos: QoS,
-    ) -> Result<(), MqttRecorderError> {
+    /// Subscribe to the given topics with the specified QoS level.
+    pub async fn subscribe(&self, topics: &[String], qos: QoS) -> Result<(), MqttRecorderError> {
         let v5_qos = Self::to_v5_qos(qos);
         for topic in topics {
             self.client.subscribe(topic, v5_qos).await?;
@@ -661,6 +648,7 @@ impl MqttClientV5 {
         Ok(())
     }
 
+    /// Publish a message to the given topic.
     pub async fn publish(
         &self,
         topic: &str,
@@ -674,12 +662,14 @@ impl MqttClientV5 {
         Ok(())
     }
 
+    /// Poll for the next event from the broker.
     pub async fn poll(&self) -> Result<rumqttc::v5::Event, MqttRecorderError> {
         let mut eventloop = self.eventloop.lock().await;
         let event = eventloop.poll().await?;
         Ok(event)
     }
 
+    /// Disconnect from the broker.
     pub async fn disconnect(&self) -> Result<(), MqttRecorderError> {
         self.client.disconnect().await?;
         Ok(())
@@ -714,11 +704,7 @@ pub enum MqttIncoming {
 }
 
 impl AnyMqttClient {
-    pub async fn subscribe(
-        &self,
-        topics: &[String],
-        qos: QoS,
-    ) -> Result<(), MqttRecorderError> {
+    pub async fn subscribe(&self, topics: &[String], qos: QoS) -> Result<(), MqttRecorderError> {
         match self {
             Self::V4(c) => c.subscribe(topics, qos).await,
             Self::V5(c) => c.subscribe(topics, qos).await,
@@ -905,7 +891,7 @@ mod tests {
 
     #[test]
     fn test_generate_client_id_format() {
-        let client_id = generate_client_id();
+        let client_id = crate::util::generate_client_id(&None);
         assert!(client_id.starts_with("mqtt-recorder-"));
         // Should be "mqtt-recorder-" (14 chars) + 8 hex chars = 22 chars
         assert_eq!(client_id.len(), 22);
@@ -916,9 +902,9 @@ mod tests {
         // Generate multiple IDs and check they're different
         // Note: Due to timing, consecutive calls might produce the same ID
         // so we add a small delay between calls
-        let id1 = generate_client_id();
+        let id1 = crate::util::generate_client_id(&None);
         std::thread::sleep(std::time::Duration::from_millis(1));
-        let id2 = generate_client_id();
+        let id2 = crate::util::generate_client_id(&None);
 
         // IDs should be different (with high probability due to nanosecond precision)
         // But we can't guarantee this in a unit test, so just check format

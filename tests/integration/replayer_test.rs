@@ -28,13 +28,7 @@ fn create_test_csv(path: &std::path::Path, messages: &[(&str, &str, u8, bool)]) 
     let mut writer = CsvWriter::new(path, false).expect("Failed to create writer");
     let ts = Utc::now();
     for (topic, payload, qos, retain) in messages.iter() {
-        let record = MessageRecord::new(
-            ts,
-            topic.to_string(),
-            payload.to_string(),
-            *qos,
-            *retain,
-        );
+        let record = MessageRecord::new(ts, topic.to_string(), payload.to_string(), *qos, *retain);
         writer.write(&record).expect("Failed to write record");
     }
     writer.flush().expect("Failed to flush");
@@ -112,7 +106,7 @@ async fn test_replayer_publishes_csv_messages() {
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { replayer.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
 
     // Collect messages from subscriber
     let messages = collect_messages(&subscriber, "test/#", 3, 5000).await;
@@ -126,7 +120,11 @@ async fn test_replayer_publishes_csv_messages() {
         .expect("Error");
 
     assert_eq!(count, 3, "Replayer should have published 3 messages");
-    assert_eq!(messages.len(), 3, "Subscriber should have received 3 messages");
+    assert_eq!(
+        messages.len(),
+        3,
+        "Subscriber should have received 3 messages"
+    );
 
     // Verify topics and payloads
     let topics: Vec<&str> = messages.iter().map(|(t, _)| t.as_str()).collect();
@@ -169,7 +167,7 @@ async fn test_replayer_preserves_message_fields() {
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 
     let (_shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { replayer.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
 
     let messages = collect_messages(&subscriber, "sensors/#", 2, 5000).await;
 
@@ -207,10 +205,7 @@ async fn test_replayer_exits_after_all_messages() {
     let csv_path = dir.path().join("input.csv");
     create_test_csv(
         &csv_path,
-        &[
-            ("test/1", "msg-1", 0, false),
-            ("test/2", "msg-2", 0, false),
-        ],
+        &[("test/1", "msg-1", 0, false), ("test/2", "msg-2", 0, false)],
     );
 
     let replayer_client = AnyMqttClient::V5(make_client(18862, "replayer").await);
@@ -220,7 +215,7 @@ async fn test_replayer_exits_after_all_messages() {
     let (_shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // Replayer should exit on its own (no shutdown signal needed)
-    let result = timeout(Duration::from_secs(10), replayer.run(shutdown_rx))
+    let result = timeout(Duration::from_secs(10), replayer.run(shutdown_rx, None))
         .await
         .expect("Replayer should exit within timeout");
 
@@ -246,8 +241,24 @@ async fn test_replayer_loops_continuously() {
     // Use 0ms-spaced timestamps so replay is fast
     let mut writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let ts = Utc::now();
-    writer.write(&MessageRecord::new(ts, "loop/msg".into(), "data-1".into(), 0, false)).unwrap();
-    writer.write(&MessageRecord::new(ts, "loop/msg".into(), "data-2".into(), 0, false)).unwrap();
+    writer
+        .write(&MessageRecord::new(
+            ts,
+            "loop/msg".into(),
+            "data-1".into(),
+            0,
+            false,
+        ))
+        .unwrap();
+    writer
+        .write(&MessageRecord::new(
+            ts,
+            "loop/msg".into(),
+            "data-2".into(),
+            0,
+            false,
+        ))
+        .unwrap();
     writer.flush().unwrap();
 
     let subscriber = make_client(18863, "subscriber").await;
@@ -263,7 +274,7 @@ async fn test_replayer_loops_continuously() {
     let mut replayer = Replayer::new(replayer_client, reader, true).await;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { replayer.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
 
     // Wait for more than 2 messages (proving loop happened)
     let messages = collect_messages(&subscriber, "loop/#", 4, 10000).await;
@@ -280,11 +291,7 @@ async fn test_replayer_loops_continuously() {
         "Should receive >=4 messages (at least 2 loops), got {}",
         messages.len()
     );
-    assert!(
-        count >= 4,
-        "Replayer count should be >=4, got {}",
-        count
-    );
+    assert!(count >= 4, "Replayer count should be >=4, got {}", count);
 }
 
 /// Test that replayer handles shutdown during replay gracefully.
@@ -305,9 +312,33 @@ async fn test_replayer_handles_shutdown_during_replay() {
     // Messages spaced 2 seconds apart so we can shutdown mid-replay
     let mut writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let base = Utc::now();
-    writer.write(&MessageRecord::new(base, "test/1".into(), "first".into(), 0, false)).unwrap();
-    writer.write(&MessageRecord::new(base + chrono::Duration::seconds(2), "test/2".into(), "second".into(), 0, false)).unwrap();
-    writer.write(&MessageRecord::new(base + chrono::Duration::seconds(4), "test/3".into(), "third".into(), 0, false)).unwrap();
+    writer
+        .write(&MessageRecord::new(
+            base,
+            "test/1".into(),
+            "first".into(),
+            0,
+            false,
+        ))
+        .unwrap();
+    writer
+        .write(&MessageRecord::new(
+            base + chrono::Duration::seconds(2),
+            "test/2".into(),
+            "second".into(),
+            0,
+            false,
+        ))
+        .unwrap();
+    writer
+        .write(&MessageRecord::new(
+            base + chrono::Duration::seconds(4),
+            "test/3".into(),
+            "third".into(),
+            0,
+            false,
+        ))
+        .unwrap();
     writer.flush().unwrap();
 
     let replayer_client = AnyMqttClient::V5(make_client(18864, "replayer").await);
@@ -315,7 +346,7 @@ async fn test_replayer_handles_shutdown_during_replay() {
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { replayer.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
 
     // Wait for first message to be sent, then shutdown during delay before second
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -361,7 +392,7 @@ async fn test_record_then_replay_roundtrip() {
     let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
 
     let (rec_shutdown_tx, rec_shutdown_rx) = broadcast::channel::<()>(1);
-    let rec_handle = tokio::spawn(async move { recorder.run(rec_shutdown_rx).await });
+    let rec_handle = tokio::spawn(async move { recorder.run(rec_shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -439,7 +470,7 @@ async fn test_record_then_replay_roundtrip() {
     let mut replayer = Replayer::new(replayer_client, reader, false).await;
 
     let (rep_shutdown_tx, rep_shutdown_rx) = broadcast::channel::<()>(1);
-    let rep_handle = tokio::spawn(async move { replayer.run(rep_shutdown_rx).await });
+    let rep_handle = tokio::spawn(async move { replayer.run(rep_shutdown_rx, None).await });
 
     // Collect replayed messages
     let messages = collect_messages(&subscriber, "roundtrip/#", 3, 5000).await;
