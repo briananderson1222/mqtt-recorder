@@ -12,6 +12,14 @@ use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
+fn get_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 /// Helper: create an MQTT v5 client connected to the given port
 async fn make_client(port: u16, id: &str) -> MqttClientV5 {
     MqttClientV5::new(MqttClientConfig::new(
@@ -38,14 +46,15 @@ async fn publish(client: &MqttClientV5, topic: &str, payload: &[u8], qos: QoS, r
 
 /// Test that recorder captures published messages into CSV.
 ///
-/// 1. Start embedded broker on port 18850
+/// 1. Start embedded broker on dynamic port
 /// 2. Create recorder subscribing to all topics, writing to temp CSV
 /// 3. Publish 3 messages to the broker
 /// 4. Shutdown recorder
 /// 5. Verify CSV contains 3 records with correct topic and payload
 #[tokio::test]
 async fn test_recorder_captures_published_messages() {
-    let _broker = EmbeddedBroker::new(18850, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -53,17 +62,17 @@ async fn test_recorder_captures_published_messages() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = AnyMqttClient::V5(make_client(18850, "recorder").await);
+    let recorder_client = AnyMqttClient::V5(make_client(port, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
-    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
+    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let publisher = make_client(18850, "publisher").await;
+    let publisher = make_client(port, "publisher").await;
     for i in 0..3 {
         publish(
             &publisher,
@@ -104,12 +113,13 @@ async fn test_recorder_captures_published_messages() {
 /// Note: QoS and retain values in CSV reflect the *delivery* QoS/retain from the
 /// broker, not the original publish values. The embedded broker may modify these.
 ///
-/// 1. Start broker on port 18851
+/// 1. Start broker on dynamic port
 /// 2. Publish messages with distinct topics and payloads
 /// 3. Verify CSV records have matching topic and payload values
 #[tokio::test]
 async fn test_recorder_preserves_message_fields() {
-    let _broker = EmbeddedBroker::new(18851, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -117,17 +127,17 @@ async fn test_recorder_preserves_message_fields() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = AnyMqttClient::V5(make_client(18851, "recorder").await);
+    let recorder_client = AnyMqttClient::V5(make_client(port, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
-    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
+    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let publisher = make_client(18851, "publisher").await;
+    let publisher = make_client(port, "publisher").await;
     publish(&publisher, "sensors/temp", b"22.5", QoS::AtMostOnce, false).await;
     publish(
         &publisher,
@@ -184,7 +194,8 @@ async fn test_recorder_preserves_message_fields() {
 /// 4. Verify CSV file is flushed (readable and complete)
 #[tokio::test]
 async fn test_recorder_handles_graceful_shutdown() {
-    let _broker = EmbeddedBroker::new(18852, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -192,17 +203,17 @@ async fn test_recorder_handles_graceful_shutdown() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = AnyMqttClient::V5(make_client(18852, "recorder").await);
+    let recorder_client = AnyMqttClient::V5(make_client(port, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
-    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
+    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let publisher = make_client(18852, "publisher").await;
+    let publisher = make_client(port, "publisher").await;
     publish(
         &publisher,
         "test/shutdown",
@@ -239,7 +250,8 @@ async fn test_recorder_handles_graceful_shutdown() {
 /// 2. Verify binary payload has b64: prefix in CSV, text is stored as-is
 #[tokio::test]
 async fn test_recorder_auto_encodes_binary_payloads() {
-    let _broker = EmbeddedBroker::new(18853, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -247,17 +259,17 @@ async fn test_recorder_auto_encodes_binary_payloads() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = AnyMqttClient::V5(make_client(18853, "recorder").await);
+    let recorder_client = AnyMqttClient::V5(make_client(port, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
-    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
+    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let publisher = make_client(18853, "publisher").await;
+    let publisher = make_client(port, "publisher").await;
     // Text payload
     publish(
         &publisher,
@@ -312,7 +324,8 @@ async fn test_recorder_auto_encodes_binary_payloads() {
 /// 3. Verify only the sensors message is recorded
 #[tokio::test]
 async fn test_recorder_topic_filter() {
-    let _broker = EmbeddedBroker::new(18854, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -320,17 +333,17 @@ async fn test_recorder_topic_filter() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("output.csv");
 
-    let recorder_client = AnyMqttClient::V5(make_client(18854, "recorder").await);
+    let recorder_client = AnyMqttClient::V5(make_client(port, "recorder").await);
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::from_single("sensors/#".to_string());
-    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
+    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { recorder.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let publisher = make_client(18854, "publisher").await;
+    let publisher = make_client(port, "publisher").await;
     publish(&publisher, "sensors/temp", b"22.5", QoS::AtMostOnce, false).await;
     publish(&publisher, "actuators/fan", b"on", QoS::AtMostOnce, false).await;
     publish(

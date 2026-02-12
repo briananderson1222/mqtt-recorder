@@ -9,6 +9,7 @@ use super::record::{MessageRecord, MessageRecordBytes};
 use crate::error::MqttRecorderError;
 
 /// Intermediate parsed fields shared between parse_record and parse_record_bytes.
+#[derive(Debug)]
 struct ParsedFields {
     timestamp: DateTime<Utc>,
     topic: String,
@@ -147,19 +148,12 @@ impl CsvReader {
 
         // Parse timestamp (ISO 8601 format)
         let timestamp_str = &record[0];
-        let timestamp = DateTime::parse_from_rfc3339(timestamp_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| {
-                // Try parsing with the format we write (which may not have timezone offset)
-                chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .map(|ndt| ndt.and_utc())
-            })
-            .map_err(|e| {
-                MqttRecorderError::InvalidArgument(format!(
-                    "Line {}: Invalid timestamp '{}': {}",
-                    line_number, timestamp_str, e
-                ))
-            })?;
+        let timestamp = crate::util::parse_timestamp(timestamp_str).map_err(|_| {
+            MqttRecorderError::InvalidArgument(format!(
+                "Line {}: Invalid timestamp '{}'",
+                line_number, timestamp_str
+            ))
+        })?;
 
         // Parse topic
         let topic = record[1].to_string();
@@ -301,6 +295,7 @@ mod tests {
     use super::*;
     use crate::csv_handler::CsvWriter;
     use chrono::TimeZone;
+    use std::fs;
 
     #[test]
     fn test_csv_reader_reads_single_record() {
@@ -393,5 +388,429 @@ mod tests {
         let read_record = reader.next().unwrap().unwrap();
         assert_eq!(read_record.topic, "test/topic");
         assert!(reader.next().is_none());
+    }
+
+    // parse_common_fields tests
+    #[test]
+    fn test_parse_common_fields_valid() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.000Z,test/topic,payload,1,true").unwrap();
+
+        let reader = CsvReader::new(&file_path, false, None).unwrap();
+        let record = csv::StringRecord::from(vec![
+            "2024-01-15T10:30:00.000Z",
+            "test/topic",
+            "payload",
+            "1",
+            "true",
+        ]);
+        let fields = reader.parse_common_fields(&record, 2).unwrap();
+
+        assert_eq!(fields.topic, "test/topic");
+        assert_eq!(fields.payload_str, "payload");
+        assert_eq!(fields.qos, 1);
+        assert!(fields.retain);
+    }
+
+    #[test]
+    fn test_parse_common_fields_wrong_field_count() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n").unwrap();
+
+        let reader = CsvReader::new(&file_path, false, None).unwrap();
+
+        // 3 fields
+        let record =
+            csv::StringRecord::from(vec!["2024-01-15T10:30:00.000Z", "test/topic", "payload"]);
+        let result = reader.parse_common_fields(&record, 2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Expected 5 fields but got 3"));
+
+        // 6 fields
+        let record = csv::StringRecord::from(vec![
+            "2024-01-15T10:30:00.000Z",
+            "test/topic",
+            "payload",
+            "1",
+            "true",
+            "extra",
+        ]);
+        let result = reader.parse_common_fields(&record, 2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Expected 5 fields but got 6"));
+    }
+
+    #[test]
+    fn test_parse_common_fields_invalid_timestamp() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n").unwrap();
+
+        let reader = CsvReader::new(&file_path, false, None).unwrap();
+        let record = csv::StringRecord::from(vec![
+            "invalid-timestamp",
+            "test/topic",
+            "payload",
+            "1",
+            "true",
+        ]);
+        let result = reader.parse_common_fields(&record, 2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid timestamp"));
+    }
+
+    #[test]
+    fn test_parse_common_fields_invalid_qos() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n").unwrap();
+
+        let reader = CsvReader::new(&file_path, false, None).unwrap();
+
+        // QoS 3 (out of range)
+        let record = csv::StringRecord::from(vec![
+            "2024-01-15T10:30:00.000Z",
+            "test/topic",
+            "payload",
+            "3",
+            "true",
+        ]);
+        let result = reader.parse_common_fields(&record, 2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("QoS must be 0, 1, or 2, got 3"));
+
+        // QoS 'abc' (not a number)
+        let record = csv::StringRecord::from(vec![
+            "2024-01-15T10:30:00.000Z",
+            "test/topic",
+            "payload",
+            "abc",
+            "true",
+        ]);
+        let result = reader.parse_common_fields(&record, 2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid QoS 'abc'"));
+    }
+
+    #[test]
+    fn test_parse_common_fields_invalid_retain() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n").unwrap();
+
+        let reader = CsvReader::new(&file_path, false, None).unwrap();
+
+        // 'yes' instead of boolean
+        let record = csv::StringRecord::from(vec![
+            "2024-01-15T10:30:00.000Z",
+            "test/topic",
+            "payload",
+            "1",
+            "yes",
+        ]);
+        let result = reader.parse_common_fields(&record, 2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid retain flag 'yes'"));
+
+        // 'abc' instead of boolean
+        let record = csv::StringRecord::from(vec![
+            "2024-01-15T10:30:00.000Z",
+            "test/topic",
+            "payload",
+            "1",
+            "abc",
+        ]);
+        let result = reader.parse_common_fields(&record, 2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid retain flag 'abc'"));
+    }
+
+    #[test]
+    fn test_parse_common_fields_field_size_limit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n").unwrap();
+
+        let reader = CsvReader::new(&file_path, false, Some(10)).unwrap();
+        let record = csv::StringRecord::from(vec![
+            "2024-01-15T10:30:00.000Z",
+            "test/topic",
+            "payload",
+            "1",
+            "true",
+        ]);
+        let result = reader.parse_common_fields(&record, 2);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds size limit"));
+    }
+
+    // parse_record tests
+    #[test]
+    fn test_parse_record_base64_decode_true() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        let base64_payload = base64::engine::general_purpose::STANDARD.encode("Hello World");
+        fs::write(
+            &file_path,
+            format!(
+                "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.000Z,test/topic,{},1,true",
+                base64_payload
+            ),
+        )
+        .unwrap();
+
+        let mut reader = CsvReader::new(&file_path, true, None).unwrap();
+        let result = reader.next().unwrap().unwrap();
+
+        assert_eq!(result.payload, "Hello World");
+    }
+
+    #[test]
+    fn test_parse_record_auto_decode_b64_prefix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        let base64_payload = base64::engine::general_purpose::STANDARD.encode("Binary Data");
+        let prefixed_payload = format!("b64:{}", base64_payload);
+        fs::write(
+            &file_path,
+            format!(
+                "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.000Z,test/topic,{},1,true",
+                prefixed_payload
+            ),
+        )
+        .unwrap();
+
+        let mut reader = CsvReader::new(&file_path, false, None).unwrap();
+        let result = reader.next().unwrap().unwrap();
+
+        assert_eq!(result.payload, "Binary Data");
+    }
+
+    #[test]
+    fn test_parse_record_plain_text_passthrough() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.000Z,test/topic,plain text,1,true").unwrap();
+
+        let mut reader = CsvReader::new(&file_path, false, None).unwrap();
+        let result = reader.next().unwrap().unwrap();
+
+        assert_eq!(result.payload, "plain text");
+    }
+
+    #[test]
+    fn test_parse_record_invalid_base64() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.000Z,test/topic,invalid-base64!,1,true").unwrap();
+
+        let mut reader = CsvReader::new(&file_path, true, None).unwrap();
+        let result = reader.next().unwrap();
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid base64 payload"));
+    }
+
+    // parse_record_bytes tests
+    #[test]
+    fn test_parse_record_bytes_text() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.000Z,test/topic,text payload,1,true").unwrap();
+
+        let mut reader = CsvReader::new(&file_path, false, None).unwrap();
+        let result = reader.read_next_bytes().unwrap().unwrap();
+
+        assert_eq!(result.payload, b"text payload");
+    }
+
+    #[test]
+    fn test_parse_record_bytes_b64_prefix() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        let binary_data = vec![0x08, 0x0A, 0x12, 0x18];
+        let base64_payload = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+        let prefixed_payload = format!("b64:{}", base64_payload);
+        fs::write(
+            &file_path,
+            format!(
+                "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.000Z,test/topic,{},1,true",
+                prefixed_payload
+            ),
+        )
+        .unwrap();
+
+        let mut reader = CsvReader::new(&file_path, false, None).unwrap();
+        let result = reader.read_next_bytes().unwrap().unwrap();
+
+        assert_eq!(result.payload, binary_data);
+    }
+
+    #[test]
+    fn test_parse_record_bytes_base64_decode() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        let binary_data = vec![0xFF, 0xFE, 0x00, 0x01];
+        let base64_payload = base64::engine::general_purpose::STANDARD.encode(&binary_data);
+        fs::write(
+            &file_path,
+            format!(
+                "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.000Z,test/topic,{},1,true",
+                base64_payload
+            ),
+        )
+        .unwrap();
+
+        let mut reader = CsvReader::new(&file_path, true, None).unwrap();
+        let result = reader.read_next_bytes().unwrap().unwrap();
+
+        assert_eq!(result.payload, binary_data);
+    }
+
+    // Iterator tests
+    #[test]
+    fn test_iterator_multiple_records() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        let timestamp = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let records = vec![
+            MessageRecord::new(
+                timestamp,
+                "topic1".to_string(),
+                "payload1".to_string(),
+                0,
+                false,
+            ),
+            MessageRecord::new(
+                timestamp,
+                "topic2".to_string(),
+                "payload2".to_string(),
+                1,
+                true,
+            ),
+        ];
+
+        // Write records
+        {
+            let mut writer = CsvWriter::new(&file_path, false).unwrap();
+            for record in &records {
+                writer.write(record).unwrap();
+            }
+            writer.flush().unwrap();
+        }
+
+        // Read using iterator
+        let reader = CsvReader::new(&file_path, false, None).unwrap();
+        let read_records: Result<Vec<_>, _> = reader.collect();
+        let read_records = read_records.unwrap();
+
+        assert_eq!(read_records.len(), 2);
+        assert_eq!(read_records[0].topic, "topic1");
+        assert_eq!(read_records[1].topic, "topic2");
+    }
+
+    #[test]
+    fn test_iterator_empty_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+        fs::write(&file_path, "timestamp,topic,payload,qos,retain\n").unwrap();
+
+        let reader = CsvReader::new(&file_path, false, None).unwrap();
+        let records: Vec<_> = reader.collect();
+        assert!(records.is_empty());
+    }
+
+    // Error cases
+    #[test]
+    fn test_nonexistent_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("nonexistent.csv");
+
+        let result = CsvReader::new(&file_path, false, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_malformed_csv() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+        fs::write(
+            &file_path,
+            "timestamp,topic,payload,qos,retain\nmalformed\"csv\"line",
+        )
+        .unwrap();
+
+        let mut reader = CsvReader::new(&file_path, false, None).unwrap();
+        let result = reader.next();
+        assert!(result.is_some());
+        assert!(result.unwrap().is_err());
+    }
+
+    // read_next_bytes tests
+    #[test]
+    fn test_read_next_bytes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test.csv");
+
+        let timestamp = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let record = MessageRecord::new(
+            timestamp,
+            "test/topic".to_string(),
+            "test payload".to_string(),
+            0,
+            false,
+        );
+
+        // Write record
+        {
+            let mut writer = CsvWriter::new(&file_path, false).unwrap();
+            writer.write(&record).unwrap();
+            writer.flush().unwrap();
+        }
+
+        // Read as bytes
+        let mut reader = CsvReader::new(&file_path, false, None).unwrap();
+        let read_record = reader.read_next_bytes().unwrap().unwrap();
+
+        assert_eq!(read_record.topic, "test/topic");
+        assert_eq!(read_record.payload, b"test payload");
+        assert_eq!(read_record.qos, 0);
+        assert!(!read_record.retain);
     }
 }

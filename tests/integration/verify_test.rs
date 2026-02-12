@@ -5,7 +5,7 @@ use mqtt_recorder::csv_handler::{CsvWriter, MessageRecord};
 use mqtt_recorder::mirror::Mirror;
 use mqtt_recorder::mqtt::{AnyMqttClient, MqttClientConfig, MqttClientV5};
 use mqtt_recorder::topics::TopicFilter;
-use mqtt_recorder::tui::{AppMode, TuiState};
+use mqtt_recorder::tui::TuiState;
 use rumqttc::QoS;
 
 use std::sync::Arc;
@@ -14,20 +14,27 @@ use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
+fn get_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 /// Helper: create a TuiState for verify tests
 fn make_tui_state(broker_port: u16, file_path: Option<String>) -> Arc<TuiState> {
-    Arc::new(TuiState::new(
-        AppMode::Mirror,
+    Arc::new(TuiState::new(mqtt_recorder::tui::state::TuiConfig {
         broker_port,
         file_path,
-        Some("127.0.0.1".to_string()),
-        0,
-        None,
-        true,
-        vec![],
-        false,
-        0,
-    ))
+        source_host: Some("127.0.0.1".to_string()),
+        source_port: 0,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: false,
+        health_check_interval: 0,
+    }))
 }
 
 /// Helper: publish N messages to a broker and poll to flush
@@ -82,8 +89,8 @@ fn write_test_csv(path: &std::path::Path, topic: &str, count: usize) {
 /// Test 1: Source mirroring with verify — messages from source broker arrive on embedded broker
 #[tokio::test]
 async fn test_verify_source_mirroring() {
-    let source_port = 18870;
-    let mirror_port = 18871;
+    let source_port = get_free_port();
+    let mirror_port = get_free_port();
 
     let _source_broker = EmbeddedBroker::new(source_port, BrokerMode::Standalone)
         .await
@@ -162,8 +169,8 @@ async fn test_verify_source_mirroring() {
 /// Test 2: Playback with verify — CSV messages replayed arrive on embedded broker
 #[tokio::test]
 async fn test_verify_playback() {
-    let source_port = 18872;
-    let mirror_port = 18873;
+    let source_port = get_free_port();
+    let mirror_port = get_free_port();
 
     let _source_broker = EmbeddedBroker::new(source_port, BrokerMode::Standalone)
         .await
@@ -255,8 +262,8 @@ async fn test_verify_playback() {
 /// Test 3: Combined source mirroring + playback with verify
 #[tokio::test]
 async fn test_verify_combined_source_and_playback() {
-    let source_port = 18874;
-    let mirror_port = 18875;
+    let source_port = get_free_port();
+    let mirror_port = get_free_port();
 
     let _source_broker = EmbeddedBroker::new(source_port, BrokerMode::Standalone)
         .await
