@@ -116,14 +116,9 @@ impl Recorder {
     /// let writer = CsvWriter::new(Path::new("output.csv"), false)?;
     /// let topics = TopicFilter::wildcard();
     ///
-    /// let recorder = Recorder::new(client, writer, topics, QoS::AtMostOnce).await;
+    /// let recorder = Recorder::new(client, writer, topics, QoS::AtMostOnce);
     /// ```
-    pub async fn new(
-        client: AnyMqttClient,
-        writer: CsvWriter,
-        topics: TopicFilter,
-        qos: QoS,
-    ) -> Self {
+    pub fn new(client: AnyMqttClient, writer: CsvWriter, topics: TopicFilter, qos: QoS) -> Self {
         Self {
             client,
             writer,
@@ -295,33 +290,17 @@ impl Recorder {
 /// Returns `Some(RawMessage)` if the event contains a publish message,
 /// or `None` for other event types.
 fn process_event_impl(event: MqttIncoming) -> Option<RawMessage> {
-    match event {
-        MqttIncoming::Publish {
-            topic,
-            payload,
-            qos,
+    if let Some((topic, payload, qos_u8, retain)) = crate::util::extract_publish(&event) {
+        let timestamp = Utc::now();
+        Some(RawMessage {
+            timestamp,
+            topic: topic.to_string(),
+            payload: payload.to_vec(),
+            qos: qos_u8,
             retain,
-        } => {
-            let timestamp = Utc::now();
-            let qos_u8 = crate::util::qos_to_u8(qos);
-
-            Some(RawMessage {
-                timestamp,
-                topic,
-                payload: payload.to_vec(),
-                qos: qos_u8,
-                retain,
-            })
-        }
-        MqttIncoming::ConnAck => {
-            info!("Connected to MQTT broker");
-            None
-        }
-        MqttIncoming::SubAck => {
-            info!("Subscription acknowledged");
-            None
-        }
-        MqttIncoming::Other => None,
+        })
+    } else {
+        None
     }
 }
 

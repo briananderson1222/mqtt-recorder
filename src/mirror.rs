@@ -50,28 +50,20 @@ use crate::mqtt::{AnyMqttClient, MqttClientV5, MqttIncoming};
 use crate::topics::TopicFilter;
 use crate::tui::{AuditArea, AuditSeverity, TuiState};
 
-/// Interval for logging mirrored message count (in number of messages).
-const LOG_INTERVAL: u64 = 100;
+/// Interval for polling broker metrics (in number of messages).
+const METRICS_POLL_INTERVAL: u64 = 100;
 
-/// Format a payload for human-readable audit output (truncated, hex for binary).
-fn format_payload_preview(data: &[u8]) -> String {
-    match std::str::from_utf8(data) {
-        Ok(s) if s.len() <= 120 => s.to_string(),
-        Ok(s) => format!("{}...", &s[..120]),
-        Err(_) if data.len() <= 60 => data
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" "),
-        Err(_) => {
-            let hex: String = data[..60]
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<Vec<_>>()
-                .join(" ");
-            format!("{}...", hex)
-        }
-    }
+fn process_event_impl(event: MqttIncoming) -> Option<MessageRecord> {
+    let (topic, payload, qos, retain) = crate::util::extract_publish(&event)?;
+    let timestamp = Utc::now();
+    let payload_str = String::from_utf8_lossy(payload).to_string();
+    Some(MessageRecord::new(
+        timestamp,
+        topic.to_string(),
+        payload_str,
+        qos,
+        retain,
+    ))
 }
 
 /// Mirror for republishing MQTT messages from an external broker to an embedded broker.
@@ -194,36 +186,14 @@ impl Mirror {
         })
     }
 
-    /// Runs the mirror loop with TUI state support for record/passthrough toggle.
-    ///
-    /// This method is similar to the basic run but checks the TUI state to determine
-    /// whether to record messages to CSV. Messages are always republished to
-    /// the embedded broker regardless of the TUI mode.
-    ///
-    /// - `AppMode::Record` - Republish AND write to CSV
-    /// - `AppMode::Passthrough` - Republish only (no CSV)
-    /// - Other modes - Same as Passthrough
-    pub async fn run(
-        &mut self,
-        mut shutdown: broadcast::Receiver<()>,
-        tui_state: Option<std::sync::Arc<TuiState>>,
-    ) -> Result<u64, MqttRecorderError> {
-        let topics = self.topics.topics();
-        if !topics.is_empty() {
-            self.source_client.subscribe(topics, self.qos).await?;
-            // Mark source as connected after successful subscribe
-            if let Some(ref state) = tui_state {
-                state.set_source_connected(true);
-            }
-            info!("Subscribed to {} topic(s) on external broker", topics.len());
-        }
-
-        // Spawn background task to drive the local client event loop
-        // Small delay lets the embedded broker finish binding its listener
+    fn spawn_local_poll_task(
+        &self,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+    ) -> tokio::task::JoinHandle<()> {
         let local_eventloop = self.local_client.eventloop();
         let broker_port = self.broker.port();
         let tui_state_bg = tui_state.clone();
-        let local_poll_handle = tokio::spawn(async move {
+        tokio::spawn(async move {
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             let mut connected = false;
             loop {
@@ -276,9 +246,17 @@ impl Mirror {
                     }
                 }
             }
-        });
+        })
+    }
 
-        // Spawn verify task if verify client is present
+    async fn spawn_verify_task(
+        &mut self,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
         let verify_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (verify_handle, verify_shutdown_tx) = if let Some(verify_client) =
             self.verify_client.take()
@@ -378,8 +356,8 @@ impl Mirror {
                                             state.push_audit(AuditArea::Verify, AuditSeverity::Warn,
                                                 format!("PAYLOAD MISMATCH on {}: expected {} bytes got {} bytes\n  expected: {}\n  received: {}",
                                                     topic, expected.len(), payload.len(),
-                                                    format_payload_preview(expected),
-                                                    format_payload_preview(&payload)));
+                                                    crate::util::format_payload_preview(expected),
+                                                    crate::util::format_payload_preview(&payload)));
                                             pending.remove(i);
                                         } else {
                                             // 3) No topic match at all — truly unexpected
@@ -390,7 +368,7 @@ impl Mirror {
                                                     "UNEXPECTED on broker: {} ({} bytes): {}",
                                                     topic,
                                                     payload.len(),
-                                                    format_payload_preview(&payload)
+                                                    crate::util::format_payload_preview(&payload)
                                                 ),
                                             );
                                         }
@@ -422,7 +400,7 @@ impl Mirror {
                                     "MISSING from broker: {} ({} bytes): {}",
                                     topic,
                                     payload.len(),
-                                    format_payload_preview(payload)
+                                    crate::util::format_payload_preview(payload)
                                 ),
                             );
                         }
@@ -440,7 +418,38 @@ impl Mirror {
         } else {
             (None, None)
         };
+        (verify_ready, verify_handle, verify_shutdown_tx)
+    }
 
+    /// Runs the mirror loop with TUI state support for record/passthrough toggle.
+    ///
+    /// This method is similar to the basic run but checks the TUI state to determine
+    /// whether to record messages to CSV. Messages are always republished to
+    /// the embedded broker regardless of the TUI mode.
+    ///
+    /// - `AppMode::Record` - Republish AND write to CSV
+    /// - `AppMode::Passthrough` - Republish only (no CSV)
+    /// - Other modes - Same as Passthrough
+    pub async fn run(
+        &mut self,
+        mut shutdown: broadcast::Receiver<()>,
+        tui_state: Option<std::sync::Arc<TuiState>>,
+    ) -> Result<u64, MqttRecorderError> {
+        let topics = self.topics.topics();
+        if !topics.is_empty() {
+            self.source_client.subscribe(topics, self.qos).await?;
+            // Mark source as connected after successful subscribe
+            if let Some(ref state) = tui_state {
+                state.set_source_connected(true);
+            }
+            info!("Subscribed to {} topic(s) on external broker", topics.len());
+        }
+
+        // Spawn background task to drive the local client event loop
+        let local_poll_handle = self.spawn_local_poll_task(&tui_state);
+
+        let (verify_ready, verify_handle, verify_shutdown_tx) =
+            self.spawn_verify_task(&tui_state).await;
         let mut message_count: u64 = 0;
         let mut flush_counter: u64 = 0;
 
@@ -710,6 +719,63 @@ impl Mirror {
         Ok(())
     }
 
+    /// Handles recording logic including file path changes and recording toggles.
+    fn handle_recording(
+        &mut self,
+        record: &MessageRecord,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        flush_counter: &mut u64,
+        was_recording: &mut bool,
+    ) -> Result<(), MqttRecorderError> {
+        // Check for file path change
+        if let Some(ref state) = tui_state {
+            if let Some(new_path) = state.take_new_file() {
+                // Flush and close old writer
+                if let Some(ref mut writer) = self.writer {
+                    let _ = writer.flush();
+                }
+                // Create new writer
+                match CsvWriter::new(std::path::Path::new(&new_path), false) {
+                    Ok(new_writer) => {
+                        self.writer = Some(new_writer);
+                    }
+                    Err(e) => {
+                        error!("Error creating new file: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Check if recording is enabled
+        let should_record = tui_state.as_ref().map(|s| s.is_recording()).unwrap_or(true);
+
+        // Flush on recording toggle off
+        if *was_recording && !should_record {
+            if let Some(ref mut writer) = self.writer {
+                let _ = writer.flush();
+            }
+        }
+        *was_recording = should_record;
+
+        if should_record {
+            if let Some(ref mut writer) = self.writer {
+                writer.write(record)?;
+                *flush_counter += 1;
+
+                if let Some(ref state) = tui_state {
+                    state.increment_recorded();
+                }
+
+                if *flush_counter >= crate::util::FLUSH_INTERVAL {
+                    writer.flush()?;
+                    *flush_counter = 0;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_source_event(
         &mut self,
         event: MqttIncoming,
@@ -768,51 +834,7 @@ impl Mirror {
                 }
             }
 
-            // Check for file path change
-            if let Some(ref state) = tui_state {
-                if let Some(new_path) = state.take_new_file() {
-                    // Flush and close old writer
-                    if let Some(ref mut writer) = self.writer {
-                        let _ = writer.flush();
-                    }
-                    // Create new writer
-                    match CsvWriter::new(std::path::Path::new(&new_path), false) {
-                        Ok(new_writer) => {
-                            self.writer = Some(new_writer);
-                        }
-                        Err(e) => {
-                            error!("Error creating new file: {}", e);
-                        }
-                    }
-                }
-            }
-
-            // Check if recording is enabled
-            let should_record = tui_state.as_ref().map(|s| s.is_recording()).unwrap_or(true);
-
-            // Flush on recording toggle off
-            if *was_recording && !should_record {
-                if let Some(ref mut writer) = self.writer {
-                    let _ = writer.flush();
-                }
-            }
-            *was_recording = should_record;
-
-            if should_record {
-                if let Some(ref mut writer) = self.writer {
-                    writer.write(&record)?;
-                    *flush_counter += 1;
-
-                    if let Some(ref state) = tui_state {
-                        state.increment_recorded();
-                    }
-
-                    if *flush_counter >= LOG_INTERVAL {
-                        writer.flush()?;
-                        *flush_counter = 0;
-                    }
-                }
-            }
+            self.handle_recording(&record, tui_state, flush_counter, was_recording)?;
 
             *message_count += 1;
 
@@ -821,7 +843,7 @@ impl Mirror {
             }
 
             // Poll broker metrics periodically
-            if message_count.is_multiple_of(LOG_INTERVAL) {
+            if *message_count % METRICS_POLL_INTERVAL == 0 {
                 if let Some(metrics) = self.broker.poll_metrics() {
                     if let Some(ref state) = tui_state {
                         state.update_broker_metrics(&metrics);
@@ -849,26 +871,7 @@ impl Mirror {
     /// Returns `Some(MessageRecord)` if the event contains a publish message,
     /// or `None` for other event types.
     fn process_event(&self, event: MqttIncoming) -> Option<MessageRecord> {
-        match event {
-            MqttIncoming::Publish {
-                topic,
-                payload,
-                qos,
-                retain,
-            } => {
-                let timestamp = Utc::now();
-                let payload_str = String::from_utf8_lossy(&payload).to_string();
-                let qos_u8 = crate::util::qos_to_u8(qos);
-                Some(MessageRecord::new(
-                    timestamp,
-                    topic,
-                    payload_str,
-                    qos_u8,
-                    retain,
-                ))
-            }
-            _ => None,
-        }
+        process_event_impl(event)
     }
 
     /// Republishes a message record to the embedded broker.
@@ -904,7 +907,7 @@ impl Mirror {
     /// Gets a reference to the embedded broker.
     ///
     /// This can be useful for checking the broker's mode or port.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn broker(&self) -> &EmbeddedBroker {
         &self.broker
     }
@@ -925,10 +928,151 @@ impl Mirror {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mqtt::MqttIncoming;
+    use rumqttc::QoS as RumqttcQoS;
 
     #[test]
     fn test_log_interval_constant() {
-        // Verify the log interval is set to a reasonable value
-        assert_eq!(LOG_INTERVAL, 100);
+        // Verify the metrics poll interval is set to a reasonable value
+        assert_eq!(METRICS_POLL_INTERVAL, 100);
+    }
+
+    #[test]
+    fn test_process_event_publish() {
+        let event = MqttIncoming::Publish {
+            topic: "test/topic".to_string(),
+            payload: vec![104, 101, 108, 108, 111],
+            qos: RumqttcQoS::AtLeastOnce,
+            retain: true,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.topic, "test/topic");
+        assert_eq!(record.payload, "hello");
+        assert_eq!(record.qos, 1);
+        assert!(record.retain);
+    }
+
+    #[test]
+    fn test_process_event_connack() {
+        assert!(process_event_impl(MqttIncoming::ConnAck).is_none());
+    }
+
+    #[test]
+    fn test_process_event_other() {
+        assert!(process_event_impl(MqttIncoming::Other).is_none());
+    }
+
+    #[test]
+    fn test_process_event_qos_0() {
+        let event = MqttIncoming::Publish {
+            topic: "test/qos0".to_string(),
+            payload: vec![116, 101, 115, 116],
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.topic, "test/qos0");
+        assert_eq!(record.payload, "test");
+        assert_eq!(record.qos, 0);
+        assert!(!record.retain);
+    }
+
+    #[test]
+    fn test_process_event_qos_1() {
+        let event = MqttIncoming::Publish {
+            topic: "test/qos1".to_string(),
+            payload: vec![116, 101, 115, 116],
+            qos: RumqttcQoS::AtLeastOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.qos, 1);
+    }
+
+    #[test]
+    fn test_process_event_qos_2() {
+        let event = MqttIncoming::Publish {
+            topic: "test/qos2".to_string(),
+            payload: vec![116, 101, 115, 116],
+            qos: RumqttcQoS::ExactlyOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.qos, 2);
+    }
+
+    #[test]
+    fn test_process_event_empty_payload() {
+        let event = MqttIncoming::Publish {
+            topic: "test/empty".to_string(),
+            payload: vec![],
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.payload, "");
+    }
+
+    #[test]
+    fn test_process_event_binary_payload() {
+        let event = MqttIncoming::Publish {
+            topic: "test/binary".to_string(),
+            payload: vec![0xFF, 0xFE, 0x00, 0x01],
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        // Should use lossy UTF-8 conversion
+        assert!(record.payload.contains('\u{FFFD}') || !record.payload.is_empty());
+    }
+
+    #[test]
+    fn test_process_event_unicode_payload() {
+        let event = MqttIncoming::Publish {
+            topic: "test/unicode".to_string(),
+            payload: "Hello 世界! 🌍".as_bytes().to_vec(),
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.payload, "Hello 世界! 🌍");
+    }
+
+    #[test]
+    fn test_process_event_suback() {
+        assert!(process_event_impl(MqttIncoming::SubAck).is_none());
+    }
+
+    #[test]
+    fn test_process_event_timestamp_is_recent() {
+        let event = MqttIncoming::Publish {
+            topic: "test/timestamp".to_string(),
+            payload: vec![116, 101, 115, 116],
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let before = Utc::now();
+        let result = process_event_impl(event);
+        let after = Utc::now();
+
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert!(record.timestamp >= before);
+        assert!(record.timestamp <= after);
+        assert!((after - record.timestamp).num_seconds() <= 1);
     }
 }

@@ -98,9 +98,9 @@ impl Replayer {
     /// let client = MqttClient::new(config).await?;
     /// let reader = CsvReader::new(Path::new("input.csv"), false, None)?;
     ///
-    /// let replayer = Replayer::new(client, reader, false).await;
+    /// let replayer = Replayer::new(client, reader, false);
     /// ```
-    pub async fn new(client: AnyMqttClient, reader: CsvReader, loop_replay: bool) -> Self {
+    pub fn new(client: AnyMqttClient, reader: CsvReader, loop_replay: bool) -> Self {
         Self {
             client,
             reader,
@@ -169,7 +169,6 @@ impl Replayer {
         mut shutdown: broadcast::Receiver<()>,
         tui_state: Option<Arc<TuiState>>,
     ) -> Result<u64, MqttRecorderError> {
-        let _tui_active = tui_state.is_some();
         let mut message_count: u64 = 0;
         let mut previous_timestamp: Option<DateTime<Utc>> = None;
 
