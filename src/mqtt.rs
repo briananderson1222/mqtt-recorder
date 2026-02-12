@@ -174,13 +174,13 @@ impl MqttClientConfig {
     }
 
     /// Returns true if TLS is configured for this connection.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn is_tls_enabled(&self) -> bool {
         self.tls.is_some()
     }
 
     /// Returns true if authentication credentials are configured.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn has_credentials(&self) -> bool {
         self.username.is_some() && self.password.is_some()
     }
@@ -283,7 +283,7 @@ impl TlsConfig {
     }
 
     /// Returns true if a CA certificate is configured for server verification.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn has_ca_cert(&self) -> bool {
         self.ca_cert.is_some()
     }
@@ -574,7 +574,7 @@ impl MqttClient {
     /// Get a reference to the underlying AsyncClient.
     ///
     /// This can be useful for advanced operations not covered by the wrapper methods.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn client(&self) -> &AsyncClient {
         &self.client
     }

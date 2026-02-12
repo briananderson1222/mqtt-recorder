@@ -559,7 +559,6 @@ mod tests {
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
-use chrono::DateTime;
 use csv::ReaderBuilder;
 
 use crate::csv_handler::AUTO_ENCODE_MARKER;
@@ -832,22 +831,11 @@ impl CsvValidator {
     /// Accepts timestamps in RFC 3339 format or the format used by the writer
     /// (e.g., "2024-01-15T10:30:00.123Z").
     fn validate_timestamp(timestamp_str: &str) -> Result<(), String> {
-        // Try RFC 3339 format first
-        if DateTime::parse_from_rfc3339(timestamp_str).is_ok() {
-            return Ok(());
+        if crate::util::parse_timestamp(timestamp_str).is_ok() {
+            Ok(())
+        } else {
+            Err("expected ISO 8601 format (e.g., 2024-01-15T10:30:00.123Z)".to_string())
         }
-
-        // Try the format we write (which may not have timezone offset)
-        if chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.3fZ").is_ok() {
-            return Ok(());
-        }
-
-        // Try without milliseconds
-        if chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%SZ").is_ok() {
-            return Ok(());
-        }
-
-        Err("expected ISO 8601 format (e.g., 2024-01-15T10:30:00.123Z)".to_string())
     }
 
     /// Validates a QoS string is 0, 1, or 2.

@@ -5,7 +5,7 @@
 //!
 //! **Feature: tui**
 
-use mqtt_recorder::tui::{should_enable_interactive, AppMode, TuiState};
+use mqtt_recorder::tui::{should_enable_interactive, AppMode, TuiConfig, TuiState};
 use proptest::prelude::*;
 use std::sync::atomic::Ordering;
 
@@ -65,7 +65,17 @@ fn property_2_app_mode_values() {
 proptest! {
     #[test]
     fn property_3_tui_state_received_count_increments(count in 0u64..1000) {
-        let state = TuiState::new(AppMode::Record, 1883, None, None, 1883, None, true, vec![], true, 60);
+        let state = TuiState::new(TuiConfig {
+            broker_port: 1883,
+            file_path: None,
+            source_host: None,
+            source_port: 1883,
+            initial_record: None,
+            initial_mirror: true,
+            playlist: vec![],
+            audit_enabled: true,
+            health_check_interval: 60,
+        });
         for _ in 0..count {
             state.increment_received();
         }
@@ -74,31 +84,50 @@ proptest! {
 
     #[test]
     fn property_3_tui_state_preserves_broker_port(port in 1024u16..65535) {
-        let state = TuiState::new(AppMode::Record, port, None, None, 1883, None, true, vec![], true, 60);
+        let state = TuiState::new(TuiConfig {
+            broker_port: port,
+            file_path: None,
+            source_host: None,
+            source_port: 1883,
+            initial_record: None,
+            initial_mirror: true,
+            playlist: vec![],
+            audit_enabled: true,
+            health_check_interval: 60,
+        });
         prop_assert_eq!(state.broker_port, port);
     }
 
     #[test]
     fn property_3_tui_state_preserves_file_path(path in "[a-z]{1,20}\\.csv") {
-        let state = TuiState::new(AppMode::Record, 1883, Some(path.clone()), None, 1883, None, true, vec![], true, 60);
+        let state = TuiState::new(TuiConfig {
+            broker_port: 1883,
+            file_path: Some(path.clone()),
+            source_host: None,
+            source_port: 1883,
+            initial_record: None,
+            initial_mirror: true,
+            playlist: vec![],
+            audit_enabled: true,
+            health_check_interval: 60,
+        });
         prop_assert_eq!(state.get_file_path(), Some(path));
     }
 }
 
 #[test]
 fn property_3_tui_state_recording_toggle() {
-    let state = TuiState::new(
-        AppMode::Mirror,
-        1883,
-        Some("test.csv".to_string()),
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: Some("test.csv".to_string()),
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
 
     // Initially true (file path provided)
     assert!(state.is_recording());
@@ -114,18 +143,17 @@ fn property_3_tui_state_recording_toggle() {
 
 #[test]
 fn property_3_tui_state_mirroring_toggle() {
-    let state = TuiState::new(
-        AppMode::Mirror,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
 
     // Initially true
     assert!(state.is_mirroring());
@@ -141,18 +169,17 @@ fn property_3_tui_state_mirroring_toggle() {
 
 #[test]
 fn property_3_tui_state_source_toggle() {
-    let state = TuiState::new(
-        AppMode::Mirror,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
 
     // Initially true
     assert!(state.is_source_enabled());
@@ -168,18 +195,17 @@ fn property_3_tui_state_source_toggle() {
 
 #[test]
 fn property_3_tui_state_loop_toggle() {
-    let state = TuiState::new(
-        AppMode::Record,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
 
     // Initially false
     assert!(!state.loop_enabled.load(Ordering::Relaxed));
@@ -199,18 +225,17 @@ fn property_3_tui_state_loop_toggle() {
 
 #[test]
 fn property_4_tui_state_initial_counts_zero() {
-    let state = TuiState::new(
-        AppMode::Record,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
     assert_eq!(state.get_received_count(), 0);
     assert_eq!(state.get_mirrored_count(), 0);
     assert_eq!(state.get_published_count(), 0);
@@ -219,52 +244,49 @@ fn property_4_tui_state_initial_counts_zero() {
 
 #[test]
 fn property_4_tui_state_initial_loop_disabled() {
-    let state = TuiState::new(
-        AppMode::Record,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
     assert!(!state.loop_enabled.load(Ordering::Relaxed));
 }
 
 #[test]
 fn property_4_tui_state_none_file_path() {
-    let state = TuiState::new(
-        AppMode::Record,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
     assert!(state.get_file_path().is_none());
 }
 
 #[test]
 fn property_4_tui_state_set_new_file_updates_both_paths() {
-    let state = TuiState::new(
-        AppMode::Record,
-        1883,
-        Some("original.csv".to_string()),
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: Some("original.csv".to_string()),
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
 
     state.set_new_file("swapped.csv".to_string());
 
@@ -280,35 +302,33 @@ fn property_4_tui_state_set_new_file_updates_both_paths() {
 
 #[test]
 fn property_4_tui_state_quit_requested_initially_false() {
-    let state = TuiState::new(
-        AppMode::Record,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
     assert!(!state.is_quit_requested());
 }
 
 #[test]
 fn property_4_tui_state_request_quit() {
-    let state = TuiState::new(
-        AppMode::Record,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
     state.request_quit();
     assert!(state.is_quit_requested());
 }
@@ -337,25 +357,34 @@ fn property_5_app_mode_copy() {
 
 #[test]
 fn property_6_broker_connections_initializes_to_zero() {
-    let state = TuiState::new(
-        AppMode::Mirror,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    );
+    let state = TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    });
     assert_eq!(state.get_broker_connections(), 0);
 }
 
 proptest! {
     #[test]
     fn property_6_broker_connections_set_get(n in 0usize..10000) {
-        let state = TuiState::new(AppMode::Mirror, 1883, None, None, 1883, None, true, vec![], true, 60);
+        let state = TuiState::new(TuiConfig {
+            broker_port: 1883,
+            file_path: None,
+            source_host: None,
+            source_port: 1883,
+            initial_record: None,
+            initial_mirror: true,
+            playlist: vec![],
+            audit_enabled: true,
+            health_check_interval: 60,
+        });
         state.set_broker_connections(n);
         prop_assert_eq!(state.get_broker_connections(), n);
     }
@@ -365,18 +394,17 @@ proptest! {
 fn property_7_broker_connections_atomic() {
     use std::sync::Arc;
     use std::thread;
-    let state = Arc::new(TuiState::new(
-        AppMode::Mirror,
-        1883,
-        None,
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-        true,
-        60,
-    ));
+    let state = Arc::new(TuiState::new(TuiConfig {
+        broker_port: 1883,
+        file_path: None,
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    }));
     let handles: Vec<_> = (0..10)
         .map(|i| {
             let s = state.clone();

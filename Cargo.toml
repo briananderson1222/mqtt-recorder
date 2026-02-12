@@ -2,6 +2,7 @@
 name = "mqtt-recorder"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.70"
 resolver = "2"
 description = "Record and replay MQTT messages"
 license = "Apache-2.0"
@@ -41,7 +42,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Error handling
 thiserror = "1"
-anyhow = "1"
 
 # Logging
 tracing = "0.1"
@@ -96,3 +96,7 @@ path = "tests/integration/replayer_test.rs"
 [[test]]
 name = "verify_test"
 path = "tests/integration/verify_test.rs"
+
+[profile.release]
+lto = true
+strip = true

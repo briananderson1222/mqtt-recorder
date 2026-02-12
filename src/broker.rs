@@ -56,7 +56,7 @@ const MAX_INFLIGHT_COUNT: usize = 100;
 #[derive(Debug, Clone)]
 pub struct BrokerMetrics {
     /// External connection count (excludes internal clients)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub connections: usize,
     /// Whether connection count changed since last poll
     pub connections_changed: Option<(usize, usize)>,
@@ -133,10 +133,10 @@ pub struct EmbeddedBroker {
     /// The broker handle for managing the broker thread
     _handle: BrokerHandle,
     /// The operational mode of the broker
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     mode: BrokerMode,
     /// The port the broker is listening on
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     port: u16,
     /// Metrics link for polling connection counts
     meters_link: Option<rumqttd::meters::MetersLink>,
@@ -208,7 +208,24 @@ impl EmbeddedBroker {
             }
         });
 
-        // Wait for the broker to be ready by probing the TCP listener
+        Self::wait_for_broker_ready(port).await?;
+
+        Ok(Self {
+            _handle: BrokerHandle { _thread: handle },
+            mode,
+            port,
+            meters_link,
+            connection_count: AtomicUsize::new(0),
+            subscription_count: AtomicUsize::new(0),
+            internal_clients: AtomicUsize::new(0),
+            client_counter: AtomicUsize::new(0),
+            cumulative_publishes: AtomicU64::new(0),
+            cumulative_failed: AtomicU64::new(0),
+        })
+    }
+
+    /// Wait for the broker to be ready by probing the TCP port.
+    async fn wait_for_broker_ready(port: u16) -> Result<(), MqttRecorderError> {
         let addr = format!("127.0.0.1:{}", port);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -223,19 +240,7 @@ impl EmbeddedBroker {
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
-
-        Ok(Self {
-            _handle: BrokerHandle { _thread: handle },
-            mode,
-            port,
-            meters_link,
-            connection_count: AtomicUsize::new(0),
-            subscription_count: AtomicUsize::new(0),
-            internal_clients: AtomicUsize::new(0),
-            client_counter: AtomicUsize::new(0),
-            cumulative_publishes: AtomicU64::new(0),
-            cumulative_failed: AtomicU64::new(0),
-        })
+        Ok(())
     }
 
     /// Create the rumqttd configuration for the embedded broker.
@@ -387,7 +392,7 @@ impl EmbeddedBroker {
     /// let broker = EmbeddedBroker::new(1883, BrokerMode::Standalone).await?;
     /// assert_eq!(*broker.mode(), BrokerMode::Standalone);
     /// ```
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn mode(&self) -> &BrokerMode {
         &self.mode
     }

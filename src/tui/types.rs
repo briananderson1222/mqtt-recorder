@@ -15,6 +15,7 @@ pub fn generate_default_filename(host: Option<&str>) -> String {
 
 /// Application mode (for compatibility, but mirroring/recording are now separate flags)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // Public API used by external tests and consumers
 pub enum AppMode {
     Record,
     Replay,
@@ -34,7 +35,7 @@ impl std::fmt::Display for AppMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Public API
 pub enum AuditArea {
     Source,
     Broker,

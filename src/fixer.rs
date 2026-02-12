@@ -33,7 +33,6 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
-use chrono::{DateTime, Utc};
 use csv::ReaderBuilder;
 
 use crate::csv_handler::{is_binary_payload, CsvWriter, MessageRecord, AUTO_ENCODE_MARKER};
@@ -340,13 +339,7 @@ impl CsvFixer {
 
         // Parse timestamp
         let timestamp_str = &record[0];
-        let timestamp = DateTime::parse_from_rfc3339(timestamp_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| {
-                chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .map(|ndt| ndt.and_utc())
-            })
-            .ok()?;
+        let timestamp = crate::util::parse_timestamp(timestamp_str).ok()?;
 
         // Parse topic
         let topic = record[1].to_string();
@@ -417,13 +410,7 @@ impl CsvFixer {
         // Timestamps are in ISO 8601 format: YYYY-MM-DDTHH:MM:SS.sssZ
         let timestamp_end = self.find_timestamp_end(raw_line)?;
         let timestamp_str = &raw_line[..timestamp_end];
-        let timestamp = DateTime::parse_from_rfc3339(timestamp_str)
-            .map(|dt| dt.with_timezone(&Utc))
-            .or_else(|_| {
-                chrono::NaiveDateTime::parse_from_str(timestamp_str, "%Y-%m-%dT%H:%M:%S%.3fZ")
-                    .map(|ndt| ndt.and_utc())
-            })
-            .ok()?;
+        let timestamp = crate::util::parse_timestamp(timestamp_str).ok()?;
 
         // Step 2: Skip the comma after timestamp and find the topic
         let after_timestamp = &raw_line[timestamp_end..];

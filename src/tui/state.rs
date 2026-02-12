@@ -1,10 +1,23 @@
 //! TUI state management
 
-use crate::tui::types::{generate_default_filename, AppMode, AuditArea, AuditEntry, AuditSeverity};
+use crate::tui::types::{generate_default_filename, AuditArea, AuditEntry, AuditSeverity};
 use std::{
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
+
+/// Configuration for creating a new TuiState.
+pub struct TuiConfig {
+    pub broker_port: u16,
+    pub file_path: Option<String>,
+    pub source_host: Option<String>,
+    pub source_port: u16,
+    pub initial_record: Option<bool>,
+    pub initial_mirror: bool,
+    pub playlist: Vec<String>,
+    pub audit_enabled: bool,
+    pub health_check_interval: u64,
+}
 
 /// Shared state for the TUI
 pub struct TuiState {
@@ -67,21 +80,9 @@ pub struct TuiState {
 }
 
 impl TuiState {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        _mode: AppMode,
-        broker_port: u16,
-        file_path: Option<String>,
-        source_host: Option<String>,
-        source_port: u16,
-        initial_record: Option<bool>,
-        initial_mirror: bool,
-        playlist: Vec<String>,
-        audit_enabled: bool,
-        health_check_interval: u64,
-    ) -> Self {
+    pub fn new(config: TuiConfig) -> Self {
         // Default recording to ON if file path provided, unless explicitly set
-        let recording = initial_record.unwrap_or(file_path.is_some());
+        let recording = config.initial_record.unwrap_or(config.file_path.is_some());
         let session_id = format!(
             "{:08x}",
             std::process::id() as u64
@@ -97,17 +98,17 @@ impl TuiState {
             replayed_count: AtomicU64::new(0),
             published_count: AtomicU64::new(0),
             recorded_count: AtomicU64::new(0),
-            broker_port,
-            source_host,
-            source_port,
-            file_path: std::sync::Mutex::new(file_path),
+            broker_port: config.broker_port,
+            source_host: config.source_host,
+            source_port: config.source_port,
+            file_path: std::sync::Mutex::new(config.file_path),
             new_file_path: std::sync::Mutex::new(None),
-            playlist: std::sync::Mutex::new(playlist),
+            playlist: std::sync::Mutex::new(config.playlist),
             playlist_index: std::sync::atomic::AtomicUsize::new(0),
             selected_index: std::sync::atomic::AtomicUsize::new(0),
             loop_enabled: AtomicBool::new(false),
             recording_enabled: AtomicBool::new(recording),
-            mirroring_enabled: AtomicBool::new(initial_mirror),
+            mirroring_enabled: AtomicBool::new(config.initial_mirror),
             source_enabled: AtomicBool::new(true),
             source_connected: AtomicBool::new(false),
             source_ever_connected: AtomicBool::new(false),
@@ -117,7 +118,7 @@ impl TuiState {
             first_connected_at: std::sync::Mutex::new(None),
             connected_at: std::sync::Mutex::new(None),
             source_enabled_at: std::sync::Mutex::new(Some(Instant::now())),
-            mirror_enabled_at: std::sync::Mutex::new(if initial_mirror {
+            mirror_enabled_at: std::sync::Mutex::new(if config.initial_mirror {
                 Some(Instant::now())
             } else {
                 None
@@ -134,7 +135,7 @@ impl TuiState {
             audit_file: std::sync::Mutex::new(None),
             audit_file_path: std::sync::Mutex::new(None),
             audit_file_enabled: AtomicBool::new(false),
-            audit_enabled: AtomicBool::new(audit_enabled),
+            audit_enabled: AtomicBool::new(config.audit_enabled),
             file_line_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             verify_matched: AtomicU64::new(0),
             verify_mismatched: AtomicU64::new(0),
@@ -143,7 +144,7 @@ impl TuiState {
             broker_total_publishes: AtomicU64::new(0),
             broker_failed_publishes: AtomicU64::new(0),
             last_health_check: std::sync::Mutex::new(Instant::now()),
-            health_check_interval,
+            health_check_interval: config.health_check_interval,
         }
     }
 
@@ -227,7 +228,7 @@ impl TuiState {
     }
 
     /// Get the time when connection was established
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn get_connected_since(&self) -> Option<chrono::DateTime<chrono::Local>> {
         self.get_connection_duration()
             .map(|d| chrono::Local::now() - chrono::Duration::from_std(d).unwrap_or_default())
@@ -389,7 +390,7 @@ impl TuiState {
         None
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn is_playback_active(&self) -> bool {
         self.loop_enabled.load(Ordering::Relaxed) && !self.is_recording()
     }
@@ -463,7 +464,7 @@ impl TuiState {
     }
 
     /// Get the currently selected file from playlist
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn get_selected_file(&self) -> Option<String> {
         let files = self.get_all_files();
         let index = self.selected_index.load(Ordering::Relaxed);
@@ -471,7 +472,7 @@ impl TuiState {
     }
 
     /// Get the active file (confirmed selection)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn get_active_file(&self) -> Option<String> {
         let files = self.get_all_files();
         let index = self.playlist_index.load(Ordering::Relaxed);
@@ -821,7 +822,7 @@ impl TuiState {
         self.mirrored_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn increment_replayed(&self) {
         self.replayed_count.fetch_add(1, Ordering::Relaxed);
     }
@@ -910,20 +911,27 @@ impl TuiState {
 mod tests {
     use super::*;
 
+    fn default_config() -> TuiConfig {
+        TuiConfig {
+            broker_port: 1883,
+            file_path: None,
+            source_host: None,
+            source_port: 1883,
+            initial_record: None,
+            initial_mirror: true,
+            playlist: vec![],
+            audit_enabled: true,
+            health_check_interval: 60,
+        }
+    }
+
     #[test]
     fn test_tui_state_new() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            Some("test.csv".to_string()),
-            Some("broker.local".to_string()),
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            file_path: Some("test.csv".to_string()),
+            source_host: Some("broker.local".to_string()),
+            ..default_config()
+        });
         assert_eq!(state.broker_port, 1883);
         assert_eq!(state.get_file_path(), Some("test.csv".to_string()));
         assert_eq!(state.source_host, Some("broker.local".to_string()));
@@ -941,37 +949,22 @@ mod tests {
 
     #[test]
     fn test_tui_state_initial_flags() {
-        // Test explicit initial states
-        let state = TuiState::new(
-            AppMode::Mirror,
-            1883,
-            Some("test.csv".to_string()),
-            None,
-            1883,
-            Some(false),
-            false,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            file_path: Some("test.csv".to_string()),
+            initial_record: Some(false),
+            initial_mirror: false,
+            ..default_config()
+        });
         assert!(!state.is_recording()); // explicitly disabled
         assert!(!state.is_mirroring()); // explicitly disabled
     }
 
     #[test]
     fn test_tui_state_recording_toggle() {
-        let state = TuiState::new(
-            AppMode::Mirror,
-            1883,
-            Some("test.csv".to_string()),
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            file_path: Some("test.csv".to_string()),
+            ..default_config()
+        });
 
         assert!(state.is_recording());
         state.set_recording(false);
@@ -982,18 +975,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_mirroring_toggle() {
-        let state = TuiState::new(
-            AppMode::Mirror,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
 
         assert!(state.is_mirroring());
         state.set_mirroring(false);
@@ -1004,18 +986,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_source_toggle() {
-        let state = TuiState::new(
-            AppMode::Mirror,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
 
         assert!(state.is_source_enabled());
         state.set_source_enabled(false);
@@ -1026,18 +997,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_counters() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
 
         assert_eq!(state.get_received_count(), 0);
         state.increment_received();
@@ -1062,18 +1022,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_quit_requested() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         assert!(!state.is_quit_requested());
         state.request_quit();
         assert!(state.is_quit_requested());
@@ -1081,18 +1030,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_loop_enabled() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         assert!(!state.loop_enabled.load(Ordering::Relaxed));
 
         state.loop_enabled.store(true, Ordering::Relaxed);
@@ -1101,35 +1039,16 @@ mod tests {
 
     #[test]
     fn test_tui_state_none_file_path() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         assert!(state.get_file_path().is_none());
     }
 
     #[test]
     fn test_tui_state_set_new_file_updates_display_path() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            Some("original.csv".to_string()),
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            file_path: Some("original.csv".to_string()),
+            ..default_config()
+        });
         assert_eq!(state.get_file_path(), Some("original.csv".to_string()));
 
         state.set_new_file("new_file.csv".to_string());
@@ -1144,18 +1063,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_set_new_file_from_none() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         assert!(state.get_file_path().is_none());
 
         state.set_new_file("first_file.csv".to_string());
@@ -1165,18 +1073,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_set_new_file_appends_csv() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
 
         state.set_new_file("myfile".to_string());
         assert_eq!(state.get_file_path(), Some("myfile.csv".to_string()));
@@ -1187,18 +1084,10 @@ mod tests {
 
     #[test]
     fn test_tui_state_generate_default_filename() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            Some("broker.example.com".to_string()),
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            source_host: Some("broker.example.com".to_string()),
+            ..default_config()
+        });
         let filename = state.generate_default_filename();
 
         assert!(filename.starts_with("broker-example-com-"));
@@ -1207,18 +1096,7 @@ mod tests {
 
     #[test]
     fn test_tui_state_generate_default_filename_no_host() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         let filename = state.generate_default_filename();
 
         assert!(filename.starts_with("recording-"));
@@ -1227,18 +1105,11 @@ mod tests {
 
     #[test]
     fn test_tui_state_selection_separate_from_active() {
-        let state = TuiState::new(
-            AppMode::Replay,
-            1883,
-            Some("file1.csv".to_string()),
-            None,
-            1883,
-            None,
-            true,
-            vec!["file2.csv".to_string(), "file3.csv".to_string()],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            file_path: Some("file1.csv".to_string()),
+            playlist: vec!["file2.csv".to_string(), "file3.csv".to_string()],
+            ..default_config()
+        });
 
         // Initially both at 0
         assert_eq!(state.get_selected_index(), 0);
@@ -1261,18 +1132,11 @@ mod tests {
 
     #[test]
     fn test_tui_state_selection_wraps_around() {
-        let state = TuiState::new(
-            AppMode::Replay,
-            1883,
-            Some("a.csv".to_string()),
-            None,
-            1883,
-            None,
-            true,
-            vec!["b.csv".to_string()],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            file_path: Some("a.csv".to_string()),
+            playlist: vec!["b.csv".to_string()],
+            ..default_config()
+        });
         assert_eq!(state.get_selected_index(), 0);
         state.navigate_selection(1);
         assert_eq!(state.get_selected_index(), 1);
@@ -1287,35 +1151,13 @@ mod tests {
 
     #[test]
     fn test_playback_looping_default_false() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         assert!(!state.is_playback_looping());
     }
 
     #[test]
     fn test_playback_looping_toggle() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.playback_looping.store(true, Ordering::Relaxed);
         assert!(state.is_playback_looping());
         state.playback_looping.store(false, Ordering::Relaxed);
@@ -1324,35 +1166,13 @@ mod tests {
 
     #[test]
     fn test_playback_finished_default_false() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         assert!(!state.is_playback_finished());
     }
 
     #[test]
     fn test_playback_finished_cleared_on_start() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.playback_finished.store(true, Ordering::Relaxed);
         assert!(state.is_playback_finished());
 
@@ -1364,54 +1184,21 @@ mod tests {
 
     #[test]
     fn test_source_enabled_elapsed_starts_immediately() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         // Source starts enabled, so elapsed should be Some
         assert!(state.get_source_enabled_elapsed().is_some());
     }
 
     #[test]
     fn test_source_enabled_elapsed_none_when_disabled() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.set_source_enabled(false);
         assert!(state.get_source_enabled_elapsed().is_none());
     }
 
     #[test]
     fn test_source_enabled_elapsed_resets_on_reenable() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         std::thread::sleep(std::time::Duration::from_millis(50));
         let before = state.get_source_enabled_elapsed().unwrap();
 
@@ -1425,36 +1212,14 @@ mod tests {
 
     #[test]
     fn test_mirror_enabled_elapsed_some_when_enabled() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         // mirror starts enabled (initial_mirror=true)
         assert!(state.get_mirror_enabled_elapsed().is_some());
     }
 
     #[test]
     fn test_mirror_enabled_elapsed_none_when_disabled() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.set_mirroring(false);
         state.set_mirror_enabled_at(false);
         assert!(state.get_mirror_enabled_elapsed().is_none());
@@ -1462,18 +1227,7 @@ mod tests {
 
     #[test]
     fn test_mirror_enabled_elapsed_resets_on_toggle() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         std::thread::sleep(std::time::Duration::from_millis(50));
         let before = state.get_mirror_enabled_elapsed().unwrap();
 
@@ -1490,53 +1244,29 @@ mod tests {
 
     #[test]
     fn test_first_connected_at_none_initially() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            Some("host".to_string()),
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            source_host: Some("host".to_string()),
+            ..default_config()
+        });
         assert!(state.get_first_connected_since().is_none());
     }
 
     #[test]
     fn test_first_connected_at_set_on_connect() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            Some("host".to_string()),
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            source_host: Some("host".to_string()),
+            ..default_config()
+        });
         state.set_source_connected(true);
         assert!(state.get_first_connected_since().is_some());
     }
 
     #[test]
     fn test_first_connected_at_not_reset_on_reconnect() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            Some("host".to_string()),
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            source_host: Some("host".to_string()),
+            ..default_config()
+        });
         state.set_source_connected(true);
         let first = state.get_first_connected_since().unwrap();
 
@@ -1558,18 +1288,7 @@ mod tests {
 
     #[test]
     fn test_broker_connections_audited_on_change() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.set_broker_connections(1);
         state.set_broker_connections(2);
 
@@ -1585,18 +1304,7 @@ mod tests {
 
     #[test]
     fn test_broker_connections_not_audited_when_unchanged() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.set_broker_connections(3);
         state.set_broker_connections(3); // Same value
 
@@ -1612,36 +1320,14 @@ mod tests {
 
     #[test]
     fn test_recording_session_count_starts_at_zero() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.start_recording_session();
         assert_eq!(state.get_recording_session_count(), 0);
     }
 
     #[test]
     fn test_recording_session_count_tracks_delta() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         // Simulate some pre-existing records
         for _ in 0..10 {
             state.increment_recorded();
@@ -1658,36 +1344,14 @@ mod tests {
 
     #[test]
     fn test_playback_session_count_starts_at_zero() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.start_playback_session();
         assert_eq!(state.get_playback_session_count(), 0);
     }
 
     #[test]
     fn test_playback_session_count_tracks_delta() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         for _ in 0..20 {
             state.increment_replayed();
         }
@@ -1701,18 +1365,7 @@ mod tests {
 
     #[test]
     fn test_playback_session_count_resets_on_new_session() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.start_playback_session();
         for _ in 0..10 {
             state.increment_replayed();
@@ -1732,18 +1385,7 @@ mod tests {
 
     #[test]
     fn test_mirror_session_counts_start_at_zero() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         let (m, p) = state.get_mirror_session_counts();
         assert_eq!(m, 0);
         assert_eq!(p, 0);
@@ -1751,18 +1393,7 @@ mod tests {
 
     #[test]
     fn test_mirror_session_counts_track_delta() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         for _ in 0..10 {
             state.increment_mirrored();
             state.increment_published();
@@ -1780,18 +1411,7 @@ mod tests {
 
     #[test]
     fn test_mirror_session_counts_published_includes_playback() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.set_mirror_enabled_at(true); // snapshot at (0, 0)
         for _ in 0..5 {
             state.increment_mirrored();
@@ -1810,18 +1430,7 @@ mod tests {
 
     #[test]
     fn test_request_quit_audit_includes_uptime() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            None,
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(default_config());
         state.request_quit();
         let log = state.get_audit_log();
         let shutdown = log
@@ -1834,18 +1443,10 @@ mod tests {
 
     #[test]
     fn test_generate_default_filename_matches_tui_state() {
-        let state = TuiState::new(
-            AppMode::Record,
-            1883,
-            None,
-            Some("test.host".to_string()),
-            1883,
-            None,
-            true,
-            vec![],
-            true,
-            60,
-        );
+        let state = TuiState::new(TuiConfig {
+            source_host: Some("test.host".to_string()),
+            ..default_config()
+        });
         let from_state = state.generate_default_filename();
         let from_fn = generate_default_filename(Some("test.host"));
         // Both should have same prefix (timestamp may differ by a ms)
