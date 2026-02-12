@@ -71,6 +71,7 @@ pub const AUTO_ENCODE_MARKER: &str = "b64:";
 ///   THE Payload_Validator SHALL classify the payload as text
 /// - **1.5**: THE Payload_Validator SHALL allow tab (0x09), newline (0x0A),
 ///   and carriage return (0x0D) in text payloads since CSV quoting handles these
+#[must_use]
 pub fn is_binary_payload(payload: &[u8]) -> bool {
     // First, check if the payload is valid UTF-8
     // If it's not valid UTF-8, it's definitely binary (Requirement 1.1)
@@ -116,7 +117,6 @@ pub(crate) fn is_binary_control_char(byte: u8) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn test_auto_encode_marker_value() {
