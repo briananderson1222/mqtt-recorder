@@ -5,12 +5,10 @@ pub mod render;
 pub mod state;
 pub mod types;
 
-#[allow(unused_imports)]
 pub use input::run_tui;
+pub use state::{TuiConfig, TuiState};
+pub use types::{generate_default_filename, should_enable_interactive, AuditArea, AuditSeverity};
+
+// Library-only re-exports (used by external consumers, not the binary)
 #[allow(unused_imports)]
-pub use state::TuiState;
-#[allow(unused_imports)]
-pub use types::{
-    generate_default_filename, should_enable_interactive, AppMode, AuditArea, AuditEntry,
-    AuditSeverity,
-};
+pub use types::{AppMode, AuditEntry};
