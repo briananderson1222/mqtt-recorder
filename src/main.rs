@@ -150,23 +150,7 @@ async fn run(mut args: Args) -> Result<(), MqttRecorderError> {
     // Create TUI state for serve modes (tracks counters, audit, verify even without TUI)
     let tui_state = create_tui_state(&args);
 
-    // Spawn TUI task only if interactive mode is enabled
-    let tui_handle = if enable_tui {
-        if let Some(ref state) = tui_state {
-            let state_clone = state.clone();
-            let shutdown_tx_clone = shutdown_tx.clone();
-            let shutdown_rx = shutdown_tx.subscribe();
-            Some(tokio::spawn(async move {
-                if let Err(e) = tui::run_tui(state_clone, shutdown_tx_clone, shutdown_rx).await {
-                    error!("TUI error: {}", e);
-                }
-            }))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let tui_handle = spawn_tui_task(enable_tui, &tui_state, &shutdown_tx);
 
     // Dispatch to the appropriate mode handler
     // When --serve + --host are both present, always use mirror event loop
@@ -671,7 +655,26 @@ async fn shutdown_broker_with_audit(
     Ok(())
 }
 
-/// Create an MQTT client configuration from CLI arguments.
+/// Spawn the TUI rendering task if interactive mode is enabled and TUI state exists.
+fn spawn_tui_task(
+    enable_tui: bool,
+    tui_state: &Option<std::sync::Arc<TuiState>>,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !enable_tui {
+        return None;
+    }
+    let state = tui_state.as_ref()?;
+    let state_clone = state.clone();
+    let shutdown_tx_clone = shutdown_tx.clone();
+    let shutdown_rx = shutdown_tx.subscribe();
+    Some(tokio::spawn(async move {
+        if let Err(e) = tui::run_tui(state_clone, shutdown_tx_clone, shutdown_rx).await {
+            error!("TUI error: {}", e);
+        }
+    }))
+}
+
 /// Create TUI state for serve modes (tracks counters, audit, verify even without TUI).
 ///
 /// Returns `None` when `--serve` is not enabled.
