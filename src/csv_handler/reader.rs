@@ -1,3 +1,8 @@
+//! CSV reader for replaying MQTT messages from files.
+//!
+//! Provides [`CsvReader`] which reads [`MessageRecord`]s and [`MessageRecordBytes`]
+//! from CSV files with support for base64 decoding and field size limits.
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use csv::{Reader, ReaderBuilder};
@@ -194,6 +199,31 @@ impl CsvReader {
         })
     }
 
+    /// Decodes a payload string into bytes based on the decode_b64 setting.
+    fn decode_payload_bytes(
+        &self,
+        payload_str: &str,
+        line_number: u64,
+    ) -> Result<Vec<u8>, MqttRecorderError> {
+        if self.decode_b64 {
+            BASE64_STANDARD.decode(payload_str).map_err(|e| {
+                MqttRecorderError::InvalidArgument(format!(
+                    "Line {}: Invalid base64 payload: {}",
+                    line_number, e
+                ))
+            })
+        } else if let Some(encoded_content) = payload_str.strip_prefix(AUTO_ENCODE_MARKER) {
+            BASE64_STANDARD.decode(encoded_content).map_err(|e| {
+                MqttRecorderError::InvalidArgument(format!(
+                    "Line {}: Invalid base64 in auto-encoded payload (after 'b64:' prefix): {}",
+                    line_number, e
+                ))
+            })
+        } else {
+            Ok(payload_str.as_bytes().to_vec())
+        }
+    }
+
     /// Parses a CSV string record into a MessageRecord.
     fn parse_record(
         &self,
@@ -201,29 +231,8 @@ impl CsvReader {
     ) -> Result<MessageRecord, MqttRecorderError> {
         let record = result?;
         let fields = self.parse_common_fields(&record, self.current_line)?;
-
-        // Parse payload, handling auto-encoded binary payloads
-        let payload = if self.decode_b64 {
-            // When decode_b64 is true: decode all payloads from base64 (Requirement 3.3)
-            let decoded_bytes = BASE64_STANDARD.decode(&fields.payload_str).map_err(|e| {
-                MqttRecorderError::InvalidArgument(format!("Invalid base64 payload: {}", e))
-            })?;
-            // Convert to UTF-8, using lossy conversion for binary data
-            String::from_utf8_lossy(&decoded_bytes).into_owned()
-        } else if let Some(encoded_content) = fields.payload_str.strip_prefix(AUTO_ENCODE_MARKER) {
-            // When decode_b64 is false and payload starts with "b64:": strip prefix and decode (Requirement 3.1)
-            let decoded_bytes = BASE64_STANDARD.decode(encoded_content).map_err(|e| {
-                MqttRecorderError::InvalidArgument(format!(
-                    "Invalid base64 in auto-encoded payload (after 'b64:' prefix): {}",
-                    e
-                ))
-            })?;
-            // Convert decoded bytes to UTF-8 string using lossy conversion for binary data
-            String::from_utf8_lossy(&decoded_bytes).into_owned()
-        } else {
-            // When decode_b64 is false and no prefix: return payload as-is (Requirement 3.2)
-            fields.payload_str
-        };
+        let payload_bytes = self.decode_payload_bytes(&fields.payload_str, self.current_line)?;
+        let payload = String::from_utf8_lossy(&payload_bytes).into_owned();
 
         Ok(MessageRecord {
             timestamp: fields.timestamp,
@@ -248,28 +257,7 @@ impl CsvReader {
             ))
         })?;
         let fields = self.parse_common_fields(&record, line_number)?;
-
-        // Parse payload as bytes, handling auto-encoded binary payloads
-        let payload: Vec<u8> = if self.decode_b64 {
-            // When decode_b64 is true: decode all payloads from base64 (Requirement 3.3)
-            BASE64_STANDARD.decode(&fields.payload_str).map_err(|e| {
-                MqttRecorderError::InvalidArgument(format!(
-                    "Line {}: Invalid base64 payload: {}",
-                    line_number, e
-                ))
-            })?
-        } else if let Some(encoded_content) = fields.payload_str.strip_prefix(AUTO_ENCODE_MARKER) {
-            // When decode_b64 is false and payload starts with "b64:": strip prefix and decode (Requirement 3.1)
-            BASE64_STANDARD.decode(encoded_content).map_err(|e| {
-                MqttRecorderError::InvalidArgument(format!(
-                    "Line {}: Invalid base64 in auto-encoded payload (after 'b64:' prefix): {}",
-                    line_number, e
-                ))
-            })?
-        } else {
-            // When decode_b64 is false and no prefix: return payload as bytes (Requirement 3.2)
-            fields.payload_str.as_bytes().to_vec()
-        };
+        let payload = self.decode_payload_bytes(&fields.payload_str, line_number)?;
 
         Ok(MessageRecordBytes {
             timestamp: fields.timestamp,

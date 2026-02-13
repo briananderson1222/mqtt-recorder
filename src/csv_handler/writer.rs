@@ -1,3 +1,8 @@
+//! CSV writer for recording MQTT messages to files.
+//!
+//! Provides [`CsvWriter`] which handles writing [`MessageRecord`]s to CSV format
+//! with optional base64 encoding and automatic binary payload detection.
+
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use chrono::{DateTime, Utc};
 use csv::Writer;

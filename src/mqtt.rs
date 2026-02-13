@@ -13,6 +13,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// Channel capacity for MQTT v4 clients (external broker connections).
+const V4_CHANNEL_CAPACITY: usize = 256;
+
+/// Channel capacity for MQTT v5 clients (embedded broker connections, higher throughput).
+const V5_CHANNEL_CAPACITY: usize = 2048;
+
+/// Keep-alive interval in seconds for MQTT v4 connections.
+const V4_KEEP_ALIVE_SECS: u64 = 30;
+
+/// Keep-alive interval in seconds for MQTT v5 connections.
+const V5_KEEP_ALIVE_SECS: u64 = 15;
+
 /// Configuration for establishing an MQTT client connection.
 ///
 /// This struct holds all the necessary parameters to connect to an MQTT broker,
@@ -283,6 +295,7 @@ impl TlsConfig {
     }
 
     /// Returns true if a CA certificate is configured for server verification.
+    /// Returns true if a CA certificate is configured for server verification.
     #[allow(dead_code)] // Public API
     pub fn has_ca_cert(&self) -> bool {
         self.ca_cert.is_some()
@@ -365,7 +378,7 @@ impl MqttClient {
         let mut mqtt_options = MqttOptions::new(&client_id, &config.host, config.port);
 
         // Set keep alive to 30 seconds to tolerate high-throughput message bursts
-        mqtt_options.set_keep_alive(Duration::from_secs(30));
+        mqtt_options.set_keep_alive(Duration::from_secs(V4_KEEP_ALIVE_SECS));
 
         // Set max packet size from config (Requirement 1.19, 1.28)
         mqtt_options.set_max_packet_size(config.max_packet_size, config.max_packet_size);
@@ -383,9 +396,7 @@ impl MqttClient {
 
         // Create the async client and event loop
         // Use a large channel capacity to prevent backpressure from blocking ping handling
-        // Channel capacity 256: sufficient for v4 clients which are used for external broker
-        // connections with moderate throughput
-        let (client, eventloop) = AsyncClient::new(mqtt_options, 256);
+        let (client, eventloop) = AsyncClient::new(mqtt_options, V4_CHANNEL_CAPACITY);
 
         Ok(Self {
             client,
@@ -417,14 +428,12 @@ impl MqttClient {
 
         // Read client certificate and key if provided (Requirement 2.7)
         let client_auth = if tls_config.has_client_auth() {
-            let cert_path = tls_config
-                .client_cert
-                .as_ref()
-                .expect("guaranteed by has_client_auth()");
-            let key_path = tls_config
-                .client_key
-                .as_ref()
-                .expect("guaranteed by has_client_auth()");
+            let cert_path = tls_config.client_cert.as_ref().ok_or_else(|| {
+                MqttRecorderError::Tls("client_cert required when client_key is set".to_string())
+            })?;
+            let key_path = tls_config.client_key.as_ref().ok_or_else(|| {
+                MqttRecorderError::Tls("client_key required when client_cert is set".to_string())
+            })?;
 
             let cert_data = fs::read(cert_path).map_err(|e| {
                 MqttRecorderError::Tls(format!(
@@ -570,14 +579,6 @@ impl MqttClient {
         self.client.disconnect().await?;
         Ok(())
     }
-
-    /// Get a reference to the underlying AsyncClient.
-    ///
-    /// This can be useful for advanced operations not covered by the wrapper methods.
-    #[allow(dead_code)] // Public API
-    pub fn client(&self) -> &AsyncClient {
-        &self.client
-    }
 }
 
 /// MQTT v5 client wrapper around rumqttc::v5.
@@ -617,7 +618,7 @@ impl MqttClientV5 {
         };
 
         let mut mqtt_options = rumqttc::v5::MqttOptions::new(&client_id, &config.host, config.port);
-        mqtt_options.set_keep_alive(Duration::from_secs(15));
+        mqtt_options.set_keep_alive(Duration::from_secs(V5_KEEP_ALIVE_SECS));
         mqtt_options.set_max_packet_size(Some(config.max_packet_size as u32));
 
         if let (Some(username), Some(password)) = (&config.username, &config.password) {
@@ -629,9 +630,9 @@ impl MqttClientV5 {
             mqtt_options.set_transport(transport);
         }
 
-        // Channel capacity 2048: v5 clients connect to the embedded broker which handles
+        // Channel capacity: v5 clients connect to the embedded broker which handles
         // high-throughput mirroring and needs larger buffers to avoid backpressure
-        let (client, eventloop) = rumqttc::v5::AsyncClient::new(mqtt_options, 2048);
+        let (client, eventloop) = rumqttc::v5::AsyncClient::new(mqtt_options, V5_CHANNEL_CAPACITY);
 
         Ok(Self {
             client,
@@ -686,24 +687,35 @@ impl MqttClientV5 {
 /// Used by components (like Replayer) that need to connect to either
 /// an external broker (v4) or the embedded broker (v5).
 pub enum AnyMqttClient {
+    /// MQTT v4 client for external broker connections.
     V4(MqttClient),
+    /// MQTT v5 client for embedded broker connections.
     V5(MqttClientV5),
 }
 
 /// Unified incoming event extracted from either v4 or v5 MQTT events.
 pub enum MqttIncoming {
+    /// A publish message received from the broker.
     Publish {
+        /// The MQTT topic the message was published to.
         topic: String,
+        /// The raw message payload bytes.
         payload: Vec<u8>,
+        /// Quality of Service level (0, 1, or 2).
         qos: QoS,
+        /// Whether this message should be retained by the broker.
         retain: bool,
     },
+    /// Connection acknowledged by the broker.
     ConnAck,
+    /// Subscription acknowledged by the broker.
     SubAck,
+    /// Any other MQTT event not specifically handled.
     Other,
 }
 
 impl AnyMqttClient {
+    /// Subscribe to topics using the underlying v4 or v5 client.
     pub async fn subscribe(&self, topics: &[String], qos: QoS) -> Result<(), MqttRecorderError> {
         match self {
             Self::V4(c) => c.subscribe(topics, qos).await,
@@ -711,6 +723,7 @@ impl AnyMqttClient {
         }
     }
 
+    /// Publish a message using the underlying v4 or v5 client.
     pub async fn publish(
         &self,
         topic: &str,
@@ -724,6 +737,7 @@ impl AnyMqttClient {
         }
     }
 
+    /// Poll for the next event, converting to the unified `MqttIncoming` type.
     pub async fn poll(&self) -> Result<MqttIncoming, MqttRecorderError> {
         match self {
             Self::V4(c) => {
@@ -737,6 +751,7 @@ impl AnyMqttClient {
         }
     }
 
+    /// Disconnect from the broker using the underlying v4 or v5 client.
     pub async fn disconnect(&self) -> Result<(), MqttRecorderError> {
         match self {
             Self::V4(c) => c.disconnect().await,

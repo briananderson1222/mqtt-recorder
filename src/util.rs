@@ -14,6 +14,15 @@ pub const DISCONNECT_TIMEOUT_SECS: u64 = 2;
 /// Number of messages between CSV flush operations.
 pub const FLUSH_INTERVAL: u64 = 100;
 
+/// Delay in seconds before retrying a failed connection or operation.
+pub const RETRY_DELAY_SECS: u64 = 1;
+
+/// Timeout in seconds when waiting for the embedded broker to become ready.
+pub const BROKER_READY_TIMEOUT_SECS: u64 = 5;
+
+/// Timeout in seconds when waiting for the embedded broker to shut down.
+pub const BROKER_SHUTDOWN_TIMEOUT_SECS: u64 = 2;
+
 /// Convert QoS enum to u8 value.
 ///
 /// # Arguments

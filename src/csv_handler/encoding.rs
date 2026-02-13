@@ -1,3 +1,8 @@
+//! Binary payload detection and base64 encoding utilities.
+//!
+//! Provides the [`AUTO_ENCODE_MARKER`] prefix and [`is_binary_payload`] function
+//! used to automatically detect and encode binary MQTT payloads for safe CSV storage.
+
 /// The marker prefix used for auto-encoded binary payloads.
 ///
 /// When `encode_b64` is false and a payload is detected as binary (containing

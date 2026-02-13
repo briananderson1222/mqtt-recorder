@@ -1,3 +1,8 @@
+//! MQTT message record types for CSV serialization.
+//!
+//! Defines [`MessageRecord`] (string payloads), [`MessageRecordBytes`] (binary payloads),
+//! and [`WriteStats`] for tracking CSV write statistics.
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
