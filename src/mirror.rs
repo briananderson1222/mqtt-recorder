@@ -242,7 +242,10 @@ impl Mirror {
                             );
                         }
                         drop(el);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(
+                            crate::util::RETRY_DELAY_SECS,
+                        ))
+                        .await;
                     }
                 }
             }
@@ -378,7 +381,10 @@ impl Mirror {
                         }
                         Ok(Err(_)) => {
                             drop(el);
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                crate::util::RETRY_DELAY_SECS,
+                            ))
+                            .await;
                         }
                         Err(_) => {
                             drop(el);
@@ -531,7 +537,25 @@ impl Mirror {
             }
         }
 
-        // Mark disconnected on exit
+        self.shutdown(
+            &tui_state,
+            local_poll_handle,
+            verify_shutdown_tx,
+            verify_handle,
+            message_count,
+        )
+        .await
+    }
+
+    /// Flush writer, abort background tasks, disconnect clients, and log summary.
+    async fn shutdown(
+        &mut self,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        local_poll_handle: tokio::task::JoinHandle<()>,
+        verify_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        verify_handle: Option<tokio::task::JoinHandle<()>>,
+        message_count: u64,
+    ) -> Result<u64, MqttRecorderError> {
         if let Some(ref state) = tui_state {
             state.set_source_connected(false);
         }
@@ -542,17 +566,19 @@ impl Mirror {
 
         local_poll_handle.abort();
 
-        // Shutdown verify task and report summary
         if let Some(stop_tx) = verify_shutdown_tx {
             drop(self.verify_tx.take());
             let _ = stop_tx.send(());
             if let Some(handle) = verify_handle {
-                // Give verify task time to drain and report missing
-                let _ = tokio::time::timeout(
+                if tokio::time::timeout(
                     tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
                     handle,
                 )
-                .await;
+                .await
+                .is_err()
+                {
+                    warn!("Verify task shutdown timed out");
+                }
             }
             if let Some(ref state) = tui_state {
                 let matched = state.get_verify_matched();
@@ -569,18 +595,25 @@ impl Mirror {
             }
         }
 
-        // Disconnect with timeouts to avoid hanging on unreachable brokers
-        let _ = tokio::time::timeout(
+        if tokio::time::timeout(
             tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
             self.source_client.disconnect(),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            warn!("Source client disconnect timed out");
+        }
 
-        let _ = tokio::time::timeout(
+        if tokio::time::timeout(
             tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
             self.local_client.disconnect(),
         )
-        .await;
+        .await
+        .is_err()
+        {
+            warn!("Local client disconnect timed out");
+        }
 
         info!("Shutting down embedded broker...");
         info!("Mirror complete. {} messages mirrored.", message_count);
@@ -902,14 +935,6 @@ impl Mirror {
             .await?;
 
         Ok(())
-    }
-
-    /// Gets a reference to the embedded broker.
-    ///
-    /// This can be useful for checking the broker's mode or port.
-    #[allow(dead_code)] // Public API
-    pub fn broker(&self) -> &EmbeddedBroker {
-        &self.broker
     }
 
     /// Consumes the Mirror and returns the embedded broker for shutdown.

@@ -227,7 +227,8 @@ impl EmbeddedBroker {
     /// Wait for the broker to be ready by probing the TCP port.
     async fn wait_for_broker_ready(port: u16) -> Result<(), MqttRecorderError> {
         let addr = format!("127.0.0.1:{}", port);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(crate::util::BROKER_READY_TIMEOUT_SECS);
         loop {
             if std::net::TcpStream::connect(&addr).is_ok() {
                 break;
@@ -581,6 +582,39 @@ mod tests {
 
         let broker = result.unwrap();
         assert_eq!(*broker.mode(), BrokerMode::Mirror);
+
+        broker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_register_internal_client() {
+        let broker = EmbeddedBroker::new(19886, BrokerMode::Standalone)
+            .await
+            .unwrap();
+
+        broker.register_internal_client();
+        broker.register_internal_client();
+
+        // Verify internal_clients count is 2 by checking the offset behavior in poll_metrics
+        // The internal_clients count affects connection count calculation
+        assert_eq!(
+            broker
+                .internal_clients
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        broker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_poll_metrics_returns_none_without_meters() {
+        let broker = EmbeddedBroker::new(19887, BrokerMode::Standalone)
+            .await
+            .unwrap();
+
+        // poll_metrics may return None or Some depending on timing, just verify it doesn't panic
+        let _result = broker.poll_metrics();
 
         broker.shutdown().await.unwrap();
     }

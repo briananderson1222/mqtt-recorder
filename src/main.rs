@@ -98,7 +98,7 @@ async fn main() -> ExitCode {
 /// 1. Setting up signal handlers for graceful shutdown (Requirements 9.1-9.2)
 /// 2. Dispatching to the appropriate mode handler
 /// 3. Coordinating graceful shutdown (Requirements 9.3-9.5)
-async fn run(args: Args) -> Result<(), MqttRecorderError> {
+async fn run(mut args: Args) -> Result<(), MqttRecorderError> {
     // Check for validate mode before other mode dispatch
     // Requirements 4.9, 4.10, 6.1-6.6
     if args.validate {
@@ -129,6 +129,13 @@ async fn run(args: Args) -> Result<(), MqttRecorderError> {
     // Determine if TUI should be enabled (only for long-running serve modes)
     let enable_tui = args.serve && should_enable_interactive(args.no_interactive);
 
+    // Resolve default filename for record mode when --file not provided
+    if matches!(args.mode.as_ref(), Some(Mode::Record)) && args.file.is_none() {
+        args.file = Some(std::path::PathBuf::from(
+            crate::tui::generate_default_filename(args.host.as_deref()),
+        ));
+    }
+
     // Initialize tracing subscriber only when TUI is not active
     if !enable_tui {
         let _ = tracing_subscriber::fmt()
@@ -141,50 +148,7 @@ async fn run(args: Args) -> Result<(), MqttRecorderError> {
     }
 
     // Create TUI state for serve modes (tracks counters, audit, verify even without TUI)
-    let tui_state = if args.serve {
-        let file_path = args.file.as_ref().map(|p| p.display().to_string());
-        let playlist: Vec<String> = args
-            .playlist
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        let tui = std::sync::Arc::new(TuiState::new(TuiConfig {
-            broker_port: args.serve_port,
-            file_path,
-            source_host: args.host.clone(),
-            source_port: args.port,
-            initial_record: args.record,
-            initial_mirror: args.mirror,
-            playlist,
-            audit_enabled: args.audit,
-            health_check_interval: args.health_check,
-        }));
-        if let Some(ref path) = args.audit_log {
-            tui.set_audit_file_path(path.display().to_string());
-            tui.enable_audit_file();
-        }
-        // Auto-start playback when --loop is provided with --file or --playlist
-        let has_playback_file = args.file.is_some() || !args.playlist.is_empty();
-        if args.loop_replay && has_playback_file {
-            info!(
-                "Auto-starting playback: loop={}, file={:?}, playlist={}",
-                args.loop_replay,
-                args.file,
-                args.playlist.len()
-            );
-            tui.loop_enabled
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            tui.playback_looping
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-            tui.recording_enabled
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-        } else if args.loop_replay {
-            info!("Playback not auto-started: no --file or --playlist provided");
-        }
-        Some(tui)
-    } else {
-        None
-    };
+    let tui_state = create_tui_state(&args);
 
     // Spawn TUI task only if interactive mode is enabled
     let tui_handle = if enable_tui {
@@ -205,9 +169,14 @@ async fn run(args: Args) -> Result<(), MqttRecorderError> {
     };
 
     // Dispatch to the appropriate mode handler
+    // When --serve + --host are both present, always use mirror event loop
+    // so all TUI toggles (mirror/record/playback) actually work.
+    // --mode just sets initial toggle states.
     let result = if args.is_standalone_broker() {
-        // Standalone broker mode (Requirement 1.26)
         run_standalone_broker(&args, shutdown_tx.subscribe(), tui_state.clone()).await
+    } else if args.serve && args.host.is_some() {
+        // Unified serve path: mirror event loop handles all modes
+        run_mirror_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
     } else {
         match args
             .mode
@@ -221,7 +190,8 @@ async fn run(args: Args) -> Result<(), MqttRecorderError> {
                 run_replay_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
             }
             Mode::Mirror => {
-                run_mirror_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
+                // Mirror requires --serve + --host, handled above
+                unreachable!("mirror mode requires --serve and --host")
             }
         }
     };
@@ -412,7 +382,7 @@ async fn run_standalone_broker(
     loop {
         tokio::select! {
             _ = shutdown.recv() => break,
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(crate::util::BROKER_SHUTDOWN_TIMEOUT_SECS)) => {
                 if let Some(metrics) = broker.poll_metrics() {
                     if let Some(ref state) = tui_state {
                         state.update_broker_metrics(&metrics);
@@ -447,14 +417,6 @@ async fn run_record_mode(
 ) -> Result<(), MqttRecorderError> {
     info!("Starting record mode...");
 
-    // Optionally start embedded broker for passthrough
-    let _broker = if args.serve {
-        info!("Starting embedded broker on port {}...", args.serve_port);
-        Some(EmbeddedBroker::new(args.serve_port, BrokerMode::Replay).await?)
-    } else {
-        None
-    };
-
     // Create MQTT client configuration
     let client_config = create_mqtt_client_config(args)?;
 
@@ -474,10 +436,12 @@ async fn run_record_mode(
         })?;
 
     // Create CSV writer (Requirement 4.5: writes header row)
-    let file_path = args.file.clone().unwrap_or_else(|| {
-        std::path::PathBuf::from(crate::tui::generate_default_filename(args.host.as_deref()))
-    });
-    let writer = CsvWriter::new(&file_path, args.encode_b64).map_err(|e| {
+    // args.file is already resolved (default filename generated earlier if needed)
+    let file_path = args
+        .file
+        .as_ref()
+        .expect("--file resolved by run() for record mode");
+    let writer = CsvWriter::new(file_path, args.encode_b64).map_err(|e| {
         error!("Failed to create output file {:?}: {}", file_path, e);
         e
     })?;
@@ -626,8 +590,15 @@ async fn run_mirror_mode(
             e
         })?;
 
-    // Optionally create CSV writer (Requirement 11.5)
-    let writer = if let Some(file_path) = &args.file {
+    // Create CSV writer - use args.file, or fall back to TUI state's file path
+    // (which may have been generated as a default for record mode)
+    let resolved_file: Option<std::path::PathBuf> = args.file.clone().or_else(|| {
+        tui_state
+            .as_ref()
+            .and_then(|s| s.get_file_path())
+            .map(std::path::PathBuf::from)
+    });
+    let writer = if let Some(ref file_path) = resolved_file {
         Some(CsvWriter::new(file_path, args.encode_b64).map_err(|e| {
             error!("Failed to create output file {:?}: {}", file_path, e);
             e
@@ -701,6 +672,62 @@ async fn shutdown_broker_with_audit(
 }
 
 /// Create an MQTT client configuration from CLI arguments.
+/// Create TUI state for serve modes (tracks counters, audit, verify even without TUI).
+///
+/// Returns `None` when `--serve` is not enabled.
+fn create_tui_state(args: &Args) -> Option<std::sync::Arc<TuiState>> {
+    if !args.serve {
+        return None;
+    }
+
+    let mode = args.mode.as_ref();
+    let file_path = args.file.as_ref().map(|p| p.display().to_string());
+
+    // Set initial toggle states based on --mode
+    let (initial_record, initial_mirror) = match mode {
+        Some(Mode::Record) => (args.record.or(Some(true)), false),
+        Some(Mode::Replay) => (Some(false), false),
+        Some(Mode::Mirror) => (args.record, args.mirror),
+        None => (Some(false), false), // standalone broker
+    };
+
+    let playlist: Vec<String> = args
+        .playlist
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let tui = std::sync::Arc::new(TuiState::new(TuiConfig {
+        broker_port: args.serve_port,
+        file_path,
+        source_host: args.host.clone(),
+        source_port: args.port,
+        initial_record,
+        initial_mirror,
+        playlist,
+        audit_enabled: args.audit,
+        health_check_interval: args.health_check,
+    }));
+    if let Some(ref path) = args.audit_log {
+        tui.set_audit_file_path(path.display().to_string());
+        tui.enable_audit_file();
+    }
+    // Set playback active for replay mode, or when --loop is explicitly provided
+    let is_replay = matches!(mode, Some(Mode::Replay));
+    let has_playback_file = tui.get_file_path().is_some() || !args.playlist.is_empty();
+    if (is_replay || args.loop_replay) && has_playback_file {
+        tui.loop_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if args.loop_replay {
+            tui.playback_looping
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        tui.recording_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(tui)
+}
+
+/// Build an [`MqttClientConfig`] from CLI arguments for connecting to an external broker.
 ///
 /// # Requirements
 /// - 2.1-2.8: MQTT broker connection configuration
