@@ -8,40 +8,63 @@ use std::{
 
 /// Configuration for creating a new TuiState.
 pub struct TuiConfig {
+    /// Port the embedded broker listens on.
     pub broker_port: u16,
+    /// Path to the primary CSV file for recording/playback.
     pub file_path: Option<String>,
+    /// Hostname of the external MQTT source broker.
     pub source_host: Option<String>,
+    /// Port of the external MQTT source broker.
     pub source_port: u16,
+    /// Initial recording toggle state (`None` = off).
     pub initial_record: Option<bool>,
+    /// Whether mirroring starts enabled.
     pub initial_mirror: bool,
+    /// Additional CSV files available for playback selection.
     pub playlist: Vec<String>,
+    /// Whether audit logging is enabled at startup.
     pub audit_enabled: bool,
+    /// Seconds between health check polls (0 = disabled).
     pub health_check_interval: u64,
 }
 
 /// Shared state for the TUI
 pub struct TuiState {
+    /// Unique identifier for this session.
     pub session_id: String,
+    /// Messages received from the source broker.
     pub received_count: AtomicU64,
+    /// Messages mirrored to the embedded broker.
     pub mirrored_count: AtomicU64,
+    /// Messages replayed from CSV.
     pub replayed_count: AtomicU64,
+    /// Messages published to the embedded broker.
     pub published_count: AtomicU64,
+    /// Messages written to CSV.
     pub recorded_count: AtomicU64,
+    /// Port the embedded broker listens on.
     pub broker_port: u16,
+    /// Hostname of the external source broker.
     pub source_host: Option<String>,
+    /// Port of the external source broker.
     pub source_port: u16,
     file_path: std::sync::Mutex<Option<String>>,
     new_file_path: std::sync::Mutex<Option<String>>,
     playlist: std::sync::Mutex<Vec<String>>,
     playlist_index: std::sync::atomic::AtomicUsize,
     selected_index: std::sync::atomic::AtomicUsize,
+    /// Whether playback looping is enabled.
     pub loop_enabled: AtomicBool,
+    /// Whether CSV recording is currently active.
     pub recording_enabled: AtomicBool,
+    /// Whether message mirroring is currently active.
     pub mirroring_enabled: AtomicBool,
+    /// Whether the source broker connection is enabled.
     pub source_enabled: AtomicBool,
+    /// Whether the source broker is currently connected.
     pub source_connected: AtomicBool,
-    #[allow(dead_code)] // Read via AtomicBool::swap() in set_source_connected
     source_ever_connected: AtomicBool,
+    /// Whether the user has requested application shutdown.
     pub quit_requested: AtomicBool,
     last_error: std::sync::Mutex<Option<String>>,
     broker_connections: AtomicUsize,
@@ -57,7 +80,9 @@ pub struct TuiState {
     playback_started: std::sync::Mutex<Option<Instant>>,
     playback_start_count: std::sync::Mutex<u64>,
     // Playback mode
+    /// Whether playback is in looping mode.
     pub playback_looping: AtomicBool,
+    /// Whether playback has completed (non-looping mode).
     pub playback_finished: AtomicBool,
     // Audit
     audit_log: std::sync::Mutex<Vec<AuditEntry>>,
@@ -67,8 +92,11 @@ pub struct TuiState {
     audit_enabled: AtomicBool,
     file_line_cache: std::sync::Mutex<std::collections::HashMap<String, (usize, Instant)>>,
     // Verify counters
+    /// Messages that matched during verification.
     pub verify_matched: AtomicU64,
+    /// Messages that had payload mismatches during verification.
     pub verify_mismatched: AtomicU64,
+    /// Expected messages that were never received during verification.
     pub verify_missing: AtomicU64,
     // Broker metrics (fed from poll_metrics)
     broker_subscriptions: AtomicUsize,
@@ -80,6 +108,7 @@ pub struct TuiState {
 }
 
 impl TuiState {
+    /// Creates a new TUI state from the given configuration.
     pub fn new(config: TuiConfig) -> Self {
         // Default recording to ON if file path provided, unless explicitly set
         let recording = config.initial_record.unwrap_or(config.file_path.is_some());
@@ -149,6 +178,7 @@ impl TuiState {
     }
 
     // === Connection timing ===
+    /// Updates the source broker connection state and records timing.
     pub fn set_source_connected(&self, connected: bool) {
         let was_connected = self.source_connected.swap(connected, Ordering::Relaxed);
         if connected && !was_connected {
@@ -214,24 +244,9 @@ impl TuiState {
         }
     }
 
+    /// Returns whether the source broker is currently connected.
     pub fn is_source_connected(&self) -> bool {
         self.source_connected.load(Ordering::Relaxed)
-    }
-
-    pub fn get_connection_duration(&self) -> Option<Duration> {
-        if self.source_connected.load(Ordering::Relaxed) {
-            if let Ok(guard) = self.connected_at.lock() {
-                return guard.map(|t| t.elapsed());
-            }
-        }
-        None
-    }
-
-    /// Get the time when connection was established
-    #[allow(dead_code)] // Public API
-    pub fn get_connected_since(&self) -> Option<chrono::DateTime<chrono::Local>> {
-        self.get_connection_duration()
-            .map(|d| chrono::Local::now() - chrono::Duration::from_std(d).unwrap_or_default())
     }
 
     /// Get the time of first-ever connection (never resets)
@@ -306,16 +321,39 @@ impl TuiState {
     }
 
     // === Broker timing ===
+    /// Returns how long the embedded broker has been running.
     pub fn get_broker_uptime(&self) -> Duration {
         self.broker_started_at.elapsed()
     }
 
+    /// Returns the wall-clock time when the embedded broker started.
     pub fn get_broker_started_at(&self) -> chrono::DateTime<chrono::Local> {
         chrono::Local::now()
             - chrono::Duration::from_std(self.get_broker_uptime()).unwrap_or_default()
     }
 
+    // === Rates ===
+
+    /// Average received messages per second since source was enabled
+    pub fn get_source_rate(&self) -> Option<f64> {
+        let secs = self.get_source_enabled_elapsed()?.as_secs_f64();
+        if secs < 1.0 {
+            return None;
+        }
+        Some(self.get_received_count() as f64 / secs)
+    }
+
+    /// Average published messages per second since broker started
+    pub fn get_broker_rate(&self) -> f64 {
+        let secs = self.get_broker_uptime().as_secs_f64();
+        if secs < 1.0 {
+            return 0.0;
+        }
+        self.get_published_count() as f64 / secs
+    }
+
     // === Recording timing ===
+    /// Starts a new recording session, resetting the session timer and counter baseline.
     pub fn start_recording_session(&self) {
         if let Ok(mut guard) = self.recording_started.lock() {
             *guard = Some(Instant::now());
@@ -325,12 +363,14 @@ impl TuiState {
         }
     }
 
+    /// Stops the current recording session and clears the session timer.
     pub fn stop_recording_session(&self) {
         if let Ok(mut guard) = self.recording_started.lock() {
             *guard = None;
         }
     }
 
+    /// Returns the elapsed duration of the current recording session, if active.
     pub fn get_recording_duration(&self) -> Option<Duration> {
         if self.recording_enabled.load(Ordering::Relaxed) {
             if let Ok(guard) = self.recording_started.lock() {
@@ -353,6 +393,7 @@ impl TuiState {
     }
 
     // === Playback timing ===
+    /// Starts a new playback session, resetting the session timer and counter baseline.
     pub fn start_playback_session(&self) {
         if let Ok(mut guard) = self.playback_started.lock() {
             *guard = Some(Instant::now());
@@ -363,6 +404,7 @@ impl TuiState {
         self.playback_finished.store(false, Ordering::Relaxed);
     }
 
+    /// Stops the current playback session and clears the session timer.
     pub fn stop_playback_session(&self) {
         if let Ok(mut guard) = self.playback_started.lock() {
             *guard = None;
@@ -381,6 +423,7 @@ impl TuiState {
         total.saturating_sub(start)
     }
 
+    /// Returns the elapsed duration of the current playback session, if active.
     pub fn get_playback_duration(&self) -> Option<Duration> {
         if self.loop_enabled.load(Ordering::Relaxed) {
             if let Ok(guard) = self.playback_started.lock() {
@@ -390,15 +433,12 @@ impl TuiState {
         None
     }
 
-    #[allow(dead_code)] // Public API
-    pub fn is_playback_active(&self) -> bool {
-        self.loop_enabled.load(Ordering::Relaxed) && !self.is_recording()
-    }
-
+    /// Returns whether playback is in loop mode.
     pub fn is_playback_looping(&self) -> bool {
         self.playback_looping.load(Ordering::Relaxed)
     }
 
+    /// Returns whether the current playback pass has finished.
     pub fn is_playback_finished(&self) -> bool {
         self.playback_finished.load(Ordering::Relaxed)
     }
@@ -463,22 +503,14 @@ impl TuiState {
         self.playlist_index.store(selected, Ordering::Relaxed);
     }
 
-    /// Get the currently selected file from playlist
-    #[allow(dead_code)] // Public API
-    pub fn get_selected_file(&self) -> Option<String> {
-        let files = self.get_all_files();
-        let index = self.selected_index.load(Ordering::Relaxed);
-        files.get(index).cloned()
-    }
-
     /// Get the active file (confirmed selection)
-    #[allow(dead_code)] // Public API
     pub fn get_active_file(&self) -> Option<String> {
         let files = self.get_all_files();
         let index = self.playlist_index.load(Ordering::Relaxed);
         files.get(index).cloned()
     }
 
+    /// Records an error, pushing it to the audit log and storing it as the last error.
     pub fn set_error(&self, error: String) {
         self.push_audit(AuditArea::System, AuditSeverity::Error, error.clone());
         if let Ok(mut guard) = self.last_error.lock() {
@@ -486,6 +518,7 @@ impl TuiState {
         }
     }
 
+    /// Pushes a structured audit entry to the log and optionally writes to the audit file.
     pub fn push_audit(&self, area: AuditArea, severity: AuditSeverity, message: String) {
         if !self.audit_enabled.load(Ordering::Relaxed) {
             return;
@@ -521,30 +554,37 @@ impl TuiState {
             if let Ok(mut guard) = self.audit_file.lock() {
                 if let Some(ref mut file) = *guard {
                     use std::io::Write;
-                    let _ = writeln!(file, "{}", flat);
+                    if let Err(e) = writeln!(file, "{}", flat) {
+                        eprintln!("Audit log write failed: {}", e);
+                    }
                 }
             }
         }
     }
 
+    /// Sets the file path for audit log output.
     pub fn set_audit_file_path(&self, path: String) {
         if let Ok(mut guard) = self.audit_file_path.lock() {
             *guard = Some(path);
         }
     }
 
+    /// Returns the configured audit log file path, if any.
     pub fn get_audit_file_path(&self) -> Option<String> {
         self.audit_file_path.lock().ok().and_then(|g| g.clone())
     }
 
+    /// Returns whether audit logging is enabled.
     pub fn is_audit_enabled(&self) -> bool {
         self.audit_enabled.load(Ordering::Relaxed)
     }
 
+    /// Returns whether audit file writing is enabled.
     pub fn is_audit_file_enabled(&self) -> bool {
         self.audit_file_enabled.load(Ordering::Relaxed)
     }
 
+    /// Opens the audit file for writing, preloading any existing content.
     pub fn enable_audit_file(&self) {
         let path = self.audit_file_path.lock().ok().and_then(|g| g.clone());
         if let Some(path) = path {
@@ -609,6 +649,7 @@ impl TuiState {
         }
     }
 
+    /// Toggles audit logging on/off. Returns the new state.
     pub fn toggle_audit(&self) -> bool {
         let was_enabled = self.audit_enabled.load(Ordering::Relaxed);
         if was_enabled {
@@ -638,6 +679,7 @@ impl TuiState {
         }
     }
 
+    /// Returns a snapshot of the current audit log entries.
     pub fn get_audit_log(&self) -> Vec<AuditEntry> {
         self.audit_log
             .lock()
@@ -668,6 +710,7 @@ impl TuiState {
         None
     }
 
+    /// Updates the external broker connection count and audits changes.
     pub fn set_broker_connections(&self, count: usize) {
         let old = self.broker_connections.swap(count, Ordering::Relaxed);
         if old != count {
@@ -679,6 +722,7 @@ impl TuiState {
         }
     }
 
+    /// Returns the current external broker connection count.
     pub fn get_broker_connections(&self) -> usize {
         self.broker_connections.load(Ordering::Relaxed)
     }
@@ -733,21 +777,37 @@ impl TuiState {
         } else {
             AuditSeverity::Info
         };
+        let rx_rate = self
+            .get_source_rate()
+            .map(|r| format!("{:.1}", r))
+            .unwrap_or_else(|| "-".to_string());
+        let pub_rate = format!("{:.1}", self.get_broker_rate());
+        let source_status = if !self.is_source_enabled() {
+            "disabled"
+        } else if self.is_source_connected() {
+            "connected"
+        } else {
+            "disconnected"
+        };
         self.push_audit(AuditArea::System, severity, format!(
-            "Health: uptime {}, conns {}, subs {}, broker_pub {}, failed {}, rx {}, mir {}, pub {}, rec {}, rep {}",
+            "Health: uptime {}, source {} rx {} ({}/s), conns {}, subs {}, broker_pub {}, failed {}, mir {}, pub {} ({}/s), rec {}, rep {}",
             uptime_str,
+            source_status,
+            self.get_received_count(),
+            rx_rate,
             self.get_broker_connections(),
             self.broker_subscriptions.load(Ordering::Relaxed),
             self.broker_total_publishes.load(Ordering::Relaxed),
             failed,
-            self.get_received_count(),
             self.get_mirrored_count(),
             self.get_published_count(),
+            pub_rate,
             self.get_recorded_count(),
             self.get_replayed_count(),
         ));
     }
 
+    /// Returns the last error message, if any.
     pub fn get_error(&self) -> Option<String> {
         self.last_error.lock().ok().and_then(|g| g.clone())
     }
@@ -790,95 +850,117 @@ impl TuiState {
         }
     }
 
+    /// Returns whether the source connection is enabled.
     pub fn is_source_enabled(&self) -> bool {
         self.source_enabled.load(Ordering::Relaxed)
     }
 
+    /// Sets whether the source connection is enabled.
     pub fn set_source_enabled(&self, enabled: bool) {
         self.source_enabled.store(enabled, Ordering::Relaxed);
     }
 
+    /// Returns whether recording is enabled.
     pub fn is_recording(&self) -> bool {
         self.recording_enabled.load(Ordering::Relaxed)
     }
 
+    /// Sets whether recording is enabled.
     pub fn set_recording(&self, enabled: bool) {
         self.recording_enabled.store(enabled, Ordering::Relaxed);
     }
 
+    /// Returns whether mirroring is enabled.
     pub fn is_mirroring(&self) -> bool {
         self.mirroring_enabled.load(Ordering::Relaxed)
     }
 
+    /// Sets whether mirroring is enabled.
     pub fn set_mirroring(&self, enabled: bool) {
         self.mirroring_enabled.store(enabled, Ordering::Relaxed);
     }
 
+    /// Increments the received message counter.
     pub fn increment_received(&self) {
         self.received_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the mirrored message counter.
     pub fn increment_mirrored(&self) {
         self.mirrored_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)] // Public API
+    /// Increments the replayed message counter.
     pub fn increment_replayed(&self) {
         self.replayed_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the published message counter.
     pub fn increment_published(&self) {
         self.published_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the recorded message counter.
     pub fn increment_recorded(&self) {
         self.recorded_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Returns the total number of messages received from the source.
     pub fn get_received_count(&self) -> u64 {
         self.received_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the total number of messages mirrored to the embedded broker.
     pub fn get_mirrored_count(&self) -> u64 {
         self.mirrored_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the total number of messages replayed from CSV.
     pub fn get_replayed_count(&self) -> u64 {
         self.replayed_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the total number of messages published to the embedded broker.
     pub fn get_published_count(&self) -> u64 {
         self.published_count.load(Ordering::Relaxed)
     }
 
+    /// Returns the total number of messages recorded to CSV.
     pub fn get_recorded_count(&self) -> u64 {
         self.recorded_count.load(Ordering::Relaxed)
     }
 
+    /// Increments the verify matched counter.
     pub fn increment_verify_matched(&self) {
         self.verify_matched.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increments the verify mismatched counter.
     pub fn increment_verify_mismatched(&self) {
         self.verify_mismatched.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Adds to the verify missing counter.
     pub fn add_verify_missing(&self, count: u64) {
         self.verify_missing.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Returns the total number of verified matching messages.
     pub fn get_verify_matched(&self) -> u64 {
         self.verify_matched.load(Ordering::Relaxed)
     }
 
+    /// Returns the total number of verified mismatched messages.
     pub fn get_verify_mismatched(&self) -> u64 {
         self.verify_mismatched.load(Ordering::Relaxed)
     }
 
+    /// Returns the total number of verified missing messages.
     pub fn get_verify_missing(&self) -> u64 {
         self.verify_missing.load(Ordering::Relaxed)
     }
 
+    /// Requests a graceful shutdown, logging a final summary to the audit log.
     pub fn request_quit(&self) {
         let uptime = self.get_broker_uptime();
         let secs = uptime.as_secs();
@@ -902,6 +984,7 @@ impl TuiState {
         self.quit_requested.store(true, Ordering::Relaxed);
     }
 
+    /// Returns whether a graceful shutdown has been requested.
     pub fn is_quit_requested(&self) -> bool {
         self.quit_requested.load(Ordering::Relaxed)
     }
@@ -1451,5 +1534,65 @@ mod tests {
         let from_fn = generate_default_filename(Some("test.host"));
         // Both should have same prefix (timestamp may differ by a ms)
         assert_eq!(&from_state[..10], &from_fn[..10]);
+    }
+
+    // === source_connected tests ===
+
+    #[test]
+    fn test_source_connected_default_false() {
+        let state = TuiState::new(default_config());
+        assert!(!state.is_source_connected());
+    }
+
+    #[test]
+    fn test_source_connected_toggle() {
+        let state = TuiState::new(default_config());
+        state.set_source_connected(true);
+        assert!(state.is_source_connected());
+        state.set_source_connected(false);
+        assert!(!state.is_source_connected());
+    }
+
+    // === Record mode initial state tests ===
+
+    #[test]
+    fn test_record_mode_no_file_recording_disabled() {
+        // When no file_path and no explicit initial_record, recording defaults to false
+        let state = TuiState::new(TuiConfig {
+            file_path: None,
+            initial_record: None,
+            ..default_config()
+        });
+        assert!(!state.is_recording());
+    }
+
+    #[test]
+    fn test_record_mode_with_file_recording_enabled() {
+        // When file_path provided, recording defaults to true
+        let state = TuiState::new(TuiConfig {
+            file_path: Some("test.csv".to_string()),
+            initial_record: None,
+            ..default_config()
+        });
+        assert!(state.is_recording());
+    }
+
+    // === Replay mode initial state tests ===
+
+    #[test]
+    fn test_replay_mode_playback_active() {
+        // Simulates run_replay_mode setting loop_enabled for TUI display
+        let state = TuiState::new(TuiConfig {
+            file_path: Some("messages.csv".to_string()),
+            ..default_config()
+        });
+        assert!(!state.loop_enabled.load(Ordering::Relaxed));
+
+        // After run_replay_mode sets playback active
+        state.loop_enabled.store(true, Ordering::Relaxed);
+        state.set_recording(false);
+
+        assert!(state.loop_enabled.load(Ordering::Relaxed));
+        assert!(!state.is_recording());
     }
 }

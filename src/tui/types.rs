@@ -17,9 +17,13 @@ pub fn generate_default_filename(host: Option<&str>) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Public API used by external tests and consumers
 pub enum AppMode {
+    /// Recording messages from a broker to CSV.
     Record,
+    /// Replaying messages from CSV to a broker.
     Replay,
+    /// Mirroring messages between brokers.
     Mirror,
+    /// Passing messages through without recording.
     Passthrough,
 }
 
@@ -34,34 +38,52 @@ impl std::fmt::Display for AppMode {
     }
 }
 
+/// Functional area of the application that generated an audit event.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)] // Public API
 pub enum AuditArea {
+    /// Events from the external MQTT source broker.
     Source,
+    /// Events from the embedded MQTT broker.
     Broker,
+    /// Events related to CSV recording.
     Record,
+    /// Events related to message playback.
     Playback,
+    /// Events related to message mirroring.
     Mirror,
+    /// System-level events (startup, shutdown, health).
     System,
+    /// Events from message verification.
     Verify,
 }
 
+/// Severity level of an audit log entry.
 #[derive(Clone, Copy, PartialEq)]
 pub enum AuditSeverity {
+    /// Informational event.
     Info,
+    /// Warning event.
     Warn,
+    /// Error event.
     Error,
 }
 
+/// A single structured audit log entry with timestamp, area, severity, and message.
 #[derive(Clone)]
 pub struct AuditEntry {
+    /// ISO 8601 formatted timestamp of the event.
     pub timestamp: String,
+    /// Functional area that generated this event.
     pub area: AuditArea,
+    /// Severity level of this event.
     pub severity: AuditSeverity,
+    /// Human-readable description of the event.
     pub message: String,
 }
 
 impl AuditArea {
+    /// Returns the short label for this audit area (e.g., "SRC", "BRK").
     pub fn label(&self) -> &'static str {
         match self {
             AuditArea::Source => "SRC",
@@ -74,6 +96,7 @@ impl AuditArea {
         }
     }
 
+    /// Returns the display color for this audit area in the TUI.
     pub fn color(&self) -> ratatui::prelude::Color {
         use ratatui::prelude::Color;
         match self {

@@ -43,7 +43,7 @@ use tracing::{error, info, warn};
 
 use crate::csv_handler::{CsvReader, MessageRecord};
 use crate::error::MqttRecorderError;
-use crate::mqtt::AnyMqttClient;
+use crate::mqtt::{AnyMqttClient, MqttIncoming};
 use crate::tui::TuiState;
 
 /// Replayer for publishing MQTT messages from a CSV file.
@@ -183,10 +183,18 @@ impl Replayer {
 
         // Initial connection check - poll once to establish connection
         match self.client.poll().await {
-            Ok(_) => {
+            Ok(event) => {
+                if matches!(event, MqttIncoming::ConnAck) {
+                    if let Some(ref state) = tui_state {
+                        state.set_source_connected(true);
+                    }
+                }
                 info!("Connected to MQTT broker");
             }
             Err(e) => {
+                if let Some(ref state) = tui_state {
+                    state.set_source_connected(false);
+                }
                 warn!("Initial connection status: {}", e);
             }
         }
@@ -222,7 +230,13 @@ impl Replayer {
                                     // Poll event loop to handle pings; this drives the connection
                                     poll_result = self.client.poll() => {
                                         match poll_result {
-                                            Ok(_) => {}
+                                            Ok(event) => {
+                                                if matches!(event, MqttIncoming::ConnAck) {
+                                                    if let Some(ref state) = tui_state {
+                                                        state.set_source_connected(true);
+                                                    }
+                                                }
+                                            }
                                             Err(e) if crate::util::is_fatal_error(&e, false) => return Err(e),
                                             Err(_) => {}
                                         }

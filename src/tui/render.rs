@@ -112,12 +112,24 @@ fn draw_source_section(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
             Style::default().fg(Color::Yellow),
         ))
     };
+    let rate_span = ctx.state.get_source_rate().map(|r| {
+        Span::styled(
+            format!(" ({:.1}/s)", r),
+            Style::default().fg(Color::DarkGray),
+        )
+    });
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(vec![
-                "Received: ".into(),
-                Span::styled(format!("{}", ctx.received), ctx.bright),
-            ]),
+            Line::from(
+                [
+                    vec![
+                        "Received: ".into(),
+                        Span::styled(format!("{}", ctx.received), ctx.bright),
+                    ],
+                    rate_span.into_iter().collect(),
+                ]
+                .concat(),
+            ),
             conn_status,
         ])
         .wrap(Wrap { trim: false }),
@@ -164,11 +176,21 @@ fn draw_broker_section(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
     } else {
         ctx.dim
     };
+    let broker_rate = ctx.state.get_broker_rate();
+    let rate_span = if broker_rate > 0.0 {
+        Span::styled(
+            format!(" ({:.1}/s)", broker_rate),
+            Style::default().fg(Color::DarkGray),
+        )
+    } else {
+        Span::raw("")
+    };
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(vec![
                 "Published: ".into(),
                 Span::styled(format!("{}", ctx.published), ctx.bright),
+                rate_span,
             ]),
             Line::from(vec![
                 "Clients: ".into(),
@@ -256,7 +278,13 @@ fn draw_record_file_playback(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
     let rec_duration = ctx.state.get_recording_duration();
     let play_duration = ctx.state.get_playback_duration();
 
-    // Record (Source → Record)
+    draw_record_panel(frame, path2[0], ctx, rec_duration);
+    draw_file_panel(frame, path2[1], ctx);
+    draw_playback_panel(frame, path2[2], ctx, play_duration);
+}
+
+/// Render the Record panel showing recording status and count.
+fn draw_record_panel(frame: &mut Frame, area: Rect, ctx: &DrawContext, duration: Option<Duration>) {
     let r_arrow = if ctx.record_on && ctx.source_on {
         "→"
     } else {
@@ -276,22 +304,24 @@ fn draw_record_file_playback(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ctx.record_color))
         .padding(Padding::horizontal(1));
-    let ri = record_block.inner(path2[0]);
-    frame.render_widget(record_block, path2[0]);
+    let ri = record_block.inner(area);
+    frame.render_widget(record_block, area);
 
     let mut rec_lines = vec![Line::from(vec![
         "Rec: ".into(),
         Span::styled(format!("{}", ctx.recorded), ctx.bright),
     ])];
-    if let Some(d) = rec_duration {
+    if let Some(d) = duration {
         rec_lines.push(Line::from(Span::styled(
             fmt_dur(d),
             Style::default().fg(Color::Green),
         )));
     }
     frame.render_widget(Paragraph::new(rec_lines), ri);
+}
 
-    // File
+/// Render the File panel showing playlist or single file.
+fn draw_file_panel(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
     let f_arrow_l = if ctx.record_on { "←" } else { " " };
     let f_arrow_r = if ctx.playback_on { "→" } else { " " };
     let file_block = Block::default()
@@ -303,8 +333,8 @@ fn draw_record_file_playback(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(ctx.file_color))
         .padding(Padding::horizontal(1));
-    let fi = file_block.inner(path2[1]);
-    frame.render_widget(file_block, path2[1]);
+    let fi = file_block.inner(area);
+    frame.render_widget(file_block, area);
 
     let all_files = ctx.state.get_all_files();
     let selected_idx = ctx.state.get_selected_index();
@@ -356,8 +386,15 @@ fn draw_record_file_playback(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
             .collect()
     };
     frame.render_widget(Paragraph::new(file_lines).wrap(Wrap { trim: false }), fi);
+}
 
-    // Playback (Playback → Broker)
+/// Render the Playback panel showing playback status and count.
+fn draw_playback_panel(
+    frame: &mut Frame,
+    area: Rect,
+    ctx: &DrawContext,
+    duration: Option<Duration>,
+) {
     let p_arrow = if ctx.playback_on { "→" } else { " " };
     let pb_label = if ctx.playback_finished {
         ("◇ done ", ctx.dim)
@@ -382,14 +419,14 @@ fn draw_record_file_playback(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
             ctx.playback_color
         }))
         .padding(Padding::horizontal(1));
-    let pi = playback_block.inner(path2[2]);
-    frame.render_widget(playback_block, path2[2]);
+    let pi = playback_block.inner(area);
+    frame.render_widget(playback_block, area);
 
     let mut play_lines = vec![Line::from(vec![
         "Replayed: ".into(),
         Span::styled(format!("{}", ctx.replayed), ctx.bright),
     ])];
-    if let Some(d) = play_duration {
+    if let Some(d) = duration {
         play_lines.push(Line::from(Span::styled(
             fmt_dur(d),
             Style::default().fg(Color::Magenta),
@@ -559,6 +596,7 @@ pub struct Terminal {
 }
 
 impl Terminal {
+    /// Creates a new TUI terminal, entering raw mode and the alternate screen.
     pub fn new() -> std::io::Result<Self> {
         enable_raw_mode()?;
         stdout().execute(EnterAlternateScreen)?;
@@ -567,6 +605,7 @@ impl Terminal {
         Ok(Self { terminal })
     }
 
+    /// Draws the TUI frame with the current state.
     pub fn draw(
         &mut self,
         state: &TuiState,

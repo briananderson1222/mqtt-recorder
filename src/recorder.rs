@@ -211,6 +211,12 @@ impl Recorder {
                 event_result = self.client.poll() => {
                     match event_result {
                         Ok(event) => {
+                            // Update source connection state on ConnAck
+                            if matches!(event, MqttIncoming::ConnAck) {
+                                if let Some(ref state) = tui_state {
+                                    state.set_source_connected(true);
+                                }
+                            }
                             if let Some(msg) = self.process_event(event) {
                                 self.writer.write_bytes(
                                     msg.timestamp,
@@ -235,6 +241,9 @@ impl Recorder {
                             }
                         }
                         Err(e) => {
+                            if let Some(ref state) = tui_state {
+                                state.set_source_connected(false);
+                            }
                             error!("MQTT error: {}", e);
                             if crate::util::is_fatal_error(&e, false) {
                                 return Err(e);
