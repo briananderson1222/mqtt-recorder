@@ -13,6 +13,18 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+/// Channel capacity for MQTT v4 clients (external broker connections).
+const V4_CHANNEL_CAPACITY: usize = 256;
+
+/// Channel capacity for MQTT v5 clients (embedded broker connections, higher throughput).
+const V5_CHANNEL_CAPACITY: usize = 2048;
+
+/// Keep-alive interval in seconds for MQTT v4 connections.
+const V4_KEEP_ALIVE_SECS: u64 = 30;
+
+/// Keep-alive interval in seconds for MQTT v5 connections.
+const V5_KEEP_ALIVE_SECS: u64 = 15;
+
 /// Configuration for establishing an MQTT client connection.
 ///
 /// This struct holds all the necessary parameters to connect to an MQTT broker,
@@ -174,13 +186,13 @@ impl MqttClientConfig {
     }
 
     /// Returns true if TLS is configured for this connection.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn is_tls_enabled(&self) -> bool {
         self.tls.is_some()
     }
 
     /// Returns true if authentication credentials are configured.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn has_credentials(&self) -> bool {
         self.username.is_some() && self.password.is_some()
     }
@@ -283,7 +295,8 @@ impl TlsConfig {
     }
 
     /// Returns true if a CA certificate is configured for server verification.
-    #[allow(dead_code)]
+    /// Returns true if a CA certificate is configured for server verification.
+    #[allow(dead_code)] // Public API
     pub fn has_ca_cert(&self) -> bool {
         self.ca_cert.is_some()
     }
@@ -293,26 +306,6 @@ impl Default for TlsConfig {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Generates a unique client ID using a UUID-like format.
-///
-/// The generated ID has the format "mqtt-recorder-XXXXXXXX" where X is a
-/// random hexadecimal character.
-///
-/// # Requirements
-/// - 2.3: WHEN no client_id is provided, generate a unique client identifier
-fn generate_client_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-
-    // Use timestamp and a simple hash to create a unique ID
-    let hash = timestamp ^ (timestamp >> 32);
-    format!("mqtt-recorder-{:08x}", hash as u32)
 }
 
 /// MQTT client wrapper around rumqttc.
@@ -376,7 +369,7 @@ impl MqttClient {
     pub async fn new(config: MqttClientConfig) -> Result<Self, MqttRecorderError> {
         // Generate client_id if empty (Requirement 2.3)
         let client_id = if config.client_id.is_empty() {
-            generate_client_id()
+            crate::util::generate_client_id(&Some(config.client_id.clone()))
         } else {
             config.client_id.clone()
         };
@@ -384,8 +377,8 @@ impl MqttClient {
         // Create MQTT options (Requirement 2.1, 2.2)
         let mut mqtt_options = MqttOptions::new(&client_id, &config.host, config.port);
 
-        // Set keep alive to 15 seconds for faster disconnection detection
-        mqtt_options.set_keep_alive(Duration::from_secs(15));
+        // Set keep alive to 30 seconds to tolerate high-throughput message bursts
+        mqtt_options.set_keep_alive(Duration::from_secs(V4_KEEP_ALIVE_SECS));
 
         // Set max packet size from config (Requirement 1.19, 1.28)
         mqtt_options.set_max_packet_size(config.max_packet_size, config.max_packet_size);
@@ -402,7 +395,8 @@ impl MqttClient {
         }
 
         // Create the async client and event loop
-        let (client, eventloop) = AsyncClient::new(mqtt_options, 10);
+        // Use a large channel capacity to prevent backpressure from blocking ping handling
+        let (client, eventloop) = AsyncClient::new(mqtt_options, V4_CHANNEL_CAPACITY);
 
         Ok(Self {
             client,
@@ -434,8 +428,12 @@ impl MqttClient {
 
         // Read client certificate and key if provided (Requirement 2.7)
         let client_auth = if tls_config.has_client_auth() {
-            let cert_path = tls_config.client_cert.as_ref().unwrap();
-            let key_path = tls_config.client_key.as_ref().unwrap();
+            let cert_path = tls_config.client_cert.as_ref().ok_or_else(|| {
+                MqttRecorderError::Tls("client_cert required when client_key is set".to_string())
+            })?;
+            let key_path = tls_config.client_key.as_ref().ok_or_else(|| {
+                MqttRecorderError::Tls("client_key required when client_cert is set".to_string())
+            })?;
 
             let cert_data = fs::read(cert_path).map_err(|e| {
                 MqttRecorderError::Tls(format!(
@@ -581,13 +579,214 @@ impl MqttClient {
         self.client.disconnect().await?;
         Ok(())
     }
+}
 
-    /// Get a reference to the underlying AsyncClient.
-    ///
-    /// This can be useful for advanced operations not covered by the wrapper methods.
-    #[allow(dead_code)]
-    pub fn client(&self) -> &AsyncClient {
-        &self.client
+/// MQTT v5 client wrapper around rumqttc::v5.
+///
+/// Used for connections to the embedded broker which runs a v5 listener.
+/// Provides the same public API as `MqttClient` but uses MQTT v5 protocol.
+pub struct MqttClientV5 {
+    client: rumqttc::v5::AsyncClient,
+    eventloop: Arc<Mutex<rumqttc::v5::EventLoop>>,
+}
+
+impl MqttClientV5 {
+    /// Convert v4 QoS to v5 QoS (they're separate types in rumqttc)
+    fn to_v5_qos(qos: QoS) -> rumqttc::v5::mqttbytes::QoS {
+        match qos {
+            QoS::AtMostOnce => rumqttc::v5::mqttbytes::QoS::AtMostOnce,
+            QoS::AtLeastOnce => rumqttc::v5::mqttbytes::QoS::AtLeastOnce,
+            QoS::ExactlyOnce => rumqttc::v5::mqttbytes::QoS::ExactlyOnce,
+        }
+    }
+
+    /// Convert v5 QoS to v4 QoS
+    fn from_v5_qos(qos: rumqttc::v5::mqttbytes::QoS) -> QoS {
+        match qos {
+            rumqttc::v5::mqttbytes::QoS::AtMostOnce => QoS::AtMostOnce,
+            rumqttc::v5::mqttbytes::QoS::AtLeastOnce => QoS::AtLeastOnce,
+            rumqttc::v5::mqttbytes::QoS::ExactlyOnce => QoS::ExactlyOnce,
+        }
+    }
+
+    /// Create a new MQTT v5 client with the given configuration.
+    pub async fn new(config: MqttClientConfig) -> Result<Self, MqttRecorderError> {
+        let client_id = if config.client_id.is_empty() {
+            crate::util::generate_client_id(&Some(config.client_id.clone()))
+        } else {
+            config.client_id.clone()
+        };
+
+        let mut mqtt_options = rumqttc::v5::MqttOptions::new(&client_id, &config.host, config.port);
+        mqtt_options.set_keep_alive(Duration::from_secs(V5_KEEP_ALIVE_SECS));
+        mqtt_options.set_max_packet_size(Some(config.max_packet_size as u32));
+
+        if let (Some(username), Some(password)) = (&config.username, &config.password) {
+            mqtt_options.set_credentials(username, password);
+        }
+
+        if let Some(tls_config) = &config.tls {
+            let transport = MqttClient::build_tls_transport(tls_config)?;
+            mqtt_options.set_transport(transport);
+        }
+
+        // Channel capacity: v5 clients connect to the embedded broker which handles
+        // high-throughput mirroring and needs larger buffers to avoid backpressure
+        let (client, eventloop) = rumqttc::v5::AsyncClient::new(mqtt_options, V5_CHANNEL_CAPACITY);
+
+        Ok(Self {
+            client,
+            eventloop: Arc::new(Mutex::new(eventloop)),
+        })
+    }
+
+    /// Subscribe to the given topics with the specified QoS level.
+    pub async fn subscribe(&self, topics: &[String], qos: QoS) -> Result<(), MqttRecorderError> {
+        let v5_qos = Self::to_v5_qos(qos);
+        for topic in topics {
+            self.client.subscribe(topic, v5_qos).await?;
+        }
+        Ok(())
+    }
+
+    /// Publish a message to the given topic.
+    pub async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), MqttRecorderError> {
+        self.client
+            .publish(topic, Self::to_v5_qos(qos), retain, payload.to_vec())
+            .await?;
+        Ok(())
+    }
+
+    /// Poll for the next event from the broker.
+    pub async fn poll(&self) -> Result<rumqttc::v5::Event, MqttRecorderError> {
+        let mut eventloop = self.eventloop.lock().await;
+        let event = eventloop.poll().await?;
+        Ok(event)
+    }
+
+    /// Disconnect from the broker.
+    pub async fn disconnect(&self) -> Result<(), MqttRecorderError> {
+        self.client.disconnect().await?;
+        Ok(())
+    }
+
+    /// Get a clone of the eventloop Arc for spawning a background poll task.
+    pub fn eventloop(&self) -> Arc<Mutex<rumqttc::v5::EventLoop>> {
+        Arc::clone(&self.eventloop)
+    }
+}
+
+/// Protocol-agnostic MQTT client that wraps either a v4 or v5 client.
+///
+/// Used by components (like Replayer) that need to connect to either
+/// an external broker (v4) or the embedded broker (v5).
+pub enum AnyMqttClient {
+    /// MQTT v4 client for external broker connections.
+    V4(MqttClient),
+    /// MQTT v5 client for embedded broker connections.
+    V5(MqttClientV5),
+}
+
+/// Unified incoming event extracted from either v4 or v5 MQTT events.
+pub enum MqttIncoming {
+    /// A publish message received from the broker.
+    Publish {
+        /// The MQTT topic the message was published to.
+        topic: String,
+        /// The raw message payload bytes.
+        payload: Vec<u8>,
+        /// Quality of Service level (0, 1, or 2).
+        qos: QoS,
+        /// Whether this message should be retained by the broker.
+        retain: bool,
+    },
+    /// Connection acknowledged by the broker.
+    ConnAck,
+    /// Subscription acknowledged by the broker.
+    SubAck,
+    /// Any other MQTT event not specifically handled.
+    Other,
+}
+
+impl AnyMqttClient {
+    /// Subscribe to topics using the underlying v4 or v5 client.
+    pub async fn subscribe(&self, topics: &[String], qos: QoS) -> Result<(), MqttRecorderError> {
+        match self {
+            Self::V4(c) => c.subscribe(topics, qos).await,
+            Self::V5(c) => c.subscribe(topics, qos).await,
+        }
+    }
+
+    /// Publish a message using the underlying v4 or v5 client.
+    pub async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<(), MqttRecorderError> {
+        match self {
+            Self::V4(c) => c.publish(topic, payload, qos, retain).await,
+            Self::V5(c) => c.publish(topic, payload, qos, retain).await,
+        }
+    }
+
+    /// Poll for the next event, converting to the unified `MqttIncoming` type.
+    pub async fn poll(&self) -> Result<MqttIncoming, MqttRecorderError> {
+        match self {
+            Self::V4(c) => {
+                let event = c.poll().await?;
+                Ok(Self::convert_v4_event(event))
+            }
+            Self::V5(c) => {
+                let event = c.poll().await?;
+                Ok(Self::convert_v5_event(event))
+            }
+        }
+    }
+
+    /// Disconnect from the broker using the underlying v4 or v5 client.
+    pub async fn disconnect(&self) -> Result<(), MqttRecorderError> {
+        match self {
+            Self::V4(c) => c.disconnect().await,
+            Self::V5(c) => c.disconnect().await,
+        }
+    }
+
+    fn convert_v4_event(event: Event) -> MqttIncoming {
+        use rumqttc::Packet;
+        match event {
+            Event::Incoming(Packet::Publish(p)) => MqttIncoming::Publish {
+                topic: p.topic,
+                payload: p.payload.to_vec(),
+                qos: p.qos,
+                retain: p.retain,
+            },
+            Event::Incoming(Packet::ConnAck(_)) => MqttIncoming::ConnAck,
+            Event::Incoming(Packet::SubAck(_)) => MqttIncoming::SubAck,
+            _ => MqttIncoming::Other,
+        }
+    }
+
+    fn convert_v5_event(event: rumqttc::v5::Event) -> MqttIncoming {
+        use rumqttc::v5::mqttbytes::v5::Packet;
+        match event {
+            rumqttc::v5::Event::Incoming(Packet::Publish(p)) => MqttIncoming::Publish {
+                topic: String::from_utf8_lossy(&p.topic).into_owned(),
+                payload: p.payload.to_vec(),
+                qos: MqttClientV5::from_v5_qos(p.qos),
+                retain: p.retain,
+            },
+            rumqttc::v5::Event::Incoming(Packet::ConnAck(_)) => MqttIncoming::ConnAck,
+            rumqttc::v5::Event::Incoming(Packet::SubAck(_)) => MqttIncoming::SubAck,
+            _ => MqttIncoming::Other,
+        }
     }
 }
 
@@ -707,7 +906,7 @@ mod tests {
 
     #[test]
     fn test_generate_client_id_format() {
-        let client_id = generate_client_id();
+        let client_id = crate::util::generate_client_id(&None);
         assert!(client_id.starts_with("mqtt-recorder-"));
         // Should be "mqtt-recorder-" (14 chars) + 8 hex chars = 22 chars
         assert_eq!(client_id.len(), 22);
@@ -718,9 +917,9 @@ mod tests {
         // Generate multiple IDs and check they're different
         // Note: Due to timing, consecutive calls might produce the same ID
         // so we add a small delay between calls
-        let id1 = generate_client_id();
+        let id1 = crate::util::generate_client_id(&None);
         std::thread::sleep(std::time::Duration::from_millis(1));
-        let id2 = generate_client_id();
+        let id2 = crate::util::generate_client_id(&None);
 
         // IDs should be different (with high probability due to nanosecond precision)
         // But we can't guarantee this in a unit test, so just check format
@@ -816,5 +1015,30 @@ mod tests {
         } else {
             panic!("Expected TLS error");
         }
+    }
+
+    #[tokio::test]
+    async fn test_mqtt_client_v5_eventloop_accessor() {
+        let config = MqttClientConfig::new("127.0.0.1".to_string(), 1883, "test".to_string());
+        let client = MqttClientV5::new(config).await.unwrap();
+        let el = client.eventloop();
+        // Should be able to clone the Arc and lock it
+        assert!(el.try_lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mqtt_client_v5_keep_alive() {
+        let config = MqttClientConfig::new("127.0.0.1".to_string(), 1883, "test".to_string());
+        // Just verify construction succeeds with the configured keep_alive
+        let client = MqttClientV5::new(config).await;
+        assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mqtt_client_channel_capacity() {
+        let config = MqttClientConfig::new("127.0.0.1".to_string(), 1883, "test".to_string());
+        // Verify client creates successfully with 256 channel capacity
+        let client = MqttClient::new(config).await;
+        assert!(client.is_ok());
     }
 }

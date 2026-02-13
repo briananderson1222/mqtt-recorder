@@ -20,13 +20,53 @@
 //! - 10.10: Display its current mode (standalone, replay, or mirror) on startup
 
 use crate::error::MqttRecorderError;
-use crate::mqtt::{MqttClient, MqttClientConfig};
-use rumqttd::{Broker, Config, ConnectionSettings, RouterConfig, ServerSettings};
+use crate::mqtt::{MqttClientConfig, MqttClientV5};
+use rumqttd::{
+    Broker, Config, ConnectionSettings, MetricSettings, MetricType, RouterConfig, ServerSettings,
+};
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
+use tracing::{error, info};
+
+/// Maximum number of concurrent connections the embedded broker accepts.
+const MAX_BROKER_CONNECTIONS: usize = 1000;
+
+/// Maximum number of outgoing packets queued per connection.
+const MAX_OUTGOING_PACKET_COUNT: u64 = 10000;
+
+/// Maximum size of each commit log segment in bytes (1 MB).
+const MAX_SEGMENT_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of segments in the commit log.
+const MAX_SEGMENT_COUNT: usize = 100;
+
+/// Connection timeout in milliseconds (60 seconds).
+const CONNECTION_TIMEOUT_MS: u16 = 60000;
+
+/// Maximum payload size in bytes (1 MB).
+const MAX_PAYLOAD_SIZE: usize = 1024 * 1024;
+
+/// Maximum number of inflight messages per connection.
+const MAX_INFLIGHT_COUNT: usize = 100;
+
+/// Snapshot of broker metrics from a single poll.
+#[derive(Debug, Clone)]
+pub struct BrokerMetrics {
+    /// External connection count (excludes internal clients)
+    #[allow(dead_code)] // Public API
+    pub connections: usize,
+    /// Whether connection count changed since last poll
+    pub connections_changed: Option<(usize, usize)>,
+    /// Total active subscriptions
+    pub subscriptions: usize,
+    /// Cumulative publishes routed by the broker (across all polls)
+    pub total_publishes: u64,
+    /// Cumulative failed publishes (across all polls)
+    pub failed_publishes: u64,
+}
 
 /// The operational mode of the embedded broker.
 ///
@@ -93,10 +133,10 @@ pub struct EmbeddedBroker {
     /// The broker handle for managing the broker thread
     _handle: BrokerHandle,
     /// The operational mode of the broker
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     mode: BrokerMode,
     /// The port the broker is listening on
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     port: u16,
     /// Metrics link for polling connection counts
     meters_link: Option<rumqttd::meters::MetersLink>,
@@ -106,6 +146,12 @@ pub struct EmbeddedBroker {
     subscription_count: AtomicUsize,
     /// Number of internal clients to subtract from connection count
     internal_clients: AtomicUsize,
+    /// Counter for generating unique local client IDs
+    client_counter: AtomicUsize,
+    /// Cumulative publishes routed (RouterMeter resets each interval, so we accumulate)
+    cumulative_publishes: AtomicU64,
+    /// Cumulative failed publishes
+    cumulative_failed: AtomicU64,
 }
 
 impl EmbeddedBroker {
@@ -141,7 +187,7 @@ impl EmbeddedBroker {
     /// ```
     pub async fn new(port: u16, mode: BrokerMode) -> Result<Self, MqttRecorderError> {
         // Log the mode on startup (Requirement 10.10)
-        eprintln!(
+        info!(
             "Starting embedded MQTT broker on port {} in {} mode",
             port, mode
         );
@@ -158,12 +204,11 @@ impl EmbeddedBroker {
         // Start the broker in a separate thread (broker.start() is blocking)
         let handle = thread::spawn(move || {
             if let Err(e) = broker.start() {
-                eprintln!("Broker error: {}", e);
+                error!("Broker error: {}", e);
             }
         });
 
-        // Give the broker a moment to start up
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        Self::wait_for_broker_ready(port).await?;
 
         Ok(Self {
             _handle: BrokerHandle { _thread: handle },
@@ -173,7 +218,30 @@ impl EmbeddedBroker {
             connection_count: AtomicUsize::new(0),
             subscription_count: AtomicUsize::new(0),
             internal_clients: AtomicUsize::new(0),
+            client_counter: AtomicUsize::new(0),
+            cumulative_publishes: AtomicU64::new(0),
+            cumulative_failed: AtomicU64::new(0),
         })
+    }
+
+    /// Wait for the broker to be ready by probing the TCP port.
+    async fn wait_for_broker_ready(port: u16) -> Result<(), MqttRecorderError> {
+        let addr = format!("127.0.0.1:{}", port);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(crate::util::BROKER_READY_TIMEOUT_SECS);
+        loop {
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(MqttRecorderError::Broker(format!(
+                    "Broker failed to start on port {} within 5 seconds",
+                    port
+                )));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        Ok(())
     }
 
     /// Create the rumqttd configuration for the embedded broker.
@@ -184,25 +252,25 @@ impl EmbeddedBroker {
         // Create router configuration with reasonable defaults
         // Use Default and override specific fields
         let router = RouterConfig {
-            max_connections: 1000,
-            max_outgoing_packet_count: 200,
-            max_segment_size: 100 * 1024, // 100 KB
-            max_segment_count: 10,
+            max_connections: MAX_BROKER_CONNECTIONS,
+            max_outgoing_packet_count: MAX_OUTGOING_PACKET_COUNT,
+            max_segment_size: MAX_SEGMENT_SIZE,
+            max_segment_count: MAX_SEGMENT_COUNT,
             ..Default::default()
         };
 
         // Create connection settings
         // Supports QoS 0, 1, and 2 (Requirement 10.7)
         let connection_settings = ConnectionSettings {
-            connection_timeout_ms: 60000, // 60 seconds
-            max_payload_size: 256 * 1024, // 256 KB max payload
-            max_inflight_count: 100,      // Support for QoS 1 and 2
-            auth: None,                   // No authentication for embedded broker
+            connection_timeout_ms: CONNECTION_TIMEOUT_MS,
+            max_payload_size: MAX_PAYLOAD_SIZE,
+            max_inflight_count: MAX_INFLIGHT_COUNT,
+            auth: None, // No authentication for embedded broker
             external_auth: None,
             dynamic_filters: true, // Allow dynamic topic creation
         };
 
-        // Create server settings for MQTT v4 (3.1.1)
+        // Create server settings for MQTT v5
         let listen_addr: SocketAddr = format!("0.0.0.0:{}", port)
             .parse()
             .map_err(|e| MqttRecorderError::Broker(format!("Invalid port {}: {}", port, e)))?;
@@ -215,22 +283,33 @@ impl EmbeddedBroker {
             connections: connection_settings,
         };
 
-        // Create the v4 servers map
-        let mut v4_servers = HashMap::new();
-        v4_servers.insert("1".to_string(), server_settings);
+        // Create the v5 servers map
+        let mut v5_servers = HashMap::new();
+        v5_servers.insert("1".to_string(), server_settings);
+
+        // Create metrics config so the timer thread pushes data to MetersLink
+        // Both Meters and Alerts must be present to avoid a panic in rumqttd's timer.rs
+        // (the select! macro evaluates unwrap() before checking the if-guard)
+        let meter_settings: MetricSettings = serde_json::from_str(r#"{"push_interval": 1}"#)
+            .map_err(|e| MqttRecorderError::Broker(format!("metrics config: {}", e)))?;
+        let alert_settings: MetricSettings = serde_json::from_str(r#"{"push_interval": 30}"#)
+            .map_err(|e| MqttRecorderError::Broker(format!("metrics config: {}", e)))?;
+        let mut metrics = HashMap::new();
+        metrics.insert(MetricType::Meters, meter_settings);
+        metrics.insert(MetricType::Alerts, alert_settings);
 
         // Create the final configuration
         let config = Config {
             id: 0,
             router,
-            v4: Some(v4_servers),
-            v5: None,
+            v4: None,
+            v5: Some(v5_servers),
             ws: None,
             cluster: None,
             console: None,
             bridge: None,
             prometheus: None,
-            metrics: None,
+            metrics: Some(metrics),
         };
 
         Ok(config)
@@ -257,16 +336,15 @@ impl EmbeddedBroker {
     /// // Use client to publish messages
     /// client.publish("topic", b"payload", QoS::AtMostOnce, false).await?;
     /// ```
-    pub async fn get_local_client(&self) -> Result<MqttClient, MqttRecorderError> {
-        // Create a client configuration for connecting to localhost
+    pub async fn get_local_client(&self) -> Result<MqttClientV5, MqttRecorderError> {
+        let id = self.client_counter.fetch_add(1, Ordering::Relaxed);
         let config = MqttClientConfig::new(
             "127.0.0.1".to_string(),
             self.port,
-            format!("mqtt-recorder-internal-{}", std::process::id()),
+            format!("mqtt-recorder-internal-{}-{}", std::process::id(), id),
         );
 
-        // Create and return the client
-        MqttClient::new(config).await
+        MqttClientV5::new(config).await
     }
 
     /// Shutdown the broker gracefully.
@@ -289,7 +367,7 @@ impl EmbeddedBroker {
     /// broker.shutdown().await?;
     /// ```
     pub async fn shutdown(self) -> Result<(), MqttRecorderError> {
-        eprintln!("Shutting down embedded broker on port {}", self.port);
+        info!("Shutting down embedded broker on port {}", self.port);
 
         // The broker thread will be dropped when self is dropped.
         // rumqttd doesn't provide a clean shutdown mechanism through the public API,
@@ -315,7 +393,7 @@ impl EmbeddedBroker {
     /// let broker = EmbeddedBroker::new(1883, BrokerMode::Standalone).await?;
     /// assert_eq!(*broker.mode(), BrokerMode::Standalone);
     /// ```
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API
     pub fn mode(&self) -> &BrokerMode {
         &self.mode
     }
@@ -325,14 +403,14 @@ impl EmbeddedBroker {
     /// # Returns
     ///
     /// The port number.
-    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    /// Poll broker metrics. Returns Some((old, new)) if connection count changed.
+    /// Poll broker metrics. Returns a snapshot when data is available.
     /// Connection count excludes internal clients.
-    pub fn poll_metrics(&self) -> Option<(usize, usize)> {
+    /// Publishes and failed_publishes are accumulated across intervals.
+    pub fn poll_metrics(&self) -> Option<BrokerMetrics> {
         let link = self.meters_link.as_ref()?;
         let meters = link.recv().ok()?;
         let offset = self.internal_clients.load(Ordering::Relaxed);
@@ -341,10 +419,23 @@ impl EmbeddedBroker {
                 let new_conn = router_meter.total_connections.saturating_sub(offset);
                 let new_sub = router_meter.total_subscriptions;
                 self.subscription_count.store(new_sub, Ordering::Relaxed);
+                self.cumulative_publishes
+                    .fetch_add(router_meter.total_publishes as u64, Ordering::Relaxed);
+                self.cumulative_failed
+                    .fetch_add(router_meter.failed_publishes as u64, Ordering::Relaxed);
                 let old = self.connection_count.swap(new_conn, Ordering::Relaxed);
-                if old != new_conn {
-                    return Some((old, new_conn));
-                }
+                let connections_changed = if old != new_conn {
+                    Some((old, new_conn))
+                } else {
+                    None
+                };
+                return Some(BrokerMetrics {
+                    connections: new_conn,
+                    connections_changed,
+                    subscriptions: new_sub,
+                    total_publishes: self.cumulative_publishes.load(Ordering::Relaxed),
+                    failed_publishes: self.cumulative_failed.load(Ordering::Relaxed),
+                });
             }
         }
         None
@@ -396,12 +487,12 @@ mod tests {
         assert!(result.is_ok());
 
         let config = result.unwrap();
-        assert!(config.v4.is_some());
+        assert!(config.v5.is_some());
 
-        let v4 = config.v4.unwrap();
-        assert!(v4.contains_key("1"));
+        let v5 = config.v5.unwrap();
+        assert!(v5.contains_key("1"));
 
-        let server = v4.get("1").unwrap();
+        let server = v5.get("1").unwrap();
         assert_eq!(server.name, "mqtt-recorder-broker");
         assert_eq!(server.listen.port(), 1883);
     }
@@ -412,8 +503,8 @@ mod tests {
         assert!(result.is_ok());
 
         let config = result.unwrap();
-        let v4 = config.v4.unwrap();
-        let server = v4.get("1").unwrap();
+        let v5 = config.v5.unwrap();
+        let server = v5.get("1").unwrap();
         assert_eq!(server.listen.port(), 9883);
     }
 
@@ -422,7 +513,7 @@ mod tests {
         let config = EmbeddedBroker::create_config(1883).unwrap();
 
         assert_eq!(config.router.max_connections, 1000);
-        assert_eq!(config.router.max_outgoing_packet_count, 200);
+        assert_eq!(config.router.max_outgoing_packet_count, 10000);
         assert!(config.router.max_segment_size > 0);
         assert!(config.router.max_segment_count > 0);
     }
@@ -430,14 +521,23 @@ mod tests {
     #[test]
     fn test_create_config_connection_settings() {
         let config = EmbeddedBroker::create_config(1883).unwrap();
-        let v4 = config.v4.unwrap();
-        let server = v4.get("1").unwrap();
+        let v5 = config.v5.unwrap();
+        let server = v5.get("1").unwrap();
 
         assert!(server.connections.connection_timeout_ms > 0);
-        assert!(server.connections.max_payload_size > 0);
         assert!(server.connections.max_inflight_count > 0);
         assert!(server.connections.dynamic_filters);
         assert!(server.connections.auth.is_none());
+    }
+
+    #[test]
+    fn test_create_config_max_payload_matches_client_default() {
+        let config = EmbeddedBroker::create_config(1883).unwrap();
+        let v5 = config.v5.unwrap();
+        let server = v5.get("1").unwrap();
+
+        // Must match MqttClientConfig default max_packet_size (1MB)
+        assert_eq!(server.connections.max_payload_size, 1024 * 1024);
     }
 
     // Note: Integration tests for actual broker startup would require
@@ -482,6 +582,39 @@ mod tests {
 
         let broker = result.unwrap();
         assert_eq!(*broker.mode(), BrokerMode::Mirror);
+
+        broker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_register_internal_client() {
+        let broker = EmbeddedBroker::new(19886, BrokerMode::Standalone)
+            .await
+            .unwrap();
+
+        broker.register_internal_client();
+        broker.register_internal_client();
+
+        // Verify internal_clients count is 2 by checking the offset behavior in poll_metrics
+        // The internal_clients count affects connection count calculation
+        assert_eq!(
+            broker
+                .internal_clients
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+
+        broker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_poll_metrics_returns_none_without_meters() {
+        let broker = EmbeddedBroker::new(19887, BrokerMode::Standalone)
+            .await
+            .unwrap();
+
+        // poll_metrics may return None or Some depending on timing, just verify it doesn't panic
+        let _result = broker.poll_metrics();
 
         broker.shutdown().await.unwrap();
     }

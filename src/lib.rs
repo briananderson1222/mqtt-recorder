@@ -15,4 +15,5 @@ pub mod recorder;
 pub mod replayer;
 pub mod topics;
 pub mod tui;
+pub mod util;
 pub mod validator;

@@ -39,18 +39,32 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use chrono::Utc;
-use rumqttc::{Event, Packet, QoS};
+use rumqttc::QoS;
 use tokio::sync::broadcast;
+use tracing::{debug, error, info, warn};
 
 use crate::broker::EmbeddedBroker;
 use crate::csv_handler::{CsvReader, CsvWriter, MessageRecord};
 use crate::error::MqttRecorderError;
-use crate::mqtt::MqttClient;
+use crate::mqtt::{AnyMqttClient, MqttClientV5, MqttIncoming};
 use crate::topics::TopicFilter;
 use crate::tui::{AuditArea, AuditSeverity, TuiState};
 
-/// Interval for logging mirrored message count (in number of messages).
-const LOG_INTERVAL: u64 = 100;
+/// Interval for polling broker metrics (in number of messages).
+const METRICS_POLL_INTERVAL: u64 = 100;
+
+fn process_event_impl(event: MqttIncoming) -> Option<MessageRecord> {
+    let (topic, payload, qos, retain) = crate::util::extract_publish(&event)?;
+    let timestamp = Utc::now();
+    let payload_str = String::from_utf8_lossy(payload).to_string();
+    Some(MessageRecord::new(
+        timestamp,
+        topic.to_string(),
+        payload_str,
+        qos,
+        retain,
+    ))
+}
 
 /// Mirror for republishing MQTT messages from an external broker to an embedded broker.
 ///
@@ -76,17 +90,21 @@ const LOG_INTERVAL: u64 = 100;
 /// - **11.9**: Handle interrupt signals for graceful shutdown
 pub struct Mirror {
     /// The MQTT client connected to the external broker (source).
-    source_client: MqttClient,
+    source_client: AnyMqttClient,
     /// The embedded broker instance.
     broker: EmbeddedBroker,
-    /// The MQTT client connected to the embedded broker for publishing.
-    local_client: MqttClient,
+    /// The MQTT v5 client connected to the embedded broker for publishing.
+    local_client: MqttClientV5,
     /// Optional CSV writer for recording messages.
     writer: Option<CsvWriter>,
     /// The topic filter specifying which topics to subscribe to.
     topics: TopicFilter,
     /// The Quality of Service level for subscriptions.
     qos: QoS,
+    /// Optional verify client for subscribing to the embedded broker.
+    verify_client: Option<MqttClientV5>,
+    /// Channel sender for expected messages (used when verify is enabled).
+    verify_tx: Option<tokio::sync::mpsc::UnboundedSender<(String, Vec<u8>)>>,
 }
 
 impl Mirror {
@@ -136,15 +154,25 @@ impl Mirror {
     ///
     /// - **11.2**: Mirror mode requires the embedded broker to be enabled
     pub async fn new(
-        source_client: MqttClient,
+        source_client: AnyMqttClient,
         broker: EmbeddedBroker,
         writer: Option<CsvWriter>,
         topics: TopicFilter,
         qos: QoS,
+        verify: bool,
     ) -> Result<Self, MqttRecorderError> {
         // Get a local client for publishing to the embedded broker
         let local_client = broker.get_local_client().await?;
         broker.register_internal_client();
+
+        // Optionally create a verify client
+        let verify_client = if verify {
+            let client = broker.get_local_client().await?;
+            broker.register_internal_client();
+            Some(client)
+        } else {
+            None
+        };
 
         Ok(Self {
             source_client,
@@ -153,204 +181,266 @@ impl Mirror {
             writer,
             topics,
             qos,
+            verify_client,
+            verify_tx: None,
         })
     }
 
-    /// Runs the mirror loop until a shutdown signal is received.
-    ///
-    /// This method:
-    /// 1. Subscribes to the configured topics on the external broker
-    /// 2. Polls for incoming messages from the external broker
-    /// 3. Republishes each received message to the embedded broker
-    /// 4. Optionally writes each message to the CSV file
-    /// 5. Logs the message count periodically
-    /// 6. Handles graceful shutdown on receiving the shutdown signal
-    /// 7. Logs the total message count on completion
-    ///
-    /// # Arguments
-    ///
-    /// * `shutdown` - A broadcast receiver for the shutdown signal
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(u64)` with the number of messages mirrored on success,
-    /// or an error if mirroring fails.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`MqttRecorderError`] if:
-    /// - Subscription to topics fails
-    /// - Publishing to the embedded broker fails
-    /// - Writing to the CSV file fails
-    /// - The MQTT connection is lost
-    ///
-    /// # Requirements
-    ///
-    /// - **11.3**: Subscribe to topics on the external broker
-    /// - **11.4**: Republish received messages to the embedded broker
-    /// - **11.5**: Optionally record messages to CSV
-    /// - **11.6**: Preserve message topic, payload, QoS, and retain flag
-    /// - **11.8**: Log the number of messages mirrored periodically
-    /// - **11.9**: Handle interrupt signals for graceful shutdown
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use tokio::sync::broadcast;
-    ///
-    /// let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-    /// let mut mirror = Mirror::new(source_client, broker, writer, topics, QoS::AtMostOnce).await?;
-    ///
-    /// // Run in a separate task
-    /// let handle = tokio::spawn(async move {
-    ///     mirror.run(shutdown_rx).await
-    /// });
-    ///
-    /// // Later, trigger shutdown
-    /// shutdown_tx.send(()).unwrap();
-    /// let count = handle.await??;
-    /// println!("Mirrored {} messages", count);
-    /// ```
-    pub async fn run(
-        &mut self,
-        mut shutdown: broadcast::Receiver<()>,
-    ) -> Result<u64, MqttRecorderError> {
-        // Subscribe to the configured topics on the external broker (Requirement 11.3, 11.7)
-        let topics = self.topics.topics();
-        if !topics.is_empty() {
-            self.source_client.subscribe(topics, self.qos).await?;
-            eprintln!("Subscribed to {} topic(s) on external broker", topics.len());
-        }
-
-        // Initial connection to local broker - poll once to establish connection
-        match self.local_client.poll().await {
-            Ok(_) => eprintln!("Connected to embedded broker for publishing"),
-            Err(e) => {
-                // Log but continue - connection might be established on first publish
-                eprintln!("Initial local broker connection status: {}", e);
-            }
-        }
-
-        let mut message_count: u64 = 0;
-        let mut flush_counter: u64 = 0;
-
-        eprintln!(
-            "Mirror mode started. Recording to file: {}",
-            if self.writer.is_some() { "yes" } else { "no" }
-        );
-
-        loop {
-            tokio::select! {
-                // Check for shutdown signal
-                _ = shutdown.recv() => {
-                    eprintln!("Shutdown signal received, stopping mirror...");
-                    break;
-                }
-
-                // Poll for MQTT events from the source broker
-                event_result = self.source_client.poll() => {
-                    match event_result {
-                        Ok(event) => {
-                            // Re-subscribe on reconnection
-                            if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-                                let topics = self.topics.topics();
-                                if !topics.is_empty() {
-                                    if let Err(e) = self.source_client.subscribe(topics, self.qos).await {
-                                        eprintln!("Error re-subscribing after reconnect: {}", e);
-                                    }
-                                }
+    fn spawn_local_poll_task(
+        &self,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let local_eventloop = self.local_client.eventloop();
+        let broker_port = self.broker.port();
+        let tui_state_bg = tui_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            let mut connected = false;
+            loop {
+                let mut el = local_eventloop.lock().await;
+                match el.poll().await {
+                    Ok(event) => {
+                        if matches!(
+                            event,
+                            rumqttc::v5::Event::Incoming(rumqttc::v5::Incoming::ConnAck(_))
+                        ) {
+                            let label = if connected {
+                                "Reconnected"
+                            } else {
+                                "Connected"
+                            };
+                            let severity = if connected {
+                                AuditSeverity::Warn
+                            } else {
+                                AuditSeverity::Info
+                            };
+                            if let Some(ref state) = tui_state_bg {
+                                state.push_audit(
+                                    AuditArea::Broker,
+                                    severity,
+                                    format!("Local client: {} to localhost:{}", label, broker_port),
+                                );
                             }
-                            if let Some(record) = self.process_event(event) {
-                                // Republish to embedded broker (Requirements 11.4, 11.6)
-                                if let Err(e) = self.republish_message(&record).await {
-                                    eprintln!("Error republishing message: {}", e);
-                                    if Self::is_fatal_error(&e) {
-                                        return Err(e);
+                            connected = true;
+                        }
+                    }
+                    Err(e) => {
+                        if connected {
+                            if let Some(ref state) = tui_state_bg {
+                                state.push_audit(
+                                    AuditArea::Broker,
+                                    AuditSeverity::Warn,
+                                    format!("Local client disconnected: {}", e),
+                                );
+                            }
+                            connected = false;
+                        } else if let Some(ref state) = tui_state_bg {
+                            state.push_audit(
+                                AuditArea::Broker,
+                                AuditSeverity::Error,
+                                format!("Local client: {}", e),
+                            );
+                        }
+                        drop(el);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(
+                            crate::util::RETRY_DELAY_SECS,
+                        ))
+                        .await;
+                    }
+                }
+            }
+        })
+    }
+
+    async fn spawn_verify_task(
+        &mut self,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+    ) -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        Option<tokio::task::JoinHandle<()>>,
+        Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        let verify_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (verify_handle, verify_shutdown_tx) = if let Some(verify_client) =
+            self.verify_client.take()
+        {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<u8>)>();
+            self.verify_tx = Some(tx);
+            let tui_state_vfy = tui_state.clone();
+            let vfy_port = self.broker.port();
+
+            // Subscribe verify client to all topics
+            if let Err(e) = verify_client
+                .subscribe(&["#".to_string()], QoS::AtMostOnce)
+                .await
+            {
+                if let Some(ref state) = tui_state_vfy {
+                    state.push_audit(
+                        AuditArea::Verify,
+                        AuditSeverity::Error,
+                        format!("Verify subscribe failed: {}", e),
+                    );
+                }
+            } else if let Some(ref state) = tui_state_vfy {
+                state.push_audit(
+                    AuditArea::Verify,
+                    AuditSeverity::Info,
+                    format!("Verify subscriber connected to localhost:{}", vfy_port),
+                );
+            }
+
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let verify_eventloop = verify_client.eventloop();
+            let verify_ready_tx = verify_ready.clone();
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                let mut pending: std::collections::VecDeque<(String, Vec<u8>)> =
+                    std::collections::VecDeque::new();
+                let mut ready = false;
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    let mut el = verify_eventloop.lock().await;
+                    match tokio::time::timeout(tokio::time::Duration::from_millis(50), el.poll())
+                        .await
+                    {
+                        Ok(Ok(event)) => {
+                            drop(el);
+                            while let Ok(msg) = rx.try_recv() {
+                                pending.push_back(msg);
+                            }
+                            if let rumqttc::v5::Event::Incoming(
+                                rumqttc::v5::mqttbytes::v5::Packet::Publish(p),
+                            ) = event
+                            {
+                                // Signal ready on first publish so source starts sending expected messages
+                                if !ready {
+                                    ready = true;
+                                    verify_ready_tx.store(true, Ordering::Relaxed);
+                                    if let Some(ref state) = tui_state_vfy {
+                                        state.push_audit(
+                                            AuditArea::Verify,
+                                            AuditSeverity::Info,
+                                            "Verify active — first message received".to_string(),
+                                        );
+                                    }
+                                    // Skip this message — source hasn't started sending expected yet
+                                    continue;
+                                }
+                                // Skip messages that arrive before source has sent any expected
+                                if pending.is_empty() {
+                                    // Drain channel one more time in case source just sent
+                                    while let Ok(msg) = rx.try_recv() {
+                                        pending.push_back(msg);
+                                    }
+                                    if pending.is_empty() {
+                                        continue;
                                     }
                                 }
-
-                                // Optionally write to CSV (Requirement 11.5)
-                                if let Some(ref mut writer) = self.writer {
-                                    writer.write(&record)?;
-                                    flush_counter += 1;
-
-                                    // Periodic flush for data persistence
-                                    if flush_counter >= LOG_INTERVAL {
-                                        writer.flush()?;
-                                        flush_counter = 0;
+                                let topic = String::from_utf8_lossy(&p.topic).into_owned();
+                                let payload = p.payload.to_vec();
+                                // 1) Exact match (topic + payload bytes)
+                                let exact = pending
+                                    .iter()
+                                    .position(|(t, p)| t == &topic && p == &payload);
+                                if let Some(i) = exact {
+                                    pending.remove(i);
+                                    if let Some(ref state) = tui_state_vfy {
+                                        state.increment_verify_matched();
                                     }
-                                }
-
-                                message_count += 1;
-
-                                // Poll local client to process any pending events
-                                if let Err(e) = self.poll_local_events().await {
-                                    if Self::is_fatal_error(&e) {
-                                        return Err(e);
-                                    }
-                                }
-
-                                // Poll broker metrics periodically
-                                if message_count.is_multiple_of(LOG_INTERVAL) {
-                                    if let Some((old, new)) = self.broker.poll_metrics() {
-                                        eprintln!("Broker connections: {} → {}", old, new);
+                                } else {
+                                    // 2) Topic match but payload differs
+                                    let topic_match = pending.iter().position(|(t, _)| t == &topic);
+                                    if let Some(ref state) = tui_state_vfy {
+                                        state.increment_verify_mismatched();
+                                        if let Some(i) = topic_match {
+                                            let expected = &pending[i].1;
+                                            state.push_audit(AuditArea::Verify, AuditSeverity::Warn,
+                                                format!("PAYLOAD MISMATCH on {}: expected {} bytes got {} bytes\n  expected: {}\n  received: {}",
+                                                    topic, expected.len(), payload.len(),
+                                                    crate::util::format_payload_preview(expected),
+                                                    crate::util::format_payload_preview(&payload)));
+                                            pending.remove(i);
+                                        } else {
+                                            // 3) No topic match at all — truly unexpected
+                                            state.push_audit(
+                                                AuditArea::Verify,
+                                                AuditSeverity::Warn,
+                                                format!(
+                                                    "UNEXPECTED on broker: {} ({} bytes): {}",
+                                                    topic,
+                                                    payload.len(),
+                                                    crate::util::format_payload_preview(&payload)
+                                                ),
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            eprintln!("MQTT error from source broker: {}", e);
-                            if Self::is_fatal_error(&e) {
-                                return Err(e);
+                        Ok(Err(_)) => {
+                            drop(el);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(
+                                crate::util::RETRY_DELAY_SECS,
+                            ))
+                            .await;
+                        }
+                        Err(_) => {
+                            drop(el);
+                            while let Ok(msg) = rx.try_recv() {
+                                pending.push_back(msg);
                             }
                         }
                     }
                 }
-            }
-        }
-
-        // Final flush before closing (Requirement 11.5)
-        if let Some(ref mut writer) = self.writer {
-            writer.flush()?;
-        }
-
-        // Disconnect from the source broker (Requirement 11.9)
-        if let Err(e) = self.source_client.disconnect().await {
-            eprintln!("Warning: Error disconnecting from source broker: {}", e);
-        }
-
-        // Disconnect local client
-        if let Err(e) = self.local_client.disconnect().await {
-            eprintln!("Warning: Error disconnecting local client: {}", e);
-        }
-
-        // Shutdown the embedded broker (Requirement 11.9)
-        // Note: We need to take ownership of the broker to shut it down
-        // Since we can't move out of self, we'll just log the shutdown intent
-        // The actual broker shutdown will happen when Mirror is dropped
-        eprintln!("Shutting down embedded broker...");
-
-        // Log message count on completion
-        eprintln!("Mirror complete. {} messages mirrored.", message_count);
-
-        Ok(message_count)
+                // Report remaining pending as missing
+                if !pending.is_empty() {
+                    if let Some(ref state) = tui_state_vfy {
+                        state.add_verify_missing(pending.len() as u64);
+                        for (topic, payload) in pending.iter().take(20) {
+                            state.push_audit(
+                                AuditArea::Verify,
+                                AuditSeverity::Warn,
+                                format!(
+                                    "MISSING from broker: {} ({} bytes): {}",
+                                    topic,
+                                    payload.len(),
+                                    crate::util::format_payload_preview(payload)
+                                ),
+                            );
+                        }
+                        if pending.len() > 20 {
+                            state.push_audit(
+                                AuditArea::Verify,
+                                AuditSeverity::Warn,
+                                format!("... and {} more missing messages", pending.len() - 20),
+                            );
+                        }
+                    }
+                }
+            });
+            (Some(handle), Some(stop_tx))
+        } else {
+            (None, None)
+        };
+        (verify_ready, verify_handle, verify_shutdown_tx)
     }
 
     /// Runs the mirror loop with TUI state support for record/passthrough toggle.
     ///
-    /// This method is similar to `run` but checks the TUI state to determine
+    /// This method is similar to the basic run but checks the TUI state to determine
     /// whether to record messages to CSV. Messages are always republished to
     /// the embedded broker regardless of the TUI mode.
     ///
     /// - `AppMode::Record` - Republish AND write to CSV
     /// - `AppMode::Passthrough` - Republish only (no CSV)
     /// - Other modes - Same as Passthrough
-    pub async fn run_with_tui(
+    pub async fn run(
         &mut self,
         mut shutdown: broadcast::Receiver<()>,
         tui_state: Option<std::sync::Arc<TuiState>>,
     ) -> Result<u64, MqttRecorderError> {
-        let tui_active = tui_state.is_some();
         let topics = self.topics.topics();
         if !topics.is_empty() {
             self.source_client.subscribe(topics, self.qos).await?;
@@ -358,40 +448,29 @@ impl Mirror {
             if let Some(ref state) = tui_state {
                 state.set_source_connected(true);
             }
-            if !tui_active {
-                eprintln!("Subscribed to {} topic(s) on external broker", topics.len());
-            }
+            info!("Subscribed to {} topic(s) on external broker", topics.len());
         }
 
-        match self.local_client.poll().await {
-            Ok(_) => {
-                if !tui_active {
-                    eprintln!("Connected to embedded broker for publishing")
-                }
-            }
-            Err(e) => {
-                if !tui_active {
-                    eprintln!("Initial local broker connection status: {}", e)
-                }
-            }
-        }
+        // Spawn background task to drive the local client event loop
+        let local_poll_handle = self.spawn_local_poll_task(&tui_state);
 
+        let (verify_ready, verify_handle, verify_shutdown_tx) =
+            self.spawn_verify_task(&tui_state).await;
         let mut message_count: u64 = 0;
         let mut flush_counter: u64 = 0;
 
-        if !tui_active {
-            eprintln!(
-                "Mirror mode started. Recording to file: {}",
-                if self.writer.is_some() {
-                    "yes (toggleable)"
-                } else {
-                    "no"
-                }
-            );
-        }
+        info!(
+            "Mirror mode started. Recording to file: {}",
+            if self.writer.is_some() {
+                "yes (toggleable)"
+            } else {
+                "no"
+            }
+        );
 
         let mut playback_reader: Option<CsvReader> = None;
         let mut was_playback_on = false;
+        let mut was_recording = tui_state.as_ref().map(|s| s.is_recording()).unwrap_or(true);
 
         loop {
             if let Some(ref state) = tui_state {
@@ -406,69 +485,17 @@ impl Mirror {
                 .map(|s| s.loop_enabled.load(Ordering::Relaxed) && !s.is_recording())
                 .unwrap_or(false);
 
-            if playback_on && !was_playback_on {
-                if let Some(ref state) = tui_state {
-                    if let Some(file_path) = state.get_active_file() {
-                        match CsvReader::new(Path::new(&file_path), false, None) {
-                            Ok(reader) => playback_reader = Some(reader),
-                            Err(e) => {
-                                state.push_audit(AuditArea::Playback, AuditSeverity::Error, format!(
-                                    "Failed to open file: {}", e
-                                ));
-                            }
-                        }
-                    }
-                }
-            } else if !playback_on && was_playback_on {
-                playback_reader = None;
-            }
-            was_playback_on = playback_on;
+            was_playback_on = self.handle_playback_transition(
+                &tui_state,
+                &mut playback_reader,
+                playback_on,
+                was_playback_on,
+            );
 
             // Process one playback record if active
-            if let Some(ref mut reader) = playback_reader {
-                match reader.read_next() {
-                    Some(Ok(record)) => {
-                        match self.republish_message(&record).await {
-                            Ok(()) => {
-                                if let Some(ref state) = tui_state {
-                                    state.increment_replayed();
-                                    state.increment_published();
-                                }
-                            }
-                            Err(e) => {
-                                if !tui_active {
-                                    eprintln!("Playback publish error: {}", e);
-                                }
-                                if Self::is_fatal_error(&e) {
-                                    return Err(e);
-                                }
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        if let Some(ref state) = tui_state {
-                            state.push_audit(AuditArea::Playback, AuditSeverity::Warn, format!(
-                                "Skipped bad CSV record: {}", e
-                            ));
-                        }
-                        // Skip bad record, continue playback
-                    }
-                    None => {
-                        // End of file - loop or stop
-                        if playback_on {
-                            if let Err(e) = reader.reset() {
-                                if let Some(ref state) = tui_state {
-                                    state.push_audit(AuditArea::Playback, AuditSeverity::Error, format!(
-                                        "Failed to reset reader: {}", e
-                                    ));
-                                }
-                                playback_reader = None;
-                            }
-                        } else {
-                            playback_reader = None;
-                        }
-                    }
-                }
+            if playback_reader.is_some() {
+                self.process_playback_record(&mut playback_reader, &tui_state, &verify_ready)
+                    .await?;
             }
 
             // Check if source is enabled (pause incoming messages)
@@ -477,8 +504,6 @@ impl Mirror {
                 .map(|s| s.is_source_enabled())
                 .unwrap_or(true);
             if !source_enabled {
-                // Still need to poll local client for playback publishes
-                let _ = self.poll_local_events().await;
                 tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                 continue;
             }
@@ -495,118 +520,15 @@ impl Mirror {
                 event_result = self.source_client.poll() => {
                     match event_result {
                         Ok(event) => {
-                            // Re-subscribe on reconnection
-                            if matches!(event, Event::Incoming(Packet::ConnAck(_))) {
-                                let topics = self.topics.topics();
-                                if !topics.is_empty() {
-                                    if let Err(e) = self.source_client.subscribe(topics, self.qos).await {
-                                        if !tui_active {
-                                            eprintln!("Error re-subscribing after reconnect: {}", e);
-                                        }
-                                    }
-                                }
-                                if let Some(ref state) = tui_state {
-                                    state.set_source_connected(true);
-                                }
-                            }
-                            if let Some(record) = self.process_event(event) {
-                                // Check if mirroring is enabled
-                                let should_mirror = tui_state
-                                    .as_ref()
-                                    .map(|s| s.is_mirroring())
-                                    .unwrap_or(true);
-
-                                if should_mirror {
-                                    if let Err(e) = self.republish_message(&record).await {
-                                        if !tui_active {
-                                            eprintln!("Error republishing message: {}", e);
-                                        }
-                                        if Self::is_fatal_error(&e) {
-                                            return Err(e);
-                                        }
-                                    } else if let Some(ref state) = tui_state {
-                                        state.increment_mirrored();
-                                        state.increment_published();
-                                    }
-                                }
-
-                                // Check for file path change
-                                if let Some(ref state) = tui_state {
-                                    if let Some(new_path) = state.take_new_file() {
-                                        // Flush and close old writer
-                                        if let Some(ref mut writer) = self.writer {
-                                            let _ = writer.flush();
-                                        }
-                                        // Create new writer
-                                        match CsvWriter::new(std::path::Path::new(&new_path), false) {
-                                            Ok(new_writer) => {
-                                                self.writer = Some(new_writer);
-                                            }
-                                            Err(e) => {
-                                                if !tui_active {
-                                                    eprintln!("Error creating new file: {}", e);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Check if recording is enabled
-                                let should_record = tui_state
-                                    .as_ref()
-                                    .map(|s| s.is_recording())
-                                    .unwrap_or(true);
-
-                                if should_record {
-                                    if let Some(ref mut writer) = self.writer {
-                                        writer.write(&record)?;
-                                        flush_counter += 1;
-
-                                        if let Some(ref state) = tui_state {
-                                            state.increment_recorded();
-                                        }
-
-                                        if flush_counter >= LOG_INTERVAL {
-                                            writer.flush()?;
-                                            flush_counter = 0;
-                                        }
-                                    }
-                                }
-
-                                message_count += 1;
-
-                                if let Some(ref state) = tui_state {
-                                    state.increment_received();
-                                }
-
-                                if let Err(e) = self.poll_local_events().await {
-                                    if Self::is_fatal_error(&e) {
-                                        return Err(e);
-                                    }
-                                }
-
-                                // Poll broker metrics periodically
-                                if message_count.is_multiple_of(LOG_INTERVAL) {
-                                    if let Some((old, new)) = self.broker.poll_metrics() {
-                                        if let Some(ref state) = tui_state {
-                                            state.set_broker_connections(new);
-                                        }
-                                        if !tui_active {
-                                            eprintln!("Broker connections: {} → {}", old, new);
-                                        }
-                                    }
-                                }
-                            }
+                            self.handle_source_event(event, &tui_state, &verify_ready, &mut message_count, &mut flush_counter, &mut was_recording).await?;
                         }
                         Err(e) => {
                             if let Some(ref state) = tui_state {
                                 state.push_audit(AuditArea::Source, AuditSeverity::Error, format!("{}", e));
                                 state.set_source_connected(false);
                             }
-                            if !tui_active {
-                                eprintln!("MQTT error from source broker: {}", e);
-                            }
-                            if Self::is_fatal_error(&e) {
+                            warn!("MQTT error from source broker: {}", e);
+                            if crate::util::is_fatal_error(&e, true) {
                                 return Err(e);
                             }
                         }
@@ -615,7 +537,25 @@ impl Mirror {
             }
         }
 
-        // Mark disconnected on exit
+        self.shutdown(
+            &tui_state,
+            local_poll_handle,
+            verify_shutdown_tx,
+            verify_handle,
+            message_count,
+        )
+        .await
+    }
+
+    /// Flush writer, abort background tasks, disconnect clients, and log summary.
+    async fn shutdown(
+        &mut self,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        local_poll_handle: tokio::task::JoinHandle<()>,
+        verify_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        verify_handle: Option<tokio::task::JoinHandle<()>>,
+        message_count: u64,
+    ) -> Result<u64, MqttRecorderError> {
         if let Some(ref state) = tui_state {
             state.set_source_connected(false);
         }
@@ -624,24 +564,330 @@ impl Mirror {
             writer.flush()?;
         }
 
-        if let Err(e) = self.source_client.disconnect().await {
-            if !tui_active {
-                eprintln!("Warning: Error disconnecting from source broker: {}", e);
+        local_poll_handle.abort();
+
+        if let Some(stop_tx) = verify_shutdown_tx {
+            drop(self.verify_tx.take());
+            let _ = stop_tx.send(());
+            if let Some(handle) = verify_handle {
+                if tokio::time::timeout(
+                    tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
+                    handle,
+                )
+                .await
+                .is_err()
+                {
+                    warn!("Verify task shutdown timed out");
+                }
+            }
+            if let Some(ref state) = tui_state {
+                let matched = state.get_verify_matched();
+                let mismatched = state.get_verify_mismatched();
+                let missing = state.get_verify_missing();
+                state.push_audit(
+                    AuditArea::Verify,
+                    AuditSeverity::Info,
+                    format!(
+                        "Verify summary: {} matched, {} unexpected, {} missing",
+                        matched, mismatched, missing
+                    ),
+                );
             }
         }
 
-        if let Err(e) = self.local_client.disconnect().await {
-            if !tui_active {
-                eprintln!("Warning: Error disconnecting local client: {}", e);
-            }
+        if tokio::time::timeout(
+            tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
+            self.source_client.disconnect(),
+        )
+        .await
+        .is_err()
+        {
+            warn!("Source client disconnect timed out");
         }
 
-        if !tui_active {
-            eprintln!("Shutting down embedded broker...");
-            eprintln!("Mirror complete. {} messages mirrored.", message_count);
+        if tokio::time::timeout(
+            tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
+            self.local_client.disconnect(),
+        )
+        .await
+        .is_err()
+        {
+            warn!("Local client disconnect timed out");
         }
+
+        info!("Shutting down embedded broker...");
+        info!("Mirror complete. {} messages mirrored.", message_count);
 
         Ok(message_count)
+    }
+
+    fn handle_playback_transition(
+        &self,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        playback_reader: &mut Option<CsvReader>,
+        playback_on: bool,
+        was_playback_on: bool,
+    ) -> bool {
+        if playback_on && !was_playback_on {
+            if let Some(ref state) = tui_state {
+                if let Some(file_path) = state.get_active_file() {
+                    info!("Playback starting: {}", file_path);
+                    match CsvReader::new(Path::new(&file_path), false, None) {
+                        Ok(reader) => *playback_reader = Some(reader),
+                        Err(e) => {
+                            state.push_audit(
+                                AuditArea::Playback,
+                                AuditSeverity::Error,
+                                format!("Failed to open file: {}", e),
+                            );
+                        }
+                    }
+                }
+            }
+        } else if playback_on && playback_reader.is_none() {
+            // Restart after one-time completion (playback_finished was cleared)
+            let finished = tui_state
+                .as_ref()
+                .map(|s| s.is_playback_finished())
+                .unwrap_or(true);
+            if !finished {
+                if let Some(ref state) = tui_state {
+                    if let Some(file_path) = state.get_active_file() {
+                        match CsvReader::new(Path::new(&file_path), false, None) {
+                            Ok(reader) => *playback_reader = Some(reader),
+                            Err(e) => {
+                                state.push_audit(
+                                    AuditArea::Playback,
+                                    AuditSeverity::Error,
+                                    format!("Failed to open file: {}", e),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } else if !playback_on && was_playback_on {
+            *playback_reader = None;
+        }
+        playback_on
+    }
+
+    async fn process_playback_record(
+        &self,
+        playback_reader: &mut Option<CsvReader>,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        verify_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), MqttRecorderError> {
+        if let Some(ref mut reader) = playback_reader {
+            match reader.read_next() {
+                Some(Ok(record)) => {
+                    if verify_ready.load(Ordering::Relaxed) {
+                        if let Some(ref tx) = self.verify_tx {
+                            let _ =
+                                tx.send((record.topic.clone(), record.payload.as_bytes().to_vec()));
+                        }
+                    }
+                    match self.republish_message(&record).await {
+                        Ok(()) => {
+                            if let Some(ref state) = tui_state {
+                                state.increment_replayed();
+                                state.increment_published();
+                            }
+                        }
+                        Err(e) => {
+                            error!("Playback publish error: {}", e);
+                            if crate::util::is_fatal_error(&e, true) {
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+                Some(Err(e)) => {
+                    if let Some(ref state) = tui_state {
+                        state.push_audit(
+                            AuditArea::Playback,
+                            AuditSeverity::Warn,
+                            format!("Skipped bad CSV record: {}", e),
+                        );
+                    }
+                    // Skip bad record, continue playback
+                }
+                None => {
+                    // End of file - loop or stop based on mode
+                    let looping = tui_state
+                        .as_ref()
+                        .map(|s| s.is_playback_looping())
+                        .unwrap_or(false);
+                    if looping {
+                        if let Err(e) = reader.reset() {
+                            if let Some(ref state) = tui_state {
+                                state.push_audit(
+                                    AuditArea::Playback,
+                                    AuditSeverity::Error,
+                                    format!("Failed to reset reader: {}", e),
+                                );
+                            }
+                            *playback_reader = None;
+                        }
+                    } else {
+                        // One-time mode: mark finished
+                        if let Some(ref state) = tui_state {
+                            state.playback_finished.store(true, Ordering::Relaxed);
+                            let session = state.get_playback_session_count();
+                            let total = state.get_replayed_count();
+                            state.push_audit(
+                                AuditArea::Playback,
+                                AuditSeverity::Info,
+                                format!(
+                                    "Playback complete ({} this session, {} total)",
+                                    session, total
+                                ),
+                            );
+                        }
+                        *playback_reader = None;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles recording logic including file path changes and recording toggles.
+    fn handle_recording(
+        &mut self,
+        record: &MessageRecord,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        flush_counter: &mut u64,
+        was_recording: &mut bool,
+    ) -> Result<(), MqttRecorderError> {
+        // Check for file path change
+        if let Some(ref state) = tui_state {
+            if let Some(new_path) = state.take_new_file() {
+                // Flush and close old writer
+                if let Some(ref mut writer) = self.writer {
+                    let _ = writer.flush();
+                }
+                // Create new writer
+                match CsvWriter::new(std::path::Path::new(&new_path), false) {
+                    Ok(new_writer) => {
+                        self.writer = Some(new_writer);
+                    }
+                    Err(e) => {
+                        error!("Error creating new file: {}", e);
+                    }
+                }
+            }
+        }
+
+        // Check if recording is enabled
+        let should_record = tui_state.as_ref().map(|s| s.is_recording()).unwrap_or(true);
+
+        // Flush on recording toggle off
+        if *was_recording && !should_record {
+            if let Some(ref mut writer) = self.writer {
+                let _ = writer.flush();
+            }
+        }
+        *was_recording = should_record;
+
+        if should_record {
+            if let Some(ref mut writer) = self.writer {
+                writer.write(record)?;
+                *flush_counter += 1;
+
+                if let Some(ref state) = tui_state {
+                    state.increment_recorded();
+                }
+
+                if *flush_counter >= crate::util::FLUSH_INTERVAL {
+                    writer.flush()?;
+                    *flush_counter = 0;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_source_event(
+        &mut self,
+        event: MqttIncoming,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        verify_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        message_count: &mut u64,
+        flush_counter: &mut u64,
+        was_recording: &mut bool,
+    ) -> Result<(), MqttRecorderError> {
+        // Re-subscribe on reconnection
+        if matches!(event, MqttIncoming::ConnAck) {
+            let topics = self.topics.topics();
+            if !topics.is_empty() {
+                if let Err(e) = self.source_client.subscribe(topics, self.qos).await {
+                    if let Some(ref state) = tui_state {
+                        state.push_audit(
+                            AuditArea::Source,
+                            AuditSeverity::Error,
+                            format!("Re-subscribe failed: {}", e),
+                        );
+                    }
+                    error!("Error re-subscribing after reconnect: {}", e);
+                }
+            }
+            if let Some(ref state) = tui_state {
+                state.set_source_connected(true);
+            }
+        }
+        if let Some(record) = self.process_event(event) {
+            // Check if mirroring is enabled
+            let should_mirror = tui_state.as_ref().map(|s| s.is_mirroring()).unwrap_or(true);
+
+            if should_mirror {
+                // Queue expected message BEFORE publishing so verify
+                // subscriber can't receive it before it's in the pending queue
+                if verify_ready.load(Ordering::Relaxed) {
+                    if let Some(ref tx) = self.verify_tx {
+                        let _ = tx.send((record.topic.clone(), record.payload.as_bytes().to_vec()));
+                    }
+                }
+                if let Err(e) = self.republish_message(&record).await {
+                    if let Some(ref state) = tui_state {
+                        state.push_audit(
+                            AuditArea::Mirror,
+                            AuditSeverity::Error,
+                            format!("Publish failed: {}", e),
+                        );
+                    }
+                    error!("Error republishing message: {}", e);
+                    if crate::util::is_fatal_error(&e, true) {
+                        return Err(e);
+                    }
+                } else if let Some(ref state) = tui_state {
+                    state.increment_mirrored();
+                    state.increment_published();
+                }
+            }
+
+            self.handle_recording(&record, tui_state, flush_counter, was_recording)?;
+
+            *message_count += 1;
+
+            if let Some(ref state) = tui_state {
+                state.increment_received();
+            }
+
+            // Poll broker metrics periodically
+            if *message_count % METRICS_POLL_INTERVAL == 0 {
+                if let Some(metrics) = self.broker.poll_metrics() {
+                    if let Some(ref state) = tui_state {
+                        state.update_broker_metrics(&metrics);
+                    }
+                    if let Some((old, new)) = metrics.connections_changed {
+                        debug!("Broker connections: {} → {}", old, new);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Processes an MQTT event and extracts a message record if applicable.
@@ -657,34 +903,8 @@ impl Mirror {
     ///
     /// Returns `Some(MessageRecord)` if the event contains a publish message,
     /// or `None` for other event types.
-    fn process_event(&self, event: Event) -> Option<MessageRecord> {
-        match event {
-            Event::Incoming(Packet::Publish(publish)) => {
-                // Extract message details (Requirement 11.6)
-                let timestamp = Utc::now();
-                let topic = publish.topic.clone();
-
-                // Convert payload bytes to string
-                // If the payload is not valid UTF-8, use lossy conversion
-                let payload = String::from_utf8_lossy(&publish.payload).to_string();
-
-                // Map rumqttc QoS to u8
-                let qos = match publish.qos {
-                    QoS::AtMostOnce => 0,
-                    QoS::AtLeastOnce => 1,
-                    QoS::ExactlyOnce => 2,
-                };
-
-                let retain = publish.retain;
-
-                Some(MessageRecord::new(timestamp, topic, payload, qos, retain))
-            }
-            // Log connection events for debugging (only in non-TUI mode)
-            Event::Incoming(Packet::ConnAck(_)) => None,
-            Event::Incoming(Packet::SubAck(_)) => None,
-            // Ignore other events
-            _ => None,
-        }
+    fn process_event(&self, event: MqttIncoming) -> Option<MessageRecord> {
+        process_event_impl(event)
     }
 
     /// Republishes a message record to the embedded broker.
@@ -706,88 +926,15 @@ impl Mirror {
     /// - **11.6**: Preserve message topic, payload, QoS, and retain flag
     async fn republish_message(&self, record: &MessageRecord) -> Result<(), MqttRecorderError> {
         // Convert QoS u8 to rumqttc QoS enum
-        let qos = Self::u8_to_qos(record.qos);
+        let qos = crate::util::u8_to_qos(record.qos);
 
         // Publish with preserved topic, payload, QoS, and retain flag
+        // The message is queued internally; the local event loop select branch drains it.
         self.local_client
             .publish(&record.topic, record.payload.as_bytes(), qos, record.retain)
             .await?;
 
-        // Poll to actually send the message - rumqttc queues publishes until polled
-        let _ = self.local_client.poll().await;
-
         Ok(())
-    }
-
-    /// Polls the local MQTT event loop to process pending events.
-    ///
-    /// This is needed to maintain the connection to the embedded broker
-    /// and handle acknowledgments.
-    async fn poll_local_events(&self) -> Result<(), MqttRecorderError> {
-        // Use a short timeout to avoid blocking
-        match tokio::time::timeout(
-            tokio::time::Duration::from_millis(10),
-            self.local_client.poll(),
-        )
-        .await
-        {
-            Ok(result) => result.map(|_| ()),
-            Err(_) => Ok(()), // Timeout is fine, just means no events pending
-        }
-    }
-
-    /// Converts a u8 QoS value to rumqttc QoS enum.
-    ///
-    /// # Arguments
-    ///
-    /// * `qos` - The QoS value as u8 (0, 1, or 2)
-    ///
-    /// # Returns
-    ///
-    /// The corresponding rumqttc QoS enum value.
-    /// Defaults to `QoS::AtMostOnce` for invalid values.
-    fn u8_to_qos(qos: u8) -> QoS {
-        match qos {
-            0 => QoS::AtMostOnce,
-            1 => QoS::AtLeastOnce,
-            2 => QoS::ExactlyOnce,
-            _ => QoS::AtMostOnce, // Default to QoS 0 for invalid values
-        }
-    }
-
-    /// Determines if an error is fatal and should stop mirroring.
-    ///
-    /// Some errors are recoverable (e.g., temporary network issues),
-    /// while others indicate a permanent failure.
-    ///
-    /// # Arguments
-    ///
-    /// * `error` - The error to check
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` if the error is fatal and mirroring should stop.
-    fn is_fatal_error(error: &MqttRecorderError) -> bool {
-        match error {
-            // Connection errors are recoverable (rumqttc auto-reconnects)
-            MqttRecorderError::Connection(_) => false,
-            // Client errors might be recoverable
-            MqttRecorderError::Client(_) => false,
-            // IO errors are fatal
-            MqttRecorderError::Io(_) => true,
-            // CSV errors are fatal
-            MqttRecorderError::Csv(_) => true,
-            // Other errors
-            _ => false,
-        }
-    }
-
-    /// Gets a reference to the embedded broker.
-    ///
-    /// This can be useful for checking the broker's mode or port.
-    #[allow(dead_code)]
-    pub fn broker(&self) -> &EmbeddedBroker {
-        &self.broker
     }
 
     /// Consumes the Mirror and returns the embedded broker for shutdown.
@@ -806,76 +953,151 @@ impl Mirror {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_u8_to_qos_valid_values() {
-        assert!(matches!(Mirror::u8_to_qos(0), QoS::AtMostOnce));
-        assert!(matches!(Mirror::u8_to_qos(1), QoS::AtLeastOnce));
-        assert!(matches!(Mirror::u8_to_qos(2), QoS::ExactlyOnce));
-    }
-
-    #[test]
-    fn test_u8_to_qos_invalid_values() {
-        // Invalid values should default to QoS 0
-        assert!(matches!(Mirror::u8_to_qos(3), QoS::AtMostOnce));
-        assert!(matches!(Mirror::u8_to_qos(255), QoS::AtMostOnce));
-    }
-
-    #[test]
-    fn test_is_fatal_error() {
-        // IO errors should be fatal
-        let io_error = MqttRecorderError::Io(std::io::Error::other("test"));
-        assert!(Mirror::is_fatal_error(&io_error));
-
-        // CSV errors should be fatal
-        let csv_error = MqttRecorderError::Csv(csv::Error::from(std::io::Error::other("test")));
-        assert!(Mirror::is_fatal_error(&csv_error));
-
-        // TLS errors should not be fatal (they occur during setup, not mirroring)
-        let tls_error = MqttRecorderError::Tls("test".to_string());
-        assert!(!Mirror::is_fatal_error(&tls_error));
-
-        // Broker errors should not be fatal
-        let broker_error = MqttRecorderError::Broker("test".to_string());
-        assert!(!Mirror::is_fatal_error(&broker_error));
-
-        // Invalid argument errors should not be fatal during mirroring
-        let arg_error = MqttRecorderError::InvalidArgument("test".to_string());
-        assert!(!Mirror::is_fatal_error(&arg_error));
-    }
-
-    #[test]
-    fn test_qos_conversion() {
-        // Test that QoS values are correctly mapped
-        assert_eq!(
-            match QoS::AtMostOnce {
-                QoS::AtMostOnce => 0u8,
-                QoS::AtLeastOnce => 1u8,
-                QoS::ExactlyOnce => 2u8,
-            },
-            0
-        );
-        assert_eq!(
-            match QoS::AtLeastOnce {
-                QoS::AtMostOnce => 0u8,
-                QoS::AtLeastOnce => 1u8,
-                QoS::ExactlyOnce => 2u8,
-            },
-            1
-        );
-        assert_eq!(
-            match QoS::ExactlyOnce {
-                QoS::AtMostOnce => 0u8,
-                QoS::AtLeastOnce => 1u8,
-                QoS::ExactlyOnce => 2u8,
-            },
-            2
-        );
-    }
+    use crate::mqtt::MqttIncoming;
+    use rumqttc::QoS as RumqttcQoS;
 
     #[test]
     fn test_log_interval_constant() {
-        // Verify the log interval is set to a reasonable value
-        assert_eq!(LOG_INTERVAL, 100);
+        // Verify the metrics poll interval is set to a reasonable value
+        assert_eq!(METRICS_POLL_INTERVAL, 100);
+    }
+
+    #[test]
+    fn test_process_event_publish() {
+        let event = MqttIncoming::Publish {
+            topic: "test/topic".to_string(),
+            payload: vec![104, 101, 108, 108, 111],
+            qos: RumqttcQoS::AtLeastOnce,
+            retain: true,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.topic, "test/topic");
+        assert_eq!(record.payload, "hello");
+        assert_eq!(record.qos, 1);
+        assert!(record.retain);
+    }
+
+    #[test]
+    fn test_process_event_connack() {
+        assert!(process_event_impl(MqttIncoming::ConnAck).is_none());
+    }
+
+    #[test]
+    fn test_process_event_other() {
+        assert!(process_event_impl(MqttIncoming::Other).is_none());
+    }
+
+    #[test]
+    fn test_process_event_qos_0() {
+        let event = MqttIncoming::Publish {
+            topic: "test/qos0".to_string(),
+            payload: vec![116, 101, 115, 116],
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.topic, "test/qos0");
+        assert_eq!(record.payload, "test");
+        assert_eq!(record.qos, 0);
+        assert!(!record.retain);
+    }
+
+    #[test]
+    fn test_process_event_qos_1() {
+        let event = MqttIncoming::Publish {
+            topic: "test/qos1".to_string(),
+            payload: vec![116, 101, 115, 116],
+            qos: RumqttcQoS::AtLeastOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.qos, 1);
+    }
+
+    #[test]
+    fn test_process_event_qos_2() {
+        let event = MqttIncoming::Publish {
+            topic: "test/qos2".to_string(),
+            payload: vec![116, 101, 115, 116],
+            qos: RumqttcQoS::ExactlyOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.qos, 2);
+    }
+
+    #[test]
+    fn test_process_event_empty_payload() {
+        let event = MqttIncoming::Publish {
+            topic: "test/empty".to_string(),
+            payload: vec![],
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.payload, "");
+    }
+
+    #[test]
+    fn test_process_event_binary_payload() {
+        let event = MqttIncoming::Publish {
+            topic: "test/binary".to_string(),
+            payload: vec![0xFF, 0xFE, 0x00, 0x01],
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        // Should use lossy UTF-8 conversion
+        assert!(record.payload.contains('\u{FFFD}') || !record.payload.is_empty());
+    }
+
+    #[test]
+    fn test_process_event_unicode_payload() {
+        let event = MqttIncoming::Publish {
+            topic: "test/unicode".to_string(),
+            payload: "Hello 世界! 🌍".as_bytes().to_vec(),
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let result = process_event_impl(event);
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert_eq!(record.payload, "Hello 世界! 🌍");
+    }
+
+    #[test]
+    fn test_process_event_suback() {
+        assert!(process_event_impl(MqttIncoming::SubAck).is_none());
+    }
+
+    #[test]
+    fn test_process_event_timestamp_is_recent() {
+        let event = MqttIncoming::Publish {
+            topic: "test/timestamp".to_string(),
+            payload: vec![116, 101, 115, 116],
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let before = Utc::now();
+        let result = process_event_impl(event);
+        let after = Utc::now();
+
+        assert!(result.is_some());
+        let record = result.unwrap();
+        assert!(record.timestamp >= before);
+        assert!(record.timestamp <= after);
+        assert!((after - record.timestamp).num_seconds() <= 1);
     }
 }

@@ -48,6 +48,14 @@ pub enum MqttRecorderError {
     #[error("MQTT client error: {0}")]
     Client(#[source] Box<rumqttc::ClientError>),
 
+    /// MQTT v5 connection error from the rumqttc v5 client.
+    #[error("MQTT v5 connection error: {0}")]
+    V5Connection(#[source] Box<rumqttc::v5::ConnectionError>),
+
+    /// MQTT v5 client operation error from the rumqttc v5 client.
+    #[error("MQTT v5 client error: {0}")]
+    V5Client(#[source] Box<rumqttc::v5::ClientError>),
+
     /// CSV file handling error.
     ///
     /// This error occurs when reading from or writing to CSV files fails,
@@ -109,6 +117,19 @@ impl From<rumqttc::ConnectionError> for MqttRecorderError {
 impl From<rumqttc::ClientError> for MqttRecorderError {
     fn from(err: rumqttc::ClientError) -> Self {
         MqttRecorderError::Client(Box::new(err))
+    }
+}
+
+// V5 error conversions
+impl From<rumqttc::v5::ConnectionError> for MqttRecorderError {
+    fn from(err: rumqttc::v5::ConnectionError) -> Self {
+        MqttRecorderError::V5Connection(Box::new(err))
+    }
+}
+
+impl From<rumqttc::v5::ClientError> for MqttRecorderError {
+    fn from(err: rumqttc::v5::ClientError) -> Self {
+        MqttRecorderError::V5Client(Box::new(err))
     }
 }
 

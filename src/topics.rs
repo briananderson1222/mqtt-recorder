@@ -142,7 +142,6 @@ impl TopicFilter {
     ///     println!("Subscribing to: {}", topic);
     /// }
     /// ```
-    #[allow(clippy::result_large_err)]
     pub fn from_json_file(path: &Path) -> Result<Self, MqttRecorderError> {
         // Open the file - this will return an IO error if the file doesn't exist
         // or cannot be read (Requirements 3.5)
@@ -224,7 +223,7 @@ impl TopicFilter {
     /// let filter = TopicFilter::wildcard();
     /// assert!(!filter.is_empty());
     /// ```
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public API for library users
     pub fn is_empty(&self) -> bool {
         self.topics.is_empty()
     }

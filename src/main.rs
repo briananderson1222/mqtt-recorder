@@ -33,11 +33,14 @@ mod recorder;
 mod replayer;
 mod topics;
 mod tui;
+mod util;
 mod validator;
 
 use clap::Parser;
 use std::process::ExitCode;
 use tokio::sync::broadcast;
+use tracing::{debug, error, info};
+use tracing_subscriber::EnvFilter;
 
 use broker::{BrokerMode, EmbeddedBroker};
 use cli::{Args, Mode};
@@ -45,11 +48,11 @@ use csv_handler::{CsvReader, CsvWriter};
 use error::MqttRecorderError;
 use fixer::CsvFixer;
 use mirror::Mirror;
-use mqtt::{MqttClient, MqttClientConfig, TlsConfig};
+use mqtt::{AnyMqttClient, MqttClient, MqttClientConfig, MqttClientV5, TlsConfig};
 use recorder::Recorder;
 use replayer::Replayer;
 use topics::TopicFilter;
-use tui::{should_enable_interactive, AppMode, TuiState};
+use tui::{should_enable_interactive, AuditArea, AuditSeverity, TuiConfig, TuiState};
 use validator::CsvValidator;
 
 /// Exit code for success (including graceful shutdown)
@@ -68,7 +71,8 @@ const EXIT_RUNTIME_ERROR: u8 = 4;
 #[tokio::main]
 async fn main() -> ExitCode {
     // Parse CLI arguments (Requirements 1.1-1.18)
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.apply_defaults();
 
     // Validate argument combinations (Requirements 1.19-1.26)
     if let Err(e) = args.validate() {
@@ -94,7 +98,7 @@ async fn main() -> ExitCode {
 /// 1. Setting up signal handlers for graceful shutdown (Requirements 9.1-9.2)
 /// 2. Dispatching to the appropriate mode handler
 /// 3. Coordinating graceful shutdown (Requirements 9.3-9.5)
-async fn run(args: Args) -> Result<(), MqttRecorderError> {
+async fn run(mut args: Args) -> Result<(), MqttRecorderError> {
     // Check for validate mode before other mode dispatch
     // Requirements 4.9, 4.10, 6.1-6.6
     if args.validate {
@@ -116,7 +120,7 @@ async fn run(args: Args) -> Result<(), MqttRecorderError> {
     // Spawn a task to handle shutdown signals
     tokio::spawn(async move {
         if let Err(e) = wait_for_shutdown_signal().await {
-            eprintln!("Error setting up signal handler: {}", e);
+            error!("Error setting up signal handler: {}", e);
         }
         // Send shutdown signal to all receivers
         let _ = shutdown_tx_signal.send(());
@@ -125,64 +129,53 @@ async fn run(args: Args) -> Result<(), MqttRecorderError> {
     // Determine if TUI should be enabled (only for long-running serve modes)
     let enable_tui = args.serve && should_enable_interactive(args.no_interactive);
 
-    // Create TUI state if enabled
-    let tui_state = if enable_tui {
-        let initial_mode = match args.mode {
-            Some(Mode::Record) => AppMode::Record,
-            Some(Mode::Replay) => AppMode::Replay,
-            Some(Mode::Mirror) => AppMode::Mirror,
-            None => AppMode::Passthrough,
-        };
-        let file_path = args.file.as_ref().map(|p| p.display().to_string());
-        let playlist: Vec<String> = args
-            .playlist
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        let tui = std::sync::Arc::new(TuiState::new(
-            initial_mode,
-            args.serve_port,
-            file_path,
-            args.host.clone(),
-            args.port,
-            args.record,
-            args.mirror,
-            playlist,
+    // Resolve default filename for record mode when --file not provided
+    if matches!(args.mode.as_ref(), Some(Mode::Record)) && args.file.is_none() {
+        args.file = Some(std::path::PathBuf::from(
+            crate::tui::generate_default_filename(args.host.as_deref()),
         ));
-        if let Some(ref path) = args.audit_log {
-            tui.set_audit_file_path(path.display().to_string());
-        }
-        Some(tui)
-    } else {
-        None
-    };
+    }
 
-    // Spawn TUI task if enabled
-    let tui_handle = if let Some(ref state) = tui_state {
-        let state_clone = state.clone();
-        let shutdown_tx_clone = shutdown_tx.clone();
-        let shutdown_rx = shutdown_tx.subscribe();
-        Some(tokio::spawn(async move {
-            if let Err(e) = tui::run_tui(state_clone, shutdown_tx_clone, shutdown_rx).await {
-                eprintln!("TUI error: {}", e);
-            }
-        }))
-    } else {
-        None
-    };
+    // Initialize tracing subscriber only when TUI is not active
+    if !enable_tui {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(
+                EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| EnvFilter::new("mqtt_recorder=info")),
+            )
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
+
+    // Create TUI state for serve modes (tracks counters, audit, verify even without TUI)
+    let tui_state = create_tui_state(&args);
+
+    let tui_handle = spawn_tui_task(enable_tui, &tui_state, &shutdown_tx);
 
     // Dispatch to the appropriate mode handler
+    // When --serve + --host are both present, always use mirror event loop
+    // so all TUI toggles (mirror/record/playback) actually work.
+    // --mode just sets initial toggle states.
     let result = if args.is_standalone_broker() {
-        // Standalone broker mode (Requirement 1.26)
         run_standalone_broker(&args, shutdown_tx.subscribe(), tui_state.clone()).await
+    } else if args.serve && args.host.is_some() {
+        // Unified serve path: mirror event loop handles all modes
+        run_mirror_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
     } else {
-        match args.mode.as_ref().unwrap() {
+        match args
+            .mode
+            .as_ref()
+            .expect("mode validated by Args::validate()")
+        {
             Mode::Record => {
                 run_record_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
             }
-            Mode::Replay => run_replay_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await,
+            Mode::Replay => {
+                run_replay_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
+            }
             Mode::Mirror => {
-                run_mirror_mode(&args, shutdown_tx.subscribe(), tui_state.clone()).await
+                // Mirror requires --serve + --host, handled above
+                unreachable!("mirror mode requires --serve and --host")
             }
         }
     };
@@ -210,19 +203,20 @@ async fn wait_for_shutdown_signal() -> Result<(), MqttRecorderError> {
 
         tokio::select! {
             _ = sigint.recv() => {
-                eprintln!("\nReceived SIGINT (Ctrl+C), initiating graceful shutdown...");
+                info!("Received SIGINT (Ctrl+C), initiating graceful shutdown...");
             }
             _ = sigterm.recv() => {
-                eprintln!("\nReceived SIGTERM, initiating graceful shutdown...");
+                info!("Received SIGTERM, initiating graceful shutdown...");
             }
         }
     }
 
     #[cfg(not(unix))]
     {
+        use tokio::signal;
         // On non-Unix platforms, only handle Ctrl+C
         signal::ctrl_c().await.map_err(MqttRecorderError::Io)?;
-        eprintln!("\nReceived Ctrl+C, initiating graceful shutdown...");
+        info!("Received Ctrl+C, initiating graceful shutdown...");
     }
 
     Ok(())
@@ -243,12 +237,15 @@ async fn wait_for_shutdown_signal() -> Result<(), MqttRecorderError> {
 /// - 6.5: Report number of invalid records (if any)
 /// - 6.6: Report largest payload size encountered
 fn run_validate_mode(args: &Args) -> Result<(), MqttRecorderError> {
-    eprintln!("Starting CSV validation mode...");
+    info!("Starting CSV validation mode...");
 
     // Get the file path (validated by Args::validate())
-    let file_path = args.file.as_ref().unwrap();
+    let file_path = args
+        .file
+        .as_ref()
+        .expect("--file validated by Args::validate()");
 
-    eprintln!("Validating file: {:?}", file_path);
+    info!("Validating file: {:?}", file_path);
 
     // Create validator with appropriate settings
     // decode_b64: when true, all payloads are expected to be base64 encoded
@@ -257,7 +254,7 @@ fn run_validate_mode(args: &Args) -> Result<(), MqttRecorderError> {
 
     // Run validation
     let stats = validator.validate(file_path).map_err(|e| {
-        eprintln!("Error: Failed to validate file {:?}: {}", file_path, e);
+        error!("Failed to validate file {:?}: {}", file_path, e);
         e
     })?;
 
@@ -267,13 +264,13 @@ fn run_validate_mode(args: &Args) -> Result<(), MqttRecorderError> {
 
     // Exit with appropriate code (Requirements 4.9, 4.10)
     if stats.is_valid() {
-        eprintln!(
+        info!(
             "Validation complete. All {} records are valid.",
             stats.valid_records
         );
         Ok(())
     } else {
-        eprintln!(
+        error!(
             "Validation failed. {} of {} records are invalid.",
             stats.invalid_records, stats.total_records
         );
@@ -293,14 +290,20 @@ fn run_validate_mode(args: &Args) -> Result<(), MqttRecorderError> {
 /// - 8.2: WHEN fix mode is active, read the input file and write a repaired version to a new file
 /// - 8.5: WHEN fix mode is active, report the number of records repaired
 fn run_fix_mode(args: &Args) -> Result<(), MqttRecorderError> {
-    eprintln!("Starting CSV fix mode...");
+    info!("Starting CSV fix mode...");
 
     // Get the file paths (validated by Args::validate())
-    let input_path = args.file.as_ref().unwrap();
-    let output_path = args.output.as_ref().unwrap();
+    let input_path = args
+        .file
+        .as_ref()
+        .expect("--file validated by Args::validate()");
+    let output_path = args
+        .output
+        .as_ref()
+        .expect("--output validated by Args::validate()");
 
-    eprintln!("Input file: {:?}", input_path);
-    eprintln!("Output file: {:?}", output_path);
+    info!("Input file: {:?}", input_path);
+    info!("Output file: {:?}", output_path);
 
     // Create fixer with appropriate settings
     // encode_b64: when true, all payloads in output will be base64 encoded
@@ -308,7 +311,7 @@ fn run_fix_mode(args: &Args) -> Result<(), MqttRecorderError> {
 
     // Run repair
     let stats = fixer.repair(input_path, output_path).map_err(|e| {
-        eprintln!("Error: Failed to repair file {:?}: {}", input_path, e);
+        error!("Failed to repair file {:?}: {}", input_path, e);
         e
     })?;
 
@@ -319,13 +322,13 @@ fn run_fix_mode(args: &Args) -> Result<(), MqttRecorderError> {
     // Exit with appropriate code
     // Exit code 0 on success, 3 on failure (when records were skipped)
     if stats.is_success() {
-        eprintln!(
+        info!(
             "Repair complete. {} records processed, {} repaired.",
             stats.total_records, stats.repaired_records
         );
         Ok(())
     } else {
-        eprintln!(
+        error!(
             "Repair completed with issues. {} records could not be repaired.",
             stats.skipped_records
         );
@@ -349,13 +352,12 @@ async fn run_standalone_broker(
     mut shutdown: broadcast::Receiver<()>,
     tui_state: Option<std::sync::Arc<TuiState>>,
 ) -> Result<(), MqttRecorderError> {
-    eprintln!("Starting standalone MQTT broker mode...");
+    info!("Starting standalone MQTT broker mode...");
 
     // Start the embedded broker
     let broker = EmbeddedBroker::new(args.serve_port, BrokerMode::Standalone).await?;
 
-    let tui_active = tui_state.is_some();
-    eprintln!(
+    info!(
         "Embedded broker running on port {}. Press Ctrl+C to stop.",
         args.serve_port
     );
@@ -364,13 +366,13 @@ async fn run_standalone_broker(
     loop {
         tokio::select! {
             _ = shutdown.recv() => break,
-            _ = tokio::time::sleep(tokio::time::Duration::from_secs(2)) => {
-                if let Some((old, new)) = broker.poll_metrics() {
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(crate::util::BROKER_SHUTDOWN_TIMEOUT_SECS)) => {
+                if let Some(metrics) = broker.poll_metrics() {
                     if let Some(ref state) = tui_state {
-                        state.set_broker_connections(new);
+                        state.update_broker_metrics(&metrics);
                     }
-                    if !tui_active {
-                        eprintln!("Broker connections: {} → {}", old, new);
+                    if let Some((old, new)) = metrics.connections_changed {
+                        debug!("Broker connections: {} → {}", old, new);
                     }
                 }
             }
@@ -378,9 +380,9 @@ async fn run_standalone_broker(
     }
 
     // Graceful shutdown (Requirement 9.5)
-    broker.shutdown().await?;
+    shutdown_broker_with_audit(broker, &tui_state).await?;
 
-    eprintln!("Standalone broker shutdown complete.");
+    info!("Standalone broker shutdown complete.");
     Ok(())
 }
 
@@ -397,36 +399,34 @@ async fn run_record_mode(
     shutdown: broadcast::Receiver<()>,
     tui_state: Option<std::sync::Arc<TuiState>>,
 ) -> Result<(), MqttRecorderError> {
-    eprintln!("Starting record mode...");
-
-    // Optionally start embedded broker for passthrough
-    let _broker = if args.serve {
-        eprintln!("Starting embedded broker on port {}...", args.serve_port);
-        Some(EmbeddedBroker::new(args.serve_port, BrokerMode::Replay).await?)
-    } else {
-        None
-    };
+    info!("Starting record mode...");
 
     // Create MQTT client configuration
     let client_config = create_mqtt_client_config(args)?;
 
     // Log connection attempt (Requirement 8.3)
-    eprintln!(
-        "Connecting to MQTT broker at {}:{}...",
-        client_config.host, client_config.port
+    info!(
+        "Connecting to MQTT broker at {}:{} (MQTT v{})...",
+        client_config.host, client_config.port, args.mqtt_version
     );
 
-    // Create MQTT client
-    let client = MqttClient::new(client_config).await.map_err(|e| {
-        eprintln!("Error: Connection failed: {}", e);
-        eprintln!("  Hint: Verify the broker is running and the host/port are correct");
-        e
-    })?;
+    // Create MQTT client (v5 by default, v4 if specified)
+    let client = create_any_mqtt_client(client_config, args.use_mqtt_v5())
+        .await
+        .map_err(|e| {
+            error!("Connection failed: {}", e);
+            info!("Hint: Verify the broker is running and the host/port are correct");
+            e
+        })?;
 
     // Create CSV writer (Requirement 4.5: writes header row)
-    let file_path = args.file.as_ref().unwrap();
+    // args.file is already resolved (default filename generated earlier if needed)
+    let file_path = args
+        .file
+        .as_ref()
+        .expect("--file resolved by run() for record mode");
     let writer = CsvWriter::new(file_path, args.encode_b64).map_err(|e| {
-        eprintln!("Error: Failed to create output file {:?}: {}", file_path, e);
+        error!("Failed to create output file {:?}: {}", file_path, e);
         e
     })?;
 
@@ -434,13 +434,13 @@ async fn run_record_mode(
     let topics = create_topic_filter(args)?;
 
     // Create and run recorder
-    let mut recorder = Recorder::new(client, writer, topics, args.get_qos()).await;
+    let mut recorder = Recorder::new(client, writer, topics, args.get_qos());
 
     // Run the recording loop (Requirements 4.1-4.9)
-    let message_count = recorder.run_with_tui(shutdown, tui_state).await?;
+    let message_count = recorder.run(shutdown, tui_state).await?;
 
     // Log completion (Requirement 8.4)
-    eprintln!("Recording complete. {} messages recorded.", message_count);
+    info!("Recording complete. {} messages recorded.", message_count);
 
     Ok(())
 }
@@ -460,16 +460,11 @@ async fn run_replay_mode(
     shutdown: broadcast::Receiver<()>,
     tui_state: Option<std::sync::Arc<TuiState>>,
 ) -> Result<(), MqttRecorderError> {
-    let tui_active = tui_state.is_some();
-    if !tui_active {
-        eprintln!("Starting replay mode...");
-    }
+    info!("Starting replay mode...");
 
     // Optionally start embedded broker (Requirement 10.3)
     let broker = if args.serve {
-        if !tui_active {
-            eprintln!("Starting embedded broker on port {}...", args.serve_port);
-        }
+        info!("Starting embedded broker on port {}...", args.serve_port);
         Some(EmbeddedBroker::new(args.serve_port, BrokerMode::Replay).await?)
     } else {
         None
@@ -477,34 +472,35 @@ async fn run_replay_mode(
 
     // Determine which client to use for publishing
     let client = if let Some(host) = &args.host {
-        // Connect to external broker
+        // Connect to external broker (v5 by default, v4 if specified)
         let client_config = create_mqtt_client_config(args)?;
-        if !tui_active {
-            eprintln!("Connecting to MQTT broker at {}:{}...", host, args.port);
-        }
-        MqttClient::new(client_config).await.map_err(|e| {
-            eprintln!("Error: Connection failed: {}", e);
-            eprintln!("  Hint: Verify the broker is running and the host/port are correct");
-            e
-        })?
+        info!(
+            "Connecting to MQTT broker at {}:{} (MQTT v{})...",
+            host, args.port, args.mqtt_version
+        );
+        create_any_mqtt_client(client_config, args.use_mqtt_v5())
+            .await
+            .map_err(|e| {
+                error!("Connection failed: {}", e);
+                info!("Hint: Verify the broker is running and the host/port are correct");
+                e
+            })?
     } else if args.serve {
-        // Connect to embedded broker (Requirement 1.22: host optional with --serve)
+        // Connect to embedded broker via v5 (Requirement 1.22: host optional with --serve)
         let config = MqttClientConfig::new(
             "127.0.0.1".to_string(),
             args.serve_port,
-            generate_client_id(&args.client_id),
+            crate::util::generate_client_id(&args.client_id),
         );
-        if !tui_active {
-            eprintln!(
-                "Connecting to embedded broker on port {}...",
-                args.serve_port
-            );
-        }
-        let client = MqttClient::new(config).await?;
+        info!(
+            "Connecting to embedded broker on port {}...",
+            args.serve_port
+        );
+        let c = MqttClientV5::new(config).await?;
         if let Some(ref b) = broker {
             b.register_internal_client();
         }
-        client
+        AnyMqttClient::V5(c)
     } else {
         // This shouldn't happen due to validation, but handle it anyway
         return Err(MqttRecorderError::InvalidArgument(
@@ -513,27 +509,29 @@ async fn run_replay_mode(
     };
 
     // Create CSV reader
-    let file_path = args.file.as_ref().unwrap();
+    let file_path = args
+        .file
+        .as_ref()
+        .expect("--file validated by Args::validate()");
     let reader =
         CsvReader::new(file_path, args.encode_b64, args.csv_field_size_limit).map_err(|e| {
-            eprintln!("Error: Failed to open input file {:?}: {}", file_path, e);
+            error!("Failed to open input file {:?}: {}", file_path, e);
             e
         })?;
 
     // Create and run replayer
-    let mut replayer = Replayer::new(client, reader, args.loop_replay).await;
+    let mut replayer = Replayer::new(client, reader, args.loop_replay);
 
     // Run the replay loop (Requirements 5.1-5.11)
-    let message_count = replayer.run_with_tui(shutdown, tui_state).await?;
+    let tui_ref = tui_state.clone();
+    let message_count = replayer.run(shutdown, tui_state).await?;
 
     // Log completion (Requirement 8.4)
-    if !tui_active {
-        eprintln!("Replay complete. {} messages replayed.", message_count);
-    }
+    info!("Replay complete. {} messages replayed.", message_count);
 
     // Shutdown embedded broker if started
     if let Some(broker) = broker {
-        broker.shutdown().await?;
+        shutdown_broker_with_audit(broker, &tui_ref).await?;
     }
 
     Ok(())
@@ -553,10 +551,7 @@ async fn run_mirror_mode(
     shutdown: broadcast::Receiver<()>,
     tui_state: Option<std::sync::Arc<TuiState>>,
 ) -> Result<(), MqttRecorderError> {
-    let tui_active = tui_state.is_some();
-    if !tui_active {
-        eprintln!("Starting mirror mode...");
-    }
+    info!("Starting mirror mode...");
 
     // Start embedded broker (Requirement 11.2: mirror mode requires --serve)
     let broker = EmbeddedBroker::new(args.serve_port, BrokerMode::Mirror).await?;
@@ -565,24 +560,31 @@ async fn run_mirror_mode(
     let source_config = create_mqtt_client_config(args)?;
 
     // Log connection attempt (Requirement 8.3)
-    if !tui_active {
-        eprintln!(
-            "Connecting to source MQTT broker at {}:{}...",
-            source_config.host, source_config.port
-        );
-    }
+    info!(
+        "Connecting to source MQTT broker at {}:{} (MQTT v{})...",
+        source_config.host, source_config.port, args.mqtt_version
+    );
 
-    // Create source MQTT client
-    let source_client = MqttClient::new(source_config).await.map_err(|e| {
-        eprintln!("Error: Connection to source broker failed: {}", e);
-        eprintln!("  Hint: Verify the broker is running and the host/port are correct");
-        e
-    })?;
+    // Create source MQTT client (v5 by default, v4 if specified)
+    let source_client = create_any_mqtt_client(source_config, args.use_mqtt_v5())
+        .await
+        .map_err(|e| {
+            error!("Connection to source broker failed: {}", e);
+            info!("Hint: Verify the broker is running and the host/port are correct");
+            e
+        })?;
 
-    // Optionally create CSV writer (Requirement 11.5)
-    let writer = if let Some(file_path) = &args.file {
+    // Create CSV writer - use args.file, or fall back to TUI state's file path
+    // (which may have been generated as a default for record mode)
+    let resolved_file: Option<std::path::PathBuf> = args.file.clone().or_else(|| {
+        tui_state
+            .as_ref()
+            .and_then(|s| s.get_file_path())
+            .map(std::path::PathBuf::from)
+    });
+    let writer = if let Some(ref file_path) = resolved_file {
         Some(CsvWriter::new(file_path, args.encode_b64).map_err(|e| {
-            eprintln!("Error: Failed to create output file {:?}: {}", file_path, e);
+            error!("Failed to create output file {:?}: {}", file_path, e);
             e
         })?)
     } else {
@@ -593,28 +595,142 @@ async fn run_mirror_mode(
     let topics = create_topic_filter(args)?;
 
     // Create and run mirror
-    let mut mirror = Mirror::new(source_client, broker, writer, topics, args.get_qos()).await?;
+    let mut mirror = Mirror::new(
+        source_client,
+        broker,
+        writer,
+        topics,
+        args.get_qos(),
+        args.verify,
+    )
+    .await?;
 
     // Run the mirror loop with TUI support (Requirements 11.3-11.9)
-    let message_count = if tui_active {
-        mirror.run_with_tui(shutdown, tui_state).await?
-    } else {
-        mirror.run(shutdown).await?
-    };
+    let tui_ref = tui_state.clone();
+    let message_count = mirror.run(shutdown, tui_state).await?;
 
     // Log completion (Requirement 8.4)
-    if !tui_active {
-        eprintln!("Mirror complete. {} messages mirrored.", message_count);
+    info!("Mirror complete. {} messages mirrored.", message_count);
+
+    // Print verify summary if active
+    if args.verify {
+        if let Some(ref state) = tui_ref {
+            let matched = state.get_verify_matched();
+            let mismatched = state.get_verify_mismatched();
+            let missing = state.get_verify_missing();
+            info!(
+                "Verify: {} matched, {} unexpected, {} missing",
+                matched, mismatched, missing
+            );
+        }
     }
 
     // Shutdown embedded broker
     let broker = mirror.into_broker();
-    broker.shutdown().await?;
+    shutdown_broker_with_audit(broker, &tui_ref).await?;
 
     Ok(())
 }
 
-/// Create an MQTT client configuration from CLI arguments.
+/// Shut down an embedded broker with audit logging.
+async fn shutdown_broker_with_audit(
+    broker: EmbeddedBroker,
+    tui_state: &Option<std::sync::Arc<TuiState>>,
+) -> Result<(), MqttRecorderError> {
+    if let Some(ref state) = tui_state {
+        state.push_audit(
+            AuditArea::Broker,
+            AuditSeverity::Info,
+            "Broker shutting down".into(),
+        );
+    }
+    broker.shutdown().await?;
+    if let Some(ref state) = tui_state {
+        state.push_audit(
+            AuditArea::Broker,
+            AuditSeverity::Info,
+            "Broker shutdown complete".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Spawn the TUI rendering task if interactive mode is enabled and TUI state exists.
+fn spawn_tui_task(
+    enable_tui: bool,
+    tui_state: &Option<std::sync::Arc<TuiState>>,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !enable_tui {
+        return None;
+    }
+    let state = tui_state.as_ref()?;
+    let state_clone = state.clone();
+    let shutdown_tx_clone = shutdown_tx.clone();
+    let shutdown_rx = shutdown_tx.subscribe();
+    Some(tokio::spawn(async move {
+        if let Err(e) = tui::run_tui(state_clone, shutdown_tx_clone, shutdown_rx).await {
+            error!("TUI error: {}", e);
+        }
+    }))
+}
+
+/// Create TUI state for serve modes (tracks counters, audit, verify even without TUI).
+///
+/// Returns `None` when `--serve` is not enabled.
+fn create_tui_state(args: &Args) -> Option<std::sync::Arc<TuiState>> {
+    if !args.serve {
+        return None;
+    }
+
+    let mode = args.mode.as_ref();
+    let file_path = args.file.as_ref().map(|p| p.display().to_string());
+
+    // Set initial toggle states based on --mode
+    let (initial_record, initial_mirror) = match mode {
+        Some(Mode::Record) => (args.record.or(Some(true)), false),
+        Some(Mode::Replay) => (Some(false), false),
+        Some(Mode::Mirror) => (args.record, args.mirror),
+        None => (Some(false), false), // standalone broker
+    };
+
+    let playlist: Vec<String> = args
+        .playlist
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    let tui = std::sync::Arc::new(TuiState::new(TuiConfig {
+        broker_port: args.serve_port,
+        file_path,
+        source_host: args.host.clone(),
+        source_port: args.port,
+        initial_record,
+        initial_mirror,
+        playlist,
+        audit_enabled: args.audit,
+        health_check_interval: args.health_check,
+    }));
+    if let Some(ref path) = args.audit_log {
+        tui.set_audit_file_path(path.display().to_string());
+        tui.enable_audit_file();
+    }
+    // Set playback active for replay mode, or when --loop is explicitly provided
+    let is_replay = matches!(mode, Some(Mode::Replay));
+    let has_playback_file = tui.get_file_path().is_some() || !args.playlist.is_empty();
+    if (is_replay || args.loop_replay) && has_playback_file {
+        tui.loop_enabled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if args.loop_replay {
+            tui.playback_looping
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        tui.recording_enabled
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    Some(tui)
+}
+
+/// Build an [`MqttClientConfig`] from CLI arguments for connecting to an external broker.
 ///
 /// # Requirements
 /// - 2.1-2.8: MQTT broker connection configuration
@@ -625,7 +741,7 @@ fn create_mqtt_client_config(args: &Args) -> Result<MqttClientConfig, MqttRecord
         .as_ref()
         .ok_or_else(|| MqttRecorderError::InvalidArgument("Host is required".to_string()))?;
 
-    let client_id = generate_client_id(&args.client_id);
+    let client_id = crate::util::generate_client_id(&args.client_id);
 
     let mut config = MqttClientConfig::new(host.clone(), args.port, client_id)
         .with_max_packet_size(args.max_packet_size);
@@ -658,6 +774,19 @@ fn create_mqtt_client_config(args: &Args) -> Result<MqttClientConfig, MqttRecord
     Ok(config)
 }
 
+/// Create an MQTT client from configuration, using v5 or v4 based on the flag.
+async fn create_any_mqtt_client(
+    config: MqttClientConfig,
+    use_v5: bool,
+) -> Result<AnyMqttClient, MqttRecorderError> {
+    let client = if use_v5 {
+        AnyMqttClient::V5(MqttClientV5::new(config).await?)
+    } else {
+        AnyMqttClient::V4(MqttClient::new(config).await?)
+    };
+    Ok(client)
+}
+
 /// Create a topic filter from CLI arguments.
 ///
 /// # Requirements
@@ -671,32 +800,13 @@ fn create_topic_filter(args: &Args) -> Result<TopicFilter, MqttRecorderError> {
     } else if let Some(topics_file) = &args.topics {
         // Topics from JSON file (Requirement 3.3)
         TopicFilter::from_json_file(topics_file).map_err(|e| {
-            eprintln!(
-                "Error: Failed to parse topics file {:?}: {}",
-                topics_file, e
-            );
+            error!("Failed to parse topics file {:?}: {}", topics_file, e);
             e
         })
     } else {
         // Default wildcard subscription (Requirement 3.1)
         Ok(TopicFilter::wildcard())
     }
-}
-
-/// Generate a client ID, using the provided one or generating a unique one.
-///
-/// # Requirement
-/// - 2.3: WHEN no client_id is provided, generate a unique client identifier
-fn generate_client_id(client_id: &Option<String>) -> String {
-    client_id.clone().unwrap_or_else(|| {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let hash = timestamp ^ (timestamp >> 32);
-        format!("mqtt-recorder-{:08x}", hash as u32)
-    })
 }
 
 /// Convert an error to the appropriate exit code.
@@ -709,6 +819,8 @@ fn error_to_exit_code(error: &MqttRecorderError) -> u8 {
         MqttRecorderError::ValidationFailed(_) => EXIT_VALIDATION_FAILURE,
         MqttRecorderError::Connection(_) => EXIT_CONNECTION_ERROR,
         MqttRecorderError::Client(_) => EXIT_CONNECTION_ERROR,
+        MqttRecorderError::V5Connection(_) => EXIT_CONNECTION_ERROR,
+        MqttRecorderError::V5Client(_) => EXIT_CONNECTION_ERROR,
         MqttRecorderError::Tls(_) => EXIT_CONNECTION_ERROR,
         MqttRecorderError::Io(_) => EXIT_IO_ERROR,
         MqttRecorderError::Csv(_) => EXIT_IO_ERROR,
@@ -720,41 +832,6 @@ fn error_to_exit_code(error: &MqttRecorderError) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // Helper function to create Args with defaults for testing
-    fn default_args() -> Args {
-        Args {
-            host: None,
-            port: 1883,
-            client_id: None,
-            mode: None,
-            file: None,
-            loop_replay: false,
-            qos: 0,
-            topics: None,
-            topic: None,
-            enable_ssl: false,
-            tls_insecure: false,
-            ca_cert: None,
-            certfile: None,
-            keyfile: None,
-            username: None,
-            password: None,
-            encode_b64: false,
-            csv_field_size_limit: None,
-            max_packet_size: 1048576,
-            serve: false,
-            serve_port: 1883,
-            validate: false,
-            fix: false,
-            output: None,
-            no_interactive: false,
-            record: None,
-            mirror: true,
-            playlist: vec![],
-            audit_log: None,
-        }
-    }
 
     #[test]
     fn test_error_to_exit_code_config_error() {
@@ -791,24 +868,11 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_client_id_with_provided_id() {
-        let client_id = Some("my-client".to_string());
-        let result = generate_client_id(&client_id);
-        assert_eq!(result, "my-client");
-    }
-
-    #[test]
-    fn test_generate_client_id_without_provided_id() {
-        let client_id = None;
-        let result = generate_client_id(&client_id);
-        assert!(result.starts_with("mqtt-recorder-"));
-        assert_eq!(result.len(), 22); // "mqtt-recorder-" (14) + 8 hex chars
-    }
-
-    #[test]
     fn test_create_topic_filter_single_topic() {
-        let mut args = default_args();
-        args.topic = Some("test/topic".to_string());
+        let args = Args {
+            topic: Some("test/topic".to_string()),
+            ..Default::default()
+        };
 
         let filter = create_topic_filter(&args).unwrap();
         assert_eq!(filter.topics(), &["test/topic"]);
@@ -816,7 +880,7 @@ mod tests {
 
     #[test]
     fn test_create_topic_filter_wildcard() {
-        let args = default_args();
+        let args = Args::default();
 
         let filter = create_topic_filter(&args).unwrap();
         assert_eq!(filter.topics(), &["#"]);
@@ -824,10 +888,12 @@ mod tests {
 
     #[test]
     fn test_create_mqtt_client_config_basic() {
-        let mut args = default_args();
-        args.host = Some("localhost".to_string());
-        args.port = 1883;
-        args.client_id = Some("test-client".to_string());
+        let args = Args {
+            host: Some("localhost".to_string()),
+            port: 1883,
+            client_id: Some("test-client".to_string()),
+            ..Default::default()
+        };
 
         let config = create_mqtt_client_config(&args).unwrap();
         assert_eq!(config.host, "localhost");
@@ -839,10 +905,12 @@ mod tests {
 
     #[test]
     fn test_create_mqtt_client_config_with_credentials() {
-        let mut args = default_args();
-        args.host = Some("localhost".to_string());
-        args.username = Some("user".to_string());
-        args.password = Some("pass".to_string());
+        let args = Args {
+            host: Some("localhost".to_string()),
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            ..Default::default()
+        };
 
         let config = create_mqtt_client_config(&args).unwrap();
         assert!(config.has_credentials());
@@ -852,10 +920,12 @@ mod tests {
 
     #[test]
     fn test_create_mqtt_client_config_with_tls() {
-        let mut args = default_args();
-        args.host = Some("localhost".to_string());
-        args.enable_ssl = true;
-        args.tls_insecure = true;
+        let args = Args {
+            host: Some("localhost".to_string()),
+            enable_ssl: true,
+            tls_insecure: true,
+            ..Default::default()
+        };
 
         let config = create_mqtt_client_config(&args).unwrap();
         assert!(config.is_tls_enabled());
@@ -863,7 +933,7 @@ mod tests {
 
     #[test]
     fn test_create_mqtt_client_config_missing_host() {
-        let args = default_args();
+        let args = Args::default();
 
         let result = create_mqtt_client_config(&args);
         assert!(result.is_err());

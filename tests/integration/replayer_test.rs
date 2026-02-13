@@ -2,9 +2,9 @@
 
 use mqtt_recorder::broker::{BrokerMode, EmbeddedBroker};
 use mqtt_recorder::csv_handler::{CsvReader, CsvWriter, MessageRecord};
-use mqtt_recorder::mqtt::{MqttClient, MqttClientConfig};
+use mqtt_recorder::mqtt::{AnyMqttClient, MqttClientConfig, MqttClientV5};
 use mqtt_recorder::replayer::Replayer;
-use rumqttc::{Event, Packet, QoS};
+use rumqttc::QoS;
 
 use chrono::Utc;
 use std::time::Duration;
@@ -12,9 +12,17 @@ use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
-/// Helper: create an MQTT client connected to the given port
-async fn make_client(port: u16, id: &str) -> MqttClient {
-    MqttClient::new(MqttClientConfig::new(
+fn get_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Helper: create an MQTT v5 client connected to the given port
+async fn make_client(port: u16, id: &str) -> MqttClientV5 {
+    MqttClientV5::new(MqttClientConfig::new(
         "127.0.0.1".to_string(),
         port,
         id.to_string(),
@@ -28,13 +36,7 @@ fn create_test_csv(path: &std::path::Path, messages: &[(&str, &str, u8, bool)]) 
     let mut writer = CsvWriter::new(path, false).expect("Failed to create writer");
     let ts = Utc::now();
     for (topic, payload, qos, retain) in messages.iter() {
-        let record = MessageRecord::new(
-            ts,
-            topic.to_string(),
-            payload.to_string(),
-            *qos,
-            *retain,
-        );
+        let record = MessageRecord::new(ts, topic.to_string(), payload.to_string(), *qos, *retain);
         writer.write(&record).expect("Failed to write record");
     }
     writer.flush().expect("Failed to flush");
@@ -42,7 +44,7 @@ fn create_test_csv(path: &std::path::Path, messages: &[(&str, &str, u8, bool)]) 
 
 /// Helper: subscribe and collect messages from broker
 async fn collect_messages(
-    client: &MqttClient,
+    client: &MqttClientV5,
     topic: &str,
     expected: usize,
     timeout_ms: u64,
@@ -51,18 +53,21 @@ async fn collect_messages(
         .subscribe(&[topic.to_string()], QoS::AtMostOnce)
         .await
         .expect("Failed to subscribe");
-    // Poll to process subscription
     let _ = client.poll().await;
 
     let mut messages = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
     while messages.len() < expected && tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(200), client.poll()).await {
-            Ok(Ok(Event::Incoming(Packet::Publish(p)))) => {
-                messages.push((p.topic.clone(), p.payload.to_vec()));
+        if let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(200), client.poll()).await
+        {
+            use rumqttc::v5::mqttbytes::v5::Packet;
+            if let rumqttc::v5::Event::Incoming(Packet::Publish(p)) = event {
+                messages.push((
+                    String::from_utf8_lossy(&p.topic).into_owned(),
+                    p.payload.to_vec(),
+                ));
             }
-            _ => {}
         }
     }
     messages
@@ -76,7 +81,8 @@ async fn collect_messages(
 /// 4. Verify all 3 messages received with correct topic/payload
 #[tokio::test]
 async fn test_replayer_publishes_csv_messages() {
-    let _broker = EmbeddedBroker::new(18860, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -93,7 +99,7 @@ async fn test_replayer_publishes_csv_messages() {
     );
 
     // Connect subscriber FIRST so it's ready before replay starts
-    let subscriber = make_client(18860, "subscriber").await;
+    let subscriber = make_client(port, "subscriber").await;
     subscriber
         .subscribe(&["test/#".to_string()], QoS::AtMostOnce)
         .await
@@ -102,12 +108,12 @@ async fn test_replayer_publishes_csv_messages() {
     let _ = subscriber.poll().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let replayer_client = make_client(18860, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false).await;
+    let mut replayer = Replayer::new(replayer_client, reader, false);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { replayer.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
 
     // Collect messages from subscriber
     let messages = collect_messages(&subscriber, "test/#", 3, 5000).await;
@@ -121,7 +127,11 @@ async fn test_replayer_publishes_csv_messages() {
         .expect("Error");
 
     assert_eq!(count, 3, "Replayer should have published 3 messages");
-    assert_eq!(messages.len(), 3, "Subscriber should have received 3 messages");
+    assert_eq!(
+        messages.len(),
+        3,
+        "Subscriber should have received 3 messages"
+    );
 
     // Verify topics and payloads
     let topics: Vec<&str> = messages.iter().map(|(t, _)| t.as_str()).collect();
@@ -136,7 +146,8 @@ async fn test_replayer_publishes_csv_messages() {
 /// 2. Replay and verify subscriber receives matching fields
 #[tokio::test]
 async fn test_replayer_preserves_message_fields() {
-    let _broker = EmbeddedBroker::new(18861, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -151,7 +162,7 @@ async fn test_replayer_preserves_message_fields() {
         ],
     );
 
-    let subscriber = make_client(18861, "subscriber").await;
+    let subscriber = make_client(port, "subscriber").await;
     subscriber
         .subscribe(&["sensors/#".to_string()], QoS::AtMostOnce)
         .await
@@ -159,12 +170,12 @@ async fn test_replayer_preserves_message_fields() {
     let _ = subscriber.poll().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let replayer_client = make_client(18861, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false).await;
+    let mut replayer = Replayer::new(replayer_client, reader, false);
 
     let (_shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { replayer.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
 
     let messages = collect_messages(&subscriber, "sensors/#", 2, 5000).await;
 
@@ -193,7 +204,8 @@ async fn test_replayer_preserves_message_fields() {
 /// 3. Verify it exits naturally and returns correct count
 #[tokio::test]
 async fn test_replayer_exits_after_all_messages() {
-    let _broker = EmbeddedBroker::new(18862, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -202,20 +214,17 @@ async fn test_replayer_exits_after_all_messages() {
     let csv_path = dir.path().join("input.csv");
     create_test_csv(
         &csv_path,
-        &[
-            ("test/1", "msg-1", 0, false),
-            ("test/2", "msg-2", 0, false),
-        ],
+        &[("test/1", "msg-1", 0, false), ("test/2", "msg-2", 0, false)],
     );
 
-    let replayer_client = make_client(18862, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false).await;
+    let mut replayer = Replayer::new(replayer_client, reader, false);
 
     let (_shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // Replayer should exit on its own (no shutdown signal needed)
-    let result = timeout(Duration::from_secs(10), replayer.run(shutdown_rx))
+    let result = timeout(Duration::from_secs(10), replayer.run(shutdown_rx, None))
         .await
         .expect("Replayer should exit within timeout");
 
@@ -231,7 +240,8 @@ async fn test_replayer_exits_after_all_messages() {
 /// 4. Shutdown and verify count > 2
 #[tokio::test]
 async fn test_replayer_loops_continuously() {
-    let _broker = EmbeddedBroker::new(18863, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -241,11 +251,27 @@ async fn test_replayer_loops_continuously() {
     // Use 0ms-spaced timestamps so replay is fast
     let mut writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let ts = Utc::now();
-    writer.write(&MessageRecord::new(ts, "loop/msg".into(), "data-1".into(), 0, false)).unwrap();
-    writer.write(&MessageRecord::new(ts, "loop/msg".into(), "data-2".into(), 0, false)).unwrap();
+    writer
+        .write(&MessageRecord::new(
+            ts,
+            "loop/msg".into(),
+            "data-1".into(),
+            0,
+            false,
+        ))
+        .unwrap();
+    writer
+        .write(&MessageRecord::new(
+            ts,
+            "loop/msg".into(),
+            "data-2".into(),
+            0,
+            false,
+        ))
+        .unwrap();
     writer.flush().unwrap();
 
-    let subscriber = make_client(18863, "subscriber").await;
+    let subscriber = make_client(port, "subscriber").await;
     subscriber
         .subscribe(&["loop/#".to_string()], QoS::AtMostOnce)
         .await
@@ -253,12 +279,12 @@ async fn test_replayer_loops_continuously() {
     let _ = subscriber.poll().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let replayer_client = make_client(18863, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, true).await;
+    let mut replayer = Replayer::new(replayer_client, reader, true);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { replayer.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
 
     // Wait for more than 2 messages (proving loop happened)
     let messages = collect_messages(&subscriber, "loop/#", 4, 10000).await;
@@ -275,11 +301,7 @@ async fn test_replayer_loops_continuously() {
         "Should receive >=4 messages (at least 2 loops), got {}",
         messages.len()
     );
-    assert!(
-        count >= 4,
-        "Replayer count should be >=4, got {}",
-        count
-    );
+    assert!(count >= 4, "Replayer count should be >=4, got {}", count);
 }
 
 /// Test that replayer handles shutdown during replay gracefully.
@@ -290,7 +312,8 @@ async fn test_replayer_loops_continuously() {
 /// 4. Verify graceful stop with partial count
 #[tokio::test]
 async fn test_replayer_handles_shutdown_during_replay() {
-    let _broker = EmbeddedBroker::new(18864, BrokerMode::Standalone)
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -300,17 +323,41 @@ async fn test_replayer_handles_shutdown_during_replay() {
     // Messages spaced 2 seconds apart so we can shutdown mid-replay
     let mut writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let base = Utc::now();
-    writer.write(&MessageRecord::new(base, "test/1".into(), "first".into(), 0, false)).unwrap();
-    writer.write(&MessageRecord::new(base + chrono::Duration::seconds(2), "test/2".into(), "second".into(), 0, false)).unwrap();
-    writer.write(&MessageRecord::new(base + chrono::Duration::seconds(4), "test/3".into(), "third".into(), 0, false)).unwrap();
+    writer
+        .write(&MessageRecord::new(
+            base,
+            "test/1".into(),
+            "first".into(),
+            0,
+            false,
+        ))
+        .unwrap();
+    writer
+        .write(&MessageRecord::new(
+            base + chrono::Duration::seconds(2),
+            "test/2".into(),
+            "second".into(),
+            0,
+            false,
+        ))
+        .unwrap();
+    writer
+        .write(&MessageRecord::new(
+            base + chrono::Duration::seconds(4),
+            "test/3".into(),
+            "third".into(),
+            0,
+            false,
+        ))
+        .unwrap();
     writer.flush().unwrap();
 
-    let replayer_client = make_client(18864, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false).await;
+    let mut replayer = Replayer::new(replayer_client, reader, false);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
-    let handle = tokio::spawn(async move { replayer.run(shutdown_rx).await });
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
 
     // Wait for first message to be sent, then shutdown during delay before second
     tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -341,7 +388,8 @@ async fn test_record_then_replay_roundtrip() {
     use mqtt_recorder::topics::TopicFilter;
 
     // === Phase 1: Record ===
-    let _broker_a = EmbeddedBroker::new(18870, BrokerMode::Standalone)
+    let port_a = get_free_port();
+    let _broker_a = EmbeddedBroker::new(port_a, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker A");
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -349,25 +397,19 @@ async fn test_record_then_replay_roundtrip() {
     let dir = tempdir().unwrap();
     let csv_path = dir.path().join("roundtrip.csv");
 
-    let recorder_client = MqttClient::new(MqttClientConfig::new(
-        "127.0.0.1".to_string(),
-        18870,
-        "recorder".to_string(),
-    ))
-    .await
-    .expect("Failed to create recorder client");
+    let recorder_client = AnyMqttClient::V5(make_client(port_a, "recorder").await);
 
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
     let topics = TopicFilter::wildcard();
-    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce).await;
+    let mut recorder = Recorder::new(recorder_client, writer, topics, QoS::AtMostOnce);
 
     let (rec_shutdown_tx, rec_shutdown_rx) = broadcast::channel::<()>(1);
-    let rec_handle = tokio::spawn(async move { recorder.run(rec_shutdown_rx).await });
+    let rec_handle = tokio::spawn(async move { recorder.run(rec_shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // Publish test messages
-    let publisher = make_client(18870, "publisher").await;
+    let publisher = make_client(port_a, "publisher").await;
     for (topic, payload) in [
         ("roundtrip/a", "alpha"),
         ("roundtrip/b", "beta"),
@@ -421,13 +463,14 @@ async fn test_record_then_replay_roundtrip() {
     }
 
     // === Phase 2: Replay ===
-    let _broker_b = EmbeddedBroker::new(18871, BrokerMode::Standalone)
+    let port_b = get_free_port();
+    let _broker_b = EmbeddedBroker::new(port_b, BrokerMode::Standalone)
         .await
         .expect("Failed to start broker B");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Subscribe on broker B first
-    let subscriber = make_client(18871, "subscriber").await;
+    let subscriber = make_client(port_b, "subscriber").await;
     subscriber
         .subscribe(&["roundtrip/#".to_string()], QoS::AtMostOnce)
         .await
@@ -435,12 +478,12 @@ async fn test_record_then_replay_roundtrip() {
     let _ = subscriber.poll().await;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let replayer_client = make_client(18871, "replayer").await;
+    let replayer_client = AnyMqttClient::V5(make_client(port_b, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false).await;
+    let mut replayer = Replayer::new(replayer_client, reader, false);
 
     let (rep_shutdown_tx, rep_shutdown_rx) = broadcast::channel::<()>(1);
-    let rep_handle = tokio::spawn(async move { replayer.run(rep_shutdown_rx).await });
+    let rep_handle = tokio::spawn(async move { replayer.run(rep_shutdown_rx, None).await });
 
     // Collect replayed messages
     let messages = collect_messages(&subscriber, "roundtrip/#", 3, 5000).await;

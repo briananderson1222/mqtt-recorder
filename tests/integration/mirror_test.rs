@@ -3,27 +3,36 @@
 use mqtt_recorder::broker::{BrokerMode, EmbeddedBroker};
 use mqtt_recorder::csv_handler::CsvWriter;
 use mqtt_recorder::mirror::Mirror;
-use mqtt_recorder::mqtt::{MqttClient, MqttClientConfig};
+use mqtt_recorder::mqtt::{AnyMqttClient, MqttClientConfig, MqttClientV5};
 use mqtt_recorder::topics::TopicFilter;
-use rumqttc::{Event, Packet, QoS};
+use rumqttc::QoS;
 
 use std::time::Duration;
 use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
 
+fn get_free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 /// Test that mirror mode republishes messages from source broker to embedded broker.
 ///
 /// Setup:
-/// 1. Start source broker on port 18830
-/// 2. Start mirror with embedded broker on port 18831, connected to source
-/// 3. Connect test client to embedded broker (18831)
-/// 4. Publish message to source broker (18830)
+/// 1. Start source broker on dynamic port
+/// 2. Start mirror with embedded broker on dynamic port, connected to source
+/// 3. Connect test client to embedded broker
+/// 4. Publish message to source broker
 /// 5. Verify message arrives on test client via embedded broker
 #[tokio::test]
 async fn test_mirror_republishes_to_embedded_broker() {
     // Start source broker
-    let _source_broker = EmbeddedBroker::new(18830, BrokerMode::Standalone)
+    let source_port = get_free_port();
+    let _source_broker = EmbeddedBroker::new(source_port, BrokerMode::Standalone)
         .await
         .expect("Failed to start source broker");
 
@@ -31,23 +40,30 @@ async fn test_mirror_republishes_to_embedded_broker() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start mirror's embedded broker
-    let mirror_broker = EmbeddedBroker::new(18831, BrokerMode::Mirror)
+    let mirror_port = get_free_port();
+    let mirror_broker = EmbeddedBroker::new(mirror_port, BrokerMode::Mirror)
         .await
         .expect("Failed to start mirror broker");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Create source client for mirror (connects to source broker)
-    let source_config =
-        MqttClientConfig::new("127.0.0.1".to_string(), 18830, "mirror-source".to_string());
-    let source_client = MqttClient::new(source_config)
+    let source_config = MqttClientConfig::new(
+        "127.0.0.1".to_string(),
+        source_port,
+        "mirror-source".to_string(),
+    );
+    let source_client = MqttClientV5::new(source_config)
         .await
         .expect("Failed to create source client");
 
     // Connect publisher to source broker first
-    let publisher_config =
-        MqttClientConfig::new("127.0.0.1".to_string(), 18830, "test-publisher".to_string());
-    let publisher = MqttClient::new(publisher_config)
+    let publisher_config = MqttClientConfig::new(
+        "127.0.0.1".to_string(),
+        source_port,
+        "test-publisher".to_string(),
+    );
+    let publisher = MqttClientV5::new(publisher_config)
         .await
         .expect("Failed to create publisher");
 
@@ -56,15 +72,22 @@ async fn test_mirror_republishes_to_embedded_broker() {
 
     // Create mirror without CSV recording
     let topics = TopicFilter::wildcard();
-    let mut mirror = Mirror::new(source_client, mirror_broker, None, topics, QoS::AtMostOnce)
-        .await
-        .expect("Failed to create mirror");
+    let mut mirror = Mirror::new(
+        AnyMqttClient::V5(source_client),
+        mirror_broker,
+        None,
+        topics,
+        QoS::AtMostOnce,
+        false,
+    )
+    .await
+    .expect("Failed to create mirror");
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     // Run mirror in background task
-    let mirror_handle = tokio::spawn(async move { mirror.run(shutdown_rx).await });
+    let mirror_handle = tokio::spawn(async move { mirror.run(shutdown_rx, None).await });
 
     // Give mirror time to subscribe
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -72,10 +95,10 @@ async fn test_mirror_republishes_to_embedded_broker() {
     // Connect test subscriber to mirror's embedded broker BEFORE publishing
     let subscriber_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18831,
+        mirror_port,
         "test-subscriber".to_string(),
     );
-    let subscriber = MqttClient::new(subscriber_config)
+    let subscriber = MqttClientV5::new(subscriber_config)
         .await
         .expect("Failed to create subscriber");
 
@@ -88,7 +111,9 @@ async fn test_mirror_republishes_to_embedded_broker() {
     // Poll subscriber to establish connection and subscription
     loop {
         match subscriber.poll().await {
-            Ok(Event::Incoming(Packet::SubAck(_))) => break,
+            Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::SubAck(_))) => {
+                break
+            }
             Ok(_) => continue,
             Err(e) => panic!("Subscriber setup error: {}", e),
         }
@@ -110,8 +135,13 @@ async fn test_mirror_republishes_to_embedded_broker() {
     let received = timeout(Duration::from_secs(5), async {
         loop {
             match subscriber.poll().await {
-                Ok(Event::Incoming(Packet::Publish(publish))) => {
-                    return Some((publish.topic.clone(), publish.payload.to_vec()));
+                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(
+                    publish,
+                ))) => {
+                    return Some((
+                        String::from_utf8_lossy(&publish.topic).into_owned(),
+                        publish.payload.to_vec(),
+                    ));
                 }
                 Ok(_) => continue,
                 Err(_) => return None,
@@ -142,14 +172,16 @@ async fn test_mirror_records_to_csv() {
     let csv_path = temp_dir.path().join("mirror_output.csv");
 
     // Start source broker
-    let _source_broker = EmbeddedBroker::new(18832, BrokerMode::Standalone)
+    let source_port = get_free_port();
+    let _source_broker = EmbeddedBroker::new(source_port, BrokerMode::Standalone)
         .await
         .expect("Failed to start source broker");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start mirror's embedded broker
-    let mirror_broker = EmbeddedBroker::new(18833, BrokerMode::Mirror)
+    let mirror_port = get_free_port();
+    let mirror_broker = EmbeddedBroker::new(mirror_port, BrokerMode::Mirror)
         .await
         .expect("Failed to start mirror broker");
 
@@ -158,10 +190,10 @@ async fn test_mirror_records_to_csv() {
     // Connect publisher to source broker first
     let publisher_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18832,
+        source_port,
         "test-publisher-2".to_string(),
     );
-    let publisher = MqttClient::new(publisher_config)
+    let publisher = MqttClientV5::new(publisher_config)
         .await
         .expect("Failed to create publisher");
 
@@ -171,10 +203,10 @@ async fn test_mirror_records_to_csv() {
     // Create source client for mirror
     let source_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18832,
+        source_port,
         "mirror-source-2".to_string(),
     );
-    let source_client = MqttClient::new(source_config)
+    let source_client = MqttClientV5::new(source_config)
         .await
         .expect("Failed to create source client");
 
@@ -184,18 +216,19 @@ async fn test_mirror_records_to_csv() {
     // Create mirror with CSV recording
     let topics = TopicFilter::wildcard();
     let mut mirror = Mirror::new(
-        source_client,
+        AnyMqttClient::V5(source_client),
         mirror_broker,
         Some(writer),
         topics,
         QoS::AtMostOnce,
+        false,
     )
     .await
     .expect("Failed to create mirror");
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
-    let mirror_handle = tokio::spawn(async move { mirror.run(shutdown_rx).await });
+    let mirror_handle = tokio::spawn(async move { mirror.run(shutdown_rx, None).await });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -233,21 +266,23 @@ async fn test_mirror_records_to_csv() {
 /// In both cases, messages should always be republished to the embedded broker.
 #[tokio::test]
 async fn test_mirror_tui_record_toggle() {
-    use mqtt_recorder::tui::{AppMode, TuiState};
+    use mqtt_recorder::tui::TuiState;
     use std::sync::Arc;
 
     let temp_dir = tempdir().expect("Failed to create temp dir");
     let csv_path = temp_dir.path().join("toggle_output.csv");
 
     // Start source broker
-    let _source_broker = EmbeddedBroker::new(18834, BrokerMode::Standalone)
+    let source_port = get_free_port();
+    let _source_broker = EmbeddedBroker::new(source_port, BrokerMode::Standalone)
         .await
         .expect("Failed to start source broker");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start mirror's embedded broker
-    let mirror_broker = EmbeddedBroker::new(18835, BrokerMode::Mirror)
+    let mirror_port = get_free_port();
+    let mirror_broker = EmbeddedBroker::new(mirror_port, BrokerMode::Mirror)
         .await
         .expect("Failed to start mirror broker");
 
@@ -256,10 +291,10 @@ async fn test_mirror_tui_record_toggle() {
     // Connect publisher first
     let publisher_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18834,
+        source_port,
         "test-publisher-3".to_string(),
     );
-    let publisher = MqttClient::new(publisher_config)
+    let publisher = MqttClientV5::new(publisher_config)
         .await
         .expect("Failed to create publisher");
     let _ = publisher.poll().await;
@@ -267,10 +302,10 @@ async fn test_mirror_tui_record_toggle() {
     // Create source client for mirror
     let source_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18834,
+        source_port,
         "mirror-source-3".to_string(),
     );
-    let source_client = MqttClient::new(source_config)
+    let source_client = MqttClientV5::new(source_config)
         .await
         .expect("Failed to create source client");
 
@@ -278,26 +313,28 @@ async fn test_mirror_tui_record_toggle() {
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create CSV writer");
 
     // Create TUI state - recording starts OFF (will toggle ON later)
-    let tui_state = Arc::new(TuiState::new(
-        AppMode::Mirror,
-        18835,
-        Some(csv_path.to_string_lossy().to_string()),
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-    ));
+    let tui_state = Arc::new(TuiState::new(mqtt_recorder::tui::state::TuiConfig {
+        broker_port: mirror_port,
+        file_path: Some(csv_path.to_string_lossy().to_string()),
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    }));
     tui_state.set_recording(false); // Start with recording OFF
 
     // Create mirror with TUI state
     let topics = TopicFilter::wildcard();
     let mut mirror = Mirror::new(
-        source_client,
+        AnyMqttClient::V5(source_client),
         mirror_broker,
         Some(writer),
         topics,
         QoS::AtMostOnce,
+        false,
     )
     .await
     .expect("Failed to create mirror");
@@ -306,11 +343,8 @@ async fn test_mirror_tui_record_toggle() {
 
     // Clone tui_state for the mirror task
     let mirror_tui_state = tui_state.clone();
-    let mirror_handle = tokio::spawn(async move {
-        mirror
-            .run_with_tui(shutdown_rx, Some(mirror_tui_state))
-            .await
-    });
+    let mirror_handle =
+        tokio::spawn(async move { mirror.run(shutdown_rx, Some(mirror_tui_state)).await });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -359,21 +393,23 @@ async fn test_mirror_tui_record_toggle() {
 /// - Messages should still be recorded to CSV (if recording is enabled)
 #[tokio::test]
 async fn test_mirror_toggle_stops_republish_but_continues_recording() {
-    use mqtt_recorder::tui::{AppMode, TuiState};
+    use mqtt_recorder::tui::TuiState;
     use std::sync::Arc;
 
     let temp_dir = tempdir().expect("Failed to create temp dir");
     let csv_path = temp_dir.path().join("mirror_toggle_test.csv");
 
     // Start source broker
-    let _source_broker = EmbeddedBroker::new(18836, BrokerMode::Standalone)
+    let source_port = get_free_port();
+    let _source_broker = EmbeddedBroker::new(source_port, BrokerMode::Standalone)
         .await
         .expect("Failed to start source broker");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start mirror's embedded broker
-    let mirror_broker = EmbeddedBroker::new(18837, BrokerMode::Mirror)
+    let mirror_port = get_free_port();
+    let mirror_broker = EmbeddedBroker::new(mirror_port, BrokerMode::Mirror)
         .await
         .expect("Failed to start mirror broker");
 
@@ -382,10 +418,10 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     // Connect publisher
     let publisher_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18836,
+        source_port,
         "test-publisher-mirror".to_string(),
     );
-    let publisher = MqttClient::new(publisher_config)
+    let publisher = MqttClientV5::new(publisher_config)
         .await
         .expect("Failed to create publisher");
     let _ = publisher.poll().await;
@@ -393,10 +429,10 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     // Create source client for mirror
     let source_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18836,
+        source_port,
         "mirror-source-toggle".to_string(),
     );
-    let source_client = MqttClient::new(source_config)
+    let source_client = MqttClientV5::new(source_config)
         .await
         .expect("Failed to create source client");
 
@@ -404,26 +440,28 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     let writer = CsvWriter::new(&csv_path, false).expect("Failed to create CSV writer");
 
     // Create TUI state - recording ON, mirroring ON initially
-    let tui_state = Arc::new(TuiState::new(
-        AppMode::Mirror,
-        18837,
-        Some(csv_path.to_string_lossy().to_string()),
-        None,
-        1883,
-        None,
-        true,
-        vec![],
-    ));
+    let tui_state = Arc::new(TuiState::new(mqtt_recorder::tui::state::TuiConfig {
+        broker_port: mirror_port,
+        file_path: Some(csv_path.to_string_lossy().to_string()),
+        source_host: None,
+        source_port: 1883,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    }));
     tui_state.set_recording(true);
 
     // Create mirror
     let topics = TopicFilter::wildcard();
     let mut mirror = Mirror::new(
-        source_client,
+        AnyMqttClient::V5(source_client),
         mirror_broker,
         Some(writer),
         topics,
         QoS::AtMostOnce,
+        false,
     )
     .await
     .expect("Failed to create mirror");
@@ -431,21 +469,18 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     let mirror_tui_state = tui_state.clone();
-    let mirror_handle = tokio::spawn(async move {
-        mirror
-            .run_with_tui(shutdown_rx, Some(mirror_tui_state))
-            .await
-    });
+    let mirror_handle =
+        tokio::spawn(async move { mirror.run(shutdown_rx, Some(mirror_tui_state)).await });
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Connect subscriber to embedded broker
     let subscriber_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18837,
+        mirror_port,
         "test-subscriber-mirror".to_string(),
     );
-    let subscriber = MqttClient::new(subscriber_config)
+    let subscriber = MqttClientV5::new(subscriber_config)
         .await
         .expect("Failed to create subscriber");
 
@@ -457,7 +492,9 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     // Wait for subscription
     loop {
         match subscriber.poll().await {
-            Ok(Event::Incoming(Packet::SubAck(_))) => break,
+            Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::SubAck(_))) => {
+                break
+            }
             Ok(_) => continue,
             Err(e) => panic!("Subscriber setup error: {}", e),
         }
@@ -481,7 +518,9 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     let received_mirrored = timeout(Duration::from_secs(2), async {
         loop {
             match subscriber.poll().await {
-                Ok(Event::Incoming(Packet::Publish(p))) => return Some(p.topic.clone()),
+                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(
+                    p,
+                ))) => return Some(String::from_utf8_lossy(&p.topic).into_owned()),
                 Ok(_) => continue,
                 Err(_) => return None,
             }
@@ -517,7 +556,9 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
     let received_not_mirrored = timeout(Duration::from_millis(500), async {
         loop {
             match subscriber.poll().await {
-                Ok(Event::Incoming(Packet::Publish(p))) => return Some(p.topic.clone()),
+                Ok(rumqttc::v5::Event::Incoming(rumqttc::v5::mqttbytes::v5::Packet::Publish(
+                    p,
+                ))) => return Some(String::from_utf8_lossy(&p.topic).into_owned()),
                 Ok(_) => continue,
                 Err(_) => return None,
             }
@@ -565,18 +606,20 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
 /// 2. The error tracking infrastructure is in place
 #[tokio::test]
 async fn test_mirror_handles_source_broker_disconnect() {
-    use mqtt_recorder::tui::{AppMode, TuiState};
+    use mqtt_recorder::tui::TuiState;
     use std::sync::Arc;
 
     // Start source broker (we'll shut it down later)
-    let source_broker = EmbeddedBroker::new(18840, BrokerMode::Standalone)
+    let source_port = get_free_port();
+    let source_broker = EmbeddedBroker::new(source_port, BrokerMode::Standalone)
         .await
         .expect("Failed to start source broker");
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Start mirror's embedded broker
-    let mirror_broker = EmbeddedBroker::new(18841, BrokerMode::Mirror)
+    let mirror_port = get_free_port();
+    let mirror_broker = EmbeddedBroker::new(mirror_port, BrokerMode::Mirror)
         .await
         .expect("Failed to start mirror broker");
 
@@ -585,39 +628,44 @@ async fn test_mirror_handles_source_broker_disconnect() {
     // Create source client for mirror
     let source_config = MqttClientConfig::new(
         "127.0.0.1".to_string(),
-        18840,
+        source_port,
         "mirror-source-disconnect".to_string(),
     );
-    let source_client = MqttClient::new(source_config)
+    let source_client = MqttClientV5::new(source_config)
         .await
         .expect("Failed to create source client");
 
     // Create TUI state to capture errors
-    let tui_state = Arc::new(TuiState::new(
-        AppMode::Mirror,
-        18841,
-        None,
-        Some("127.0.0.1".to_string()),
-        18840,
-        None,
-        true,
-        vec![],
-    ));
+    let tui_state = Arc::new(TuiState::new(mqtt_recorder::tui::state::TuiConfig {
+        broker_port: mirror_port,
+        file_path: None,
+        source_host: Some("127.0.0.1".to_string()),
+        source_port,
+        initial_record: None,
+        initial_mirror: true,
+        playlist: vec![],
+        audit_enabled: true,
+        health_check_interval: 60,
+    }));
 
     // Create mirror
     let topics = TopicFilter::wildcard();
-    let mut mirror = Mirror::new(source_client, mirror_broker, None, topics, QoS::AtMostOnce)
-        .await
-        .expect("Failed to create mirror");
+    let mut mirror = Mirror::new(
+        AnyMqttClient::V5(source_client),
+        mirror_broker,
+        None,
+        topics,
+        QoS::AtMostOnce,
+        false,
+    )
+    .await
+    .expect("Failed to create mirror");
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
     let mirror_tui_state = tui_state.clone();
-    let mirror_handle = tokio::spawn(async move {
-        mirror
-            .run_with_tui(shutdown_rx, Some(mirror_tui_state))
-            .await
-    });
+    let mirror_handle =
+        tokio::spawn(async move { mirror.run(shutdown_rx, Some(mirror_tui_state)).await });
 
     // Let mirror establish connection
     tokio::time::sleep(Duration::from_millis(500)).await;

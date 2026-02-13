@@ -37,13 +37,13 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use rumqttc::QoS;
 use tokio::sync::broadcast;
 use tokio::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
 use crate::csv_handler::{CsvReader, MessageRecord};
 use crate::error::MqttRecorderError;
-use crate::mqtt::MqttClient;
+use crate::mqtt::{AnyMqttClient, MqttIncoming};
 use crate::tui::TuiState;
 
 /// Replayer for publishing MQTT messages from a CSV file.
@@ -66,7 +66,7 @@ use crate::tui::TuiState;
 /// - **5.11**: Handle interrupt signals for graceful shutdown
 pub struct Replayer {
     /// The MQTT client for broker communication.
-    client: MqttClient,
+    client: AnyMqttClient,
     /// The CSV reader for reading recorded messages.
     reader: CsvReader,
     /// Whether to loop replay continuously.
@@ -98,9 +98,9 @@ impl Replayer {
     /// let client = MqttClient::new(config).await?;
     /// let reader = CsvReader::new(Path::new("input.csv"), false, None)?;
     ///
-    /// let replayer = Replayer::new(client, reader, false).await;
+    /// let replayer = Replayer::new(client, reader, false);
     /// ```
-    pub async fn new(client: MqttClient, reader: CsvReader, loop_replay: bool) -> Self {
+    pub fn new(client: AnyMqttClient, reader: CsvReader, loop_replay: bool) -> Self {
         Self {
             client,
             reader,
@@ -121,6 +121,7 @@ impl Replayer {
     /// # Arguments
     ///
     /// * `shutdown` - A broadcast receiver for the shutdown signal
+    /// * `tui_state` - Optional TUI state for interactive mode
     ///
     /// # Returns
     ///
@@ -155,7 +156,7 @@ impl Replayer {
     ///
     /// // Run in a separate task
     /// let handle = tokio::spawn(async move {
-    ///     replayer.run(shutdown_rx).await
+    ///     replayer.run(shutdown_rx, None).await
     /// });
     ///
     /// // Later, trigger shutdown
@@ -163,45 +164,38 @@ impl Replayer {
     /// let count = handle.await??;
     /// println!("Replayed {} messages", count);
     /// ```
-    #[allow(dead_code)]
     pub async fn run(
-        &mut self,
-        shutdown: broadcast::Receiver<()>,
-    ) -> Result<u64, MqttRecorderError> {
-        self.run_with_tui(shutdown, None).await
-    }
-
-    pub async fn run_with_tui(
         &mut self,
         mut shutdown: broadcast::Receiver<()>,
         tui_state: Option<Arc<TuiState>>,
     ) -> Result<u64, MqttRecorderError> {
-        let tui_active = tui_state.is_some();
         let mut message_count: u64 = 0;
         let mut previous_timestamp: Option<DateTime<Utc>> = None;
 
-        if !tui_active {
-            eprintln!(
-                "Starting replay (loop: {})",
-                if self.loop_replay {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
-        }
+        info!(
+            "Starting replay (loop: {})",
+            if self.loop_replay {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
 
         // Initial connection check - poll once to establish connection
         match self.client.poll().await {
-            Ok(_) => {
-                if !tui_active {
-                    eprintln!("Connected to MQTT broker");
+            Ok(event) => {
+                if matches!(event, MqttIncoming::ConnAck) {
+                    if let Some(ref state) = tui_state {
+                        state.set_source_connected(true);
+                    }
                 }
+                info!("Connected to MQTT broker");
             }
             Err(e) => {
-                if !tui_active {
-                    eprintln!("Initial connection status: {}", e);
+                if let Some(ref state) = tui_state {
+                    state.set_source_connected(false);
                 }
+                warn!("Initial connection status: {}", e);
             }
         }
 
@@ -230,16 +224,20 @@ impl Replayer {
                                 }
                                 tokio::select! {
                                     _ = shutdown.recv() => {
-                                        if !tui_active {
-                                            eprintln!("Shutdown signal received during delay, stopping replayer...");
-                                        }
+                                        info!("Shutdown signal received during delay, stopping replayer...");
                                         return Ok(message_count);
                                     }
                                     // Poll event loop to handle pings; this drives the connection
                                     poll_result = self.client.poll() => {
                                         match poll_result {
-                                            Ok(_) => {}
-                                            Err(e) if Self::is_fatal_error(&e) => return Err(e),
+                                            Ok(event) => {
+                                                if matches!(event, MqttIncoming::ConnAck) {
+                                                    if let Some(ref state) = tui_state {
+                                                        state.set_source_connected(true);
+                                                    }
+                                                }
+                                            }
+                                            Err(e) if crate::util::is_fatal_error(&e, false) => return Err(e),
                                             Err(_) => {}
                                         }
                                     }
@@ -260,10 +258,8 @@ impl Replayer {
                             }
                         }
                         Err(e) => {
-                            if !tui_active {
-                                eprintln!("Error publishing message: {}", e);
-                            }
-                            if Self::is_fatal_error(&e) {
+                            error!("Error publishing message: {}", e);
+                            if crate::util::is_fatal_error(&e, false) {
                                 return Err(e);
                             }
                         }
@@ -271,7 +267,7 @@ impl Replayer {
 
                     // Poll to process pending events
                     if let Err(e) = self.poll_events().await {
-                        if Self::is_fatal_error(&e) {
+                        if crate::util::is_fatal_error(&e, false) {
                             return Err(e);
                         }
                     }
@@ -279,35 +275,27 @@ impl Replayer {
                     // Check for shutdown signal (non-blocking)
                     match shutdown.try_recv() {
                         Ok(_) => {
-                            if !tui_active {
-                                eprintln!("Shutdown signal received, stopping replayer...");
-                            }
+                            info!("Shutdown signal received, stopping replayer...");
                             break;
                         }
                         Err(broadcast::error::TryRecvError::Empty) => {}
                         Err(broadcast::error::TryRecvError::Closed) => {
-                            if !tui_active {
-                                eprintln!("Shutdown channel closed, stopping replayer...");
-                            }
+                            info!("Shutdown channel closed, stopping replayer...");
                             break;
                         }
                         Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                     }
                 }
                 Some(Err(e)) => {
-                    if !tui_active {
-                        eprintln!("Error reading CSV record: {}", e);
-                    }
+                    error!("Error reading CSV record: {}", e);
                     return Err(e);
                 }
                 None => {
                     if self.loop_replay {
-                        if !tui_active {
-                            eprintln!(
-                                "End of file reached, restarting replay... ({} messages so far)",
-                                message_count
-                            );
-                        }
+                        info!(
+                            "End of file reached, restarting replay... ({} messages so far)",
+                            message_count
+                        );
                         self.reader.reset()?;
                         previous_timestamp = None;
                     } else {
@@ -317,15 +305,13 @@ impl Replayer {
             }
         }
 
-        if let Err(e) = self.client.disconnect().await {
-            if !tui_active {
-                eprintln!("Warning: Error disconnecting from broker: {}", e);
-            }
-        }
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
+            self.client.disconnect(),
+        )
+        .await;
 
-        if !tui_active {
-            eprintln!("Replay complete. {} messages replayed.", message_count);
-        }
+        info!("Replay complete. {} messages replayed.", message_count);
 
         Ok(message_count)
     }
@@ -352,7 +338,7 @@ impl Replayer {
     /// - **5.6**: Decode base64 payloads before publishing (handled by CsvReader)
     async fn publish_message(&self, record: &MessageRecord) -> Result<(), MqttRecorderError> {
         // Convert QoS u8 to rumqttc QoS enum (Requirement 5.3)
-        let qos = Self::u8_to_qos(record.qos);
+        let qos = crate::util::u8_to_qos(record.qos);
 
         // Publish with preserved topic, payload, QoS, and retain flag
         // (Requirements 5.2, 5.3, 5.4)
@@ -391,25 +377,6 @@ impl Replayer {
         }
     }
 
-    /// Converts a u8 QoS value to rumqttc QoS enum.
-    ///
-    /// # Arguments
-    ///
-    /// * `qos` - The QoS value as u8 (0, 1, or 2)
-    ///
-    /// # Returns
-    ///
-    /// The corresponding rumqttc QoS enum value.
-    /// Defaults to `QoS::AtMostOnce` for invalid values.
-    fn u8_to_qos(qos: u8) -> QoS {
-        match qos {
-            0 => QoS::AtMostOnce,
-            1 => QoS::AtLeastOnce,
-            2 => QoS::ExactlyOnce,
-            _ => QoS::AtMostOnce, // Default to QoS 0 for invalid values
-        }
-    }
-
     /// Polls the MQTT event loop to process pending events.
     ///
     /// This is needed to maintain the connection and handle acknowledgments.
@@ -418,35 +385,6 @@ impl Replayer {
         match tokio::time::timeout(Duration::from_millis(10), self.client.poll()).await {
             Ok(result) => result.map(|_| ()),
             Err(_) => Ok(()), // Timeout is fine, just means no events pending
-        }
-    }
-
-    /// Determines if an error is fatal and should stop replay.
-    ///
-    /// Some errors are recoverable (e.g., temporary network issues),
-    /// while others indicate a permanent failure.
-    ///
-    /// # Arguments
-    ///
-    /// * `error` - The error to check
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` if the error is fatal and replay should stop.
-    fn is_fatal_error(error: &MqttRecorderError) -> bool {
-        match error {
-            // Connection errors are typically fatal
-            MqttRecorderError::Connection(_) => true,
-            // Client errors might be recoverable
-            MqttRecorderError::Client(_) => false,
-            // IO errors are fatal
-            MqttRecorderError::Io(_) => true,
-            // CSV errors are fatal
-            MqttRecorderError::Csv(_) => true,
-            // Invalid argument errors are fatal (bad CSV data)
-            MqttRecorderError::InvalidArgument(_) => true,
-            // Other errors
-            _ => false,
         }
     }
 }
@@ -491,43 +429,6 @@ mod tests {
 
         let delay = Replayer::calculate_delay(&ts1, &ts2);
         assert_eq!(delay, Duration::ZERO);
-    }
-
-    #[test]
-    fn test_u8_to_qos_valid_values() {
-        assert!(matches!(Replayer::u8_to_qos(0), QoS::AtMostOnce));
-        assert!(matches!(Replayer::u8_to_qos(1), QoS::AtLeastOnce));
-        assert!(matches!(Replayer::u8_to_qos(2), QoS::ExactlyOnce));
-    }
-
-    #[test]
-    fn test_u8_to_qos_invalid_values() {
-        // Invalid values should default to QoS 0
-        assert!(matches!(Replayer::u8_to_qos(3), QoS::AtMostOnce));
-        assert!(matches!(Replayer::u8_to_qos(255), QoS::AtMostOnce));
-    }
-
-    #[test]
-    fn test_is_fatal_error() {
-        // IO errors should be fatal
-        let io_error = MqttRecorderError::Io(std::io::Error::other("test"));
-        assert!(Replayer::is_fatal_error(&io_error));
-
-        // CSV errors should be fatal
-        let csv_error = MqttRecorderError::Csv(csv::Error::from(std::io::Error::other("test")));
-        assert!(Replayer::is_fatal_error(&csv_error));
-
-        // Invalid argument errors should be fatal
-        let arg_error = MqttRecorderError::InvalidArgument("test".to_string());
-        assert!(Replayer::is_fatal_error(&arg_error));
-
-        // TLS errors should not be fatal (they occur during setup, not replay)
-        let tls_error = MqttRecorderError::Tls("test".to_string());
-        assert!(!Replayer::is_fatal_error(&tls_error));
-
-        // Broker errors should not be fatal
-        let broker_error = MqttRecorderError::Broker("test".to_string());
-        assert!(!Replayer::is_fatal_error(&broker_error));
     }
 
     #[test]
