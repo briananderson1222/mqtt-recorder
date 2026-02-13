@@ -33,15 +33,27 @@ src/
 ├── main.rs          # Application entry point, mode dispatch, signal handling
 ├── lib.rs           # Library exports
 ├── cli.rs           # CLI argument parsing (clap)
-├── mqtt.rs          # MQTT client wrapper (rumqttc)
+├── mqtt.rs          # MQTT client wrapper (rumqttc v4/v5)
 ├── broker.rs        # Embedded broker (rumqttd)
-├── csv_handler.rs   # CSV reading/writing, binary detection, auto-encoding
+├── csv_handler/     # CSV reading/writing, binary detection, auto-encoding
+│   ├── mod.rs       # Module exports
+│   ├── reader.rs    # CSV reading and decoding
+│   ├── writer.rs    # CSV writing and encoding
+│   ├── record.rs    # MessageRecord struct
+│   └── encoding.rs  # Binary detection and base64 encoding
+├── tui/             # Interactive terminal UI (ratatui)
+│   ├── mod.rs       # Module exports
+│   ├── state.rs     # TUI state management
+│   ├── render.rs    # UI rendering
+│   ├── input.rs     # Keyboard input handling
+│   └── types.rs     # TUI type definitions
 ├── validator.rs     # CSV validation logic
 ├── fixer.rs         # CSV repair logic
 ├── topics.rs        # Topic filter and JSON parsing
 ├── recorder.rs      # Record mode handler
 ├── replayer.rs      # Replay mode handler
 ├── mirror.rs        # Mirror mode handler
+├── util.rs          # Shared utilities
 └── error.rs         # Custom error types (thiserror)
 ```
 
@@ -51,6 +63,7 @@ src/
 - **rumqttc**: MQTT client library
 - **rumqttd**: Embedded MQTT broker
 - **tokio**: Async runtime
+- **ratatui/crossterm**: Terminal UI rendering and input
 - **serde/serde_json**: JSON serialization
 - **csv**: CSV file handling
 - **base64**: Payload encoding
@@ -115,7 +128,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) format:
 
 ### Modifying CSV Format
 
-1. Update `MessageRecord` struct in `src/csv_handler.rs`
+1. Update `MessageRecord` struct in `src/csv_handler/record.rs`
 2. Update `CsvWriter` and `CsvReader` implementations
 3. Update property tests in `tests/property/csv_props.rs`
 4. Update README.md CSV format documentation
@@ -191,7 +204,7 @@ When modifying core logic, ensure property tests still pass.
 | `Cargo.toml` | Dependencies and project configuration |
 | `src/cli.rs` | All CLI arguments and validation |
 | `src/error.rs` | Error type definitions |
-| `src/csv_handler.rs` | CSV format, binary detection, auto-encoding |
+| `src/csv_handler/` | CSV format, binary detection, auto-encoding |
 | `src/validator.rs` | CSV validation logic |
 | `src/fixer.rs` | CSV repair logic |
 | `.github/workflows/ci.yml` | CI pipeline configuration |
@@ -274,3 +287,17 @@ Capture corrections and unique patterns discovered while working in this repo:
 - All mismatches log the actual payload content (text or hex) to the audit log for debugging
 - Use `--verify` as the primary debugging tool when investigating data integrity issues between source and embedded broker — if verify shows clean matches but CSV output differs, the bug is in the CSV layer
 - The verify subscriber is registered as an internal client so it doesn't inflate the broker connection count
+
+### TUI State as Source of Truth
+
+- TUI state (`TuiState`) should NEVER be the source of truth for initialization data — resolve config values (file paths, flags) from CLI args before creating TuiState
+- TUI state IS the correct source of truth for runtime user intent (toggle states set via keyboard input)
+- Counters (`received_count`, `recorded_count`, `verify_matched`, etc.) and audit log are currently coupled to `TuiState`, which only exists when `--serve` is active. Non-serve modes use local variables and `info!()` for final summaries.
+- **Design debt**: Extract a `SessionStats` struct (counters + audit) that lives independently of TUI. `TuiState` would hold a reference to it. All mode handlers would receive `SessionStats` regardless of `--serve`. Do this when adding `--json-summary`, metrics endpoints, or daemon mode.
+
+### Unified Serve Mode
+
+- When `--serve` + `--host` are both present, all modes route through the mirror event loop (`run_mirror_mode`). The `--mode` flag only sets initial toggle states (record ON/OFF, mirror ON/OFF, playback ON/OFF).
+- `run_record_mode` only runs without `--serve` (simple CLI recording, no TUI)
+- `run_replay_mode` only runs for `--serve` without `--host` (playback to embedded broker, no source)
+- This ensures all TUI toggles (record/mirror/playback) actually work regardless of which `--mode` was specified

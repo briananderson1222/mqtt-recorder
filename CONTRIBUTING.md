@@ -25,7 +25,7 @@ Please be respectful and constructive in all interactions. We welcome contributo
    ```
 3. Add the upstream remote:
    ```bash
-   git remote add upstream https://github.com/ORIGINAL_OWNER/mqtt-recorder.git
+   git remote add upstream https://github.com/briananderson1222/mqtt-recorder.git
    ```
 4. Build the project:
    ```bash
@@ -183,17 +183,31 @@ Guidelines:
 ```
 mqtt-recorder/
 ├── src/
-│   ├── main.rs          # Entry point
+│   ├── main.rs          # Entry point, mode dispatch, signal handling
 │   ├── lib.rs           # Library exports
-│   ├── cli.rs           # CLI argument parsing
-│   ├── mqtt.rs          # MQTT client
-│   ├── broker.rs        # Embedded broker
-│   ├── csv_handler.rs   # CSV handling
-│   ├── topics.rs        # Topic filtering
-│   ├── recorder.rs      # Record mode
-│   ├── replayer.rs      # Replay mode
-│   ├── mirror.rs        # Mirror mode
-│   └── error.rs         # Error types
+│   ├── cli.rs           # CLI argument parsing (clap)
+│   ├── mqtt.rs          # MQTT client wrapper (v4/v5)
+│   ├── broker.rs        # Embedded MQTT broker (rumqttd)
+│   ├── csv_handler/     # CSV handling
+│   │   ├── mod.rs       # Module exports
+│   │   ├── reader.rs    # CSV reading and decoding
+│   │   ├── writer.rs    # CSV writing and encoding
+│   │   ├── record.rs    # MessageRecord struct
+│   │   └── encoding.rs  # Binary detection and base64 encoding
+│   ├── tui/             # Interactive terminal UI (ratatui)
+│   │   ├── mod.rs       # Module exports
+│   │   ├── state.rs     # TUI state management
+│   │   ├── render.rs    # UI rendering
+│   │   ├── input.rs     # Keyboard input handling
+│   │   └── types.rs     # TUI type definitions
+│   ├── topics.rs        # Topic filtering and JSON parsing
+│   ├── recorder.rs      # Record mode handler
+│   ├── replayer.rs      # Replay mode handler
+│   ├── mirror.rs        # Mirror mode handler
+│   ├── validator.rs     # CSV validation logic
+│   ├── fixer.rs         # CSV repair logic
+│   ├── util.rs          # Shared utilities
+│   └── error.rs         # Error types (thiserror)
 ├── tests/
 │   ├── property/        # Property-based tests
 │   └── integration/     # Integration tests

@@ -2,7 +2,7 @@
 
 A command-line tool for recording and replaying MQTT messages, written in Rust.
 
-[![CI](https://github.com/YOUR_USERNAME/mqtt-recorder/actions/workflows/ci.yml/badge.svg)](https://github.com/YOUR_USERNAME/mqtt-recorder/actions/workflows/ci.yml)
+[![CI](https://github.com/briananderson1222/mqtt-recorder/actions/workflows/ci.yml/badge.svg)](https://github.com/briananderson1222/mqtt-recorder/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
 ## Features
@@ -11,6 +11,12 @@ A command-line tool for recording and replaying MQTT messages, written in Rust.
 - **Replay Mode**: Read messages from a CSV file and publish them to a broker with timing preservation
 - **Mirror Mode**: Subscribe to an external broker and republish messages to an embedded broker in real-time
 - **Standalone Broker**: Run an embedded MQTT broker without any recording or replaying
+- **Interactive TUI**: Real-time terminal dashboard with controls for recording, mirroring, playback, and audit log viewing
+- **Verify Mode**: Independent message verification for mirror mode — compares source messages against embedded broker output
+- **Audit Logging**: Structured audit log with area/severity, viewable in TUI and optionally written to file
+- **Playlist Support**: Load multiple CSV files for playback selection in replay mode
+- **Health Check Monitoring**: Periodic broker health checks reporting connections, subscriptions, and publish metrics
+- **MQTT v3.1.1 and v5**: Configurable protocol version for external broker connections (v5 default); embedded broker runs v5
 - **TLS/SSL Support**: Connect to secured brokers with certificate authentication
 - **Base64 Encoding**: Optionally encode binary payloads as base64 for safe CSV storage
 - **Automatic Binary Detection**: Automatically detects and encodes binary payloads with a `b64:` prefix
@@ -25,7 +31,7 @@ A command-line tool for recording and replaying MQTT messages, written in Rust.
 Ensure you have Rust installed (1.70 or later recommended), then:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/mqtt-recorder.git
+git clone https://github.com/briananderson1222/mqtt-recorder.git
 cd mqtt-recorder
 cargo build --release
 ```
@@ -34,7 +40,7 @@ The binary will be available at `target/release/mqtt-recorder`.
 
 ### From Releases
 
-Download pre-built binaries from the [Releases](https://github.com/YOUR_USERNAME/mqtt-recorder/releases) page for:
+Download pre-built binaries from the [Releases](https://github.com/briananderson1222/mqtt-recorder/releases) page for:
 - Linux (x86_64)
 - macOS (x86_64, aarch64)
 - Windows (x86_64)
@@ -192,6 +198,50 @@ mqtt-recorder --mode replay \
   --file messages.csv
 ```
 
+### Interactive TUI Mode
+
+The TUI is enabled by default when running interactively. Disable it for scripting:
+
+```bash
+# Run mirror mode without TUI
+mqtt-recorder --mode mirror --host broker.example.com --serve --no_interactive
+```
+
+### Verify Mirrored Messages
+
+Compare source messages against what the embedded broker actually delivers:
+
+```bash
+mqtt-recorder --mode mirror \
+  --host broker.example.com \
+  --serve \
+  --serve_port 1884 \
+  --verify
+```
+
+### Audit Logging to File
+
+Write structured audit events to a file:
+
+```bash
+mqtt-recorder --mode mirror \
+  --host broker.example.com \
+  --serve \
+  --audit_log /tmp/audit.log
+```
+
+### Playlist Replay
+
+Load multiple CSV files for playback selection:
+
+```bash
+mqtt-recorder --mode replay \
+  --serve \
+  --file main.csv \
+  --playlist extra1.csv \
+  --playlist extra2.csv
+```
+
 ## CLI Reference
 
 ### Global Options
@@ -217,6 +267,28 @@ mqtt-recorder --mode replay \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--loop` | Loop replay continuously | `false` |
+| `--playlist` | Additional CSV files for playback selection (repeatable) | None |
+
+### Mirror Options
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--mirror` | Start with mirroring enabled | `true` |
+| `--verify` | Verify mirrored messages against embedded broker output | `false` |
+
+### TUI Options
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--no_interactive` | Disable interactive TUI mode | `false` |
+| `--record` | Start with recording enabled | `true` if `--file` provided |
+
+### Audit Options
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--audit` | Enable audit logging in TUI | `true` |
+| `--audit_log` | Path to write audit log file (auto-enables file writing) | None |
 
 ### TLS/SSL Options
 
@@ -256,6 +328,7 @@ mqtt-recorder --mode replay \
 |----------|-------------|---------|
 | `--max_packet_size` | Maximum MQTT packet size in bytes | `1048576` (1MB) |
 | `--mqtt_version` | MQTT protocol version for external brokers (`3.1.1` or `5`) | `5` |
+| `--health_check` | Health check interval in seconds (0 to disable) | `60` |
 
 ### Embedded Broker Options
 
