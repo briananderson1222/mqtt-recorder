@@ -38,7 +38,7 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rumqttc::QoS;
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -471,6 +471,7 @@ impl Mirror {
         let mut playback_reader: Option<CsvReader> = None;
         let mut was_playback_on = false;
         let mut was_recording = tui_state.as_ref().map(|s| s.is_recording()).unwrap_or(true);
+        let mut previous_playback_ts: Option<DateTime<Utc>> = None;
 
         loop {
             if let Some(ref state) = tui_state {
@@ -485,17 +486,27 @@ impl Mirror {
                 .map(|s| s.loop_enabled.load(Ordering::Relaxed) && !s.is_recording())
                 .unwrap_or(false);
 
+            let prev_was_on = was_playback_on;
             was_playback_on = self.handle_playback_transition(
                 &tui_state,
                 &mut playback_reader,
                 playback_on,
-                was_playback_on,
+                prev_was_on,
             );
+            // Reset timestamp tracking on playback start/restart
+            if was_playback_on && !prev_was_on {
+                previous_playback_ts = None;
+            }
 
             // Process one playback record if active
             if playback_reader.is_some() {
-                self.process_playback_record(&mut playback_reader, &tui_state, &verify_ready)
-                    .await?;
+                self.process_playback_record(
+                    &mut playback_reader,
+                    &tui_state,
+                    &verify_ready,
+                    &mut previous_playback_ts,
+                )
+                .await?;
             }
 
             // Check if source is enabled (pause incoming messages)
@@ -677,10 +688,29 @@ impl Mirror {
         playback_reader: &mut Option<CsvReader>,
         tui_state: &Option<std::sync::Arc<TuiState>>,
         verify_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        previous_ts: &mut Option<DateTime<Utc>>,
     ) -> Result<(), MqttRecorderError> {
         if let Some(ref mut reader) = playback_reader {
             match reader.read_next() {
                 Some(Ok(record)) => {
+                    // Apply speed-based delay between records
+                    let speed = tui_state
+                        .as_ref()
+                        .map(|s| s.get_playback_speed())
+                        .unwrap_or(crate::util::DEFAULT_PLAYBACK_SPEED);
+                    if speed != 0.0 {
+                        if let Some(prev) = previous_ts {
+                            let diff = record.timestamp - *prev;
+                            if diff.num_milliseconds() > 0 {
+                                let delay_ms = diff.num_milliseconds() as f64 / speed as f64;
+                                tokio::time::sleep(tokio::time::Duration::from_millis(
+                                    delay_ms as u64,
+                                ))
+                                .await;
+                            }
+                        }
+                    }
+                    *previous_ts = Some(record.timestamp);
                     if verify_ready.load(Ordering::Relaxed) {
                         if let Some(ref tx) = self.verify_tx {
                             let _ =
@@ -729,6 +759,7 @@ impl Mirror {
                             }
                             *playback_reader = None;
                         }
+                        *previous_ts = None;
                     } else {
                         // One-time mode: mark finished
                         if let Some(ref state) = tui_state {

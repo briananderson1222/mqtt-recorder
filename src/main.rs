@@ -520,7 +520,7 @@ async fn run_replay_mode(
         })?;
 
     // Create and run replayer
-    let mut replayer = Replayer::new(client, reader, args.loop_replay);
+    let mut replayer = Replayer::new(client, reader, args.loop_replay, args.speed);
 
     // Run the replay loop (Requirements 5.1-5.11)
     let tui_ref = tui_state.clone();
@@ -656,6 +656,9 @@ async fn shutdown_broker_with_audit(
 }
 
 /// Spawn the TUI rendering task if interactive mode is enabled and TUI state exists.
+///
+/// Uses `spawn_blocking` because the TUI does blocking I/O (crossterm::event::poll)
+/// which would starve tokio worker threads if run in a regular `spawn` task.
 fn spawn_tui_task(
     enable_tui: bool,
     tui_state: &Option<std::sync::Arc<TuiState>>,
@@ -668,10 +671,13 @@ fn spawn_tui_task(
     let state_clone = state.clone();
     let shutdown_tx_clone = shutdown_tx.clone();
     let shutdown_rx = shutdown_tx.subscribe();
-    Some(tokio::spawn(async move {
-        if let Err(e) = tui::run_tui(state_clone, shutdown_tx_clone, shutdown_rx).await {
-            error!("TUI error: {}", e);
-        }
+    Some(tokio::task::spawn_blocking(move || {
+        let rt = tokio::runtime::Handle::current();
+        rt.block_on(async move {
+            if let Err(e) = tui::run_tui(state_clone, shutdown_tx_clone, shutdown_rx).await {
+                error!("TUI error: {}", e);
+            }
+        });
     }))
 }
 
@@ -709,6 +715,7 @@ fn create_tui_state(args: &Args) -> Option<std::sync::Arc<TuiState>> {
         playlist,
         audit_enabled: args.audit,
         health_check_interval: args.health_check,
+        initial_speed: args.speed,
     }));
     if let Some(ref path) = args.audit_log {
         tui.set_audit_file_path(path.display().to_string());

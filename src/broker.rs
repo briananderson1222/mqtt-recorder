@@ -37,11 +37,12 @@ const MAX_BROKER_CONNECTIONS: usize = 1000;
 /// Maximum number of outgoing packets queued per connection.
 const MAX_OUTGOING_PACKET_COUNT: u64 = 10000;
 
-/// Maximum size of each commit log segment in bytes (1 MB).
-const MAX_SEGMENT_SIZE: usize = 1024 * 1024;
+/// Maximum size of each commit log segment in bytes (100 MB).
+/// Large segments reduce rotation frequency during high-throughput replay.
+const MAX_SEGMENT_SIZE: usize = 100 * 1024 * 1024;
 
 /// Maximum number of segments in the commit log.
-const MAX_SEGMENT_COUNT: usize = 100;
+const MAX_SEGMENT_COUNT: usize = 10;
 
 /// Connection timeout in milliseconds (60 seconds).
 const CONNECTION_TIMEOUT_MS: u16 = 60000;
@@ -290,9 +291,9 @@ impl EmbeddedBroker {
         // Create metrics config so the timer thread pushes data to MetersLink
         // Both Meters and Alerts must be present to avoid a panic in rumqttd's timer.rs
         // (the select! macro evaluates unwrap() before checking the if-guard)
-        let meter_settings: MetricSettings = serde_json::from_str(r#"{"push_interval": 1}"#)
+        let meter_settings: MetricSettings = serde_json::from_str(r#"{"push_interval": 5}"#)
             .map_err(|e| MqttRecorderError::Broker(format!("metrics config: {}", e)))?;
-        let alert_settings: MetricSettings = serde_json::from_str(r#"{"push_interval": 30}"#)
+        let alert_settings: MetricSettings = serde_json::from_str(r#"{"push_interval": 60}"#)
             .map_err(|e| MqttRecorderError::Broker(format!("metrics config: {}", e)))?;
         let mut metrics = HashMap::new();
         metrics.insert(MetricType::Meters, meter_settings);

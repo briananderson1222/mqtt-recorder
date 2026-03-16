@@ -34,6 +34,7 @@ fn make_tui_state(broker_port: u16, file_path: Option<String>) -> Arc<TuiState> 
         playlist: vec![],
         audit_enabled: false,
         health_check_interval: 0,
+        initial_speed: 1.0,
     }))
 }
 

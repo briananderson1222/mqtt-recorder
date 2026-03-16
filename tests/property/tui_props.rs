@@ -75,6 +75,7 @@ proptest! {
             playlist: vec![],
             audit_enabled: true,
             health_check_interval: 60,
+            initial_speed: 1.0,
         });
         for _ in 0..count {
             state.increment_received();
@@ -94,6 +95,7 @@ proptest! {
             playlist: vec![],
             audit_enabled: true,
             health_check_interval: 60,
+            initial_speed: 1.0,
         });
         prop_assert_eq!(state.broker_port, port);
     }
@@ -110,6 +112,7 @@ proptest! {
             playlist: vec![],
             audit_enabled: true,
             health_check_interval: 60,
+            initial_speed: 1.0,
         });
         prop_assert_eq!(state.get_file_path(), Some(path));
     }
@@ -127,6 +130,7 @@ fn property_3_tui_state_recording_toggle() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
 
     // Initially true (file path provided)
@@ -153,6 +157,7 @@ fn property_3_tui_state_mirroring_toggle() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
 
     // Initially true
@@ -179,6 +184,7 @@ fn property_3_tui_state_source_toggle() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
 
     // Initially true
@@ -205,6 +211,7 @@ fn property_3_tui_state_loop_toggle() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
 
     // Initially false
@@ -235,6 +242,7 @@ fn property_4_tui_state_initial_counts_zero() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
     assert_eq!(state.get_received_count(), 0);
     assert_eq!(state.get_mirrored_count(), 0);
@@ -254,6 +262,7 @@ fn property_4_tui_state_initial_loop_disabled() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
     assert!(!state.loop_enabled.load(Ordering::Relaxed));
 }
@@ -270,6 +279,7 @@ fn property_4_tui_state_none_file_path() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
     assert!(state.get_file_path().is_none());
 }
@@ -286,6 +296,7 @@ fn property_4_tui_state_set_new_file_updates_both_paths() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
 
     state.set_new_file("swapped.csv".to_string());
@@ -312,6 +323,7 @@ fn property_4_tui_state_quit_requested_initially_false() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
     assert!(!state.is_quit_requested());
 }
@@ -328,6 +340,7 @@ fn property_4_tui_state_request_quit() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
     state.request_quit();
     assert!(state.is_quit_requested());
@@ -367,6 +380,7 @@ fn property_6_broker_connections_initializes_to_zero() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     });
     assert_eq!(state.get_broker_connections(), 0);
 }
@@ -384,6 +398,7 @@ proptest! {
             playlist: vec![],
             audit_enabled: true,
             health_check_interval: 60,
+            initial_speed: 1.0,
         });
         state.set_broker_connections(n);
         prop_assert_eq!(state.get_broker_connections(), n);
@@ -404,6 +419,7 @@ fn property_7_broker_connections_atomic() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     }));
     let handles: Vec<_> = (0..10)
         .map(|i| {

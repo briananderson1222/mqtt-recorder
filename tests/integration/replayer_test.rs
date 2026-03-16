@@ -110,7 +110,7 @@ async fn test_replayer_publishes_csv_messages() {
 
     let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false);
+    let mut replayer = Replayer::new(replayer_client, reader, false, 0.0);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
@@ -172,7 +172,7 @@ async fn test_replayer_preserves_message_fields() {
 
     let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false);
+    let mut replayer = Replayer::new(replayer_client, reader, false, 0.0);
 
     let (_shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
@@ -219,7 +219,7 @@ async fn test_replayer_exits_after_all_messages() {
 
     let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false);
+    let mut replayer = Replayer::new(replayer_client, reader, false, 0.0);
 
     let (_shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
 
@@ -281,7 +281,7 @@ async fn test_replayer_loops_continuously() {
 
     let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, true);
+    let mut replayer = Replayer::new(replayer_client, reader, true, 0.0);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
@@ -354,7 +354,7 @@ async fn test_replayer_handles_shutdown_during_replay() {
 
     let replayer_client = AnyMqttClient::V5(make_client(port, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false);
+    let mut replayer = Replayer::new(replayer_client, reader, false, 1.0);
 
     let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
     let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
@@ -480,7 +480,7 @@ async fn test_record_then_replay_roundtrip() {
 
     let replayer_client = AnyMqttClient::V5(make_client(port_b, "replayer").await);
     let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
-    let mut replayer = Replayer::new(replayer_client, reader, false);
+    let mut replayer = Replayer::new(replayer_client, reader, false, 0.0);
 
     let (rep_shutdown_tx, rep_shutdown_rx) = broadcast::channel::<()>(1);
     let rep_handle = tokio::spawn(async move { replayer.run(rep_shutdown_rx, None).await });

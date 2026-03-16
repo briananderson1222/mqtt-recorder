@@ -23,6 +23,16 @@ pub const BROKER_READY_TIMEOUT_SECS: u64 = 5;
 /// Timeout in seconds when waiting for the embedded broker to shut down.
 pub const BROKER_SHUTDOWN_TIMEOUT_SECS: u64 = 2;
 
+/// Default playback speed multiplier (1.0 = real-time).
+pub const DEFAULT_PLAYBACK_SPEED: f32 = 1.0;
+
+/// Interval in milliseconds between batched event loop polls during replay.
+pub const POLL_BATCH_INTERVAL_MS: u64 = 100;
+
+/// Preset speed values for cycling through with +/- keys.
+/// 0 = max speed (no delay).
+pub const SPEED_PRESETS: &[f32] = &[0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0];
+
 /// Convert QoS enum to u8 value.
 ///
 /// # Arguments

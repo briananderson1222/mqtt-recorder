@@ -579,9 +579,12 @@ impl MqttClient {
         self.client.disconnect().await?;
         Ok(())
     }
-}
 
-/// MQTT v5 client wrapper around rumqttc::v5.
+    /// Get a clone of the eventloop Arc for spawning a background poll task.
+    pub fn eventloop(&self) -> Arc<Mutex<EventLoop>> {
+        Arc::clone(&self.eventloop)
+    }
+}
 ///
 /// Used for connections to the embedded broker which runs a v5 listener.
 /// Provides the same public API as `MqttClient` but uses MQTT v5 protocol.
@@ -756,6 +759,48 @@ impl AnyMqttClient {
         match self {
             Self::V4(c) => c.disconnect().await,
             Self::V5(c) => c.disconnect().await,
+        }
+    }
+
+    /// Spawn a background task that continuously polls the event loop.
+    ///
+    /// This drives network I/O (sending queued publishes, receiving acks,
+    /// handling keepalive) independently of the main task, preventing
+    /// channel backpressure from blocking `publish()`.
+    ///
+    /// Returns a `JoinHandle` that should be aborted when done.
+    pub fn spawn_poll_task(&self) -> tokio::task::JoinHandle<()> {
+        match self {
+            Self::V4(c) => {
+                let el = c.eventloop();
+                tokio::spawn(async move {
+                    loop {
+                        let mut eventloop = el.lock().await;
+                        match eventloop.poll().await {
+                            Ok(_) => {}
+                            Err(_) => {
+                                drop(eventloop);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                })
+            }
+            Self::V5(c) => {
+                let el = c.eventloop();
+                tokio::spawn(async move {
+                    loop {
+                        let mut eventloop = el.lock().await;
+                        match eventloop.poll().await {
+                            Ok(_) => {}
+                            Err(_) => {
+                                drop(eventloop);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
+                            }
+                        }
+                    }
+                })
+            }
         }
     }
 
