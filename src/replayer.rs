@@ -38,12 +38,12 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::broadcast;
-use tokio::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tokio::time::Duration;
+use tracing::{error, info};
 
 use crate::csv_handler::{CsvReader, MessageRecord};
 use crate::error::MqttRecorderError;
-use crate::mqtt::{AnyMqttClient, MqttIncoming};
+use crate::mqtt::AnyMqttClient;
 use crate::tui::TuiState;
 
 /// Replayer for publishing MQTT messages from a CSV file.
@@ -57,6 +57,7 @@ use crate::tui::TuiState;
 /// * `client` - The MQTT client for broker communication
 /// * `reader` - The CSV reader for reading recorded messages
 /// * `loop_replay` - Whether to loop replay continuously
+/// * `default_speed` - Playback speed when no TuiState is available (from CLI --speed)
 ///
 /// # Requirements
 ///
@@ -71,6 +72,8 @@ pub struct Replayer {
     reader: CsvReader,
     /// Whether to loop replay continuously.
     loop_replay: bool,
+    /// Playback speed for non-TUI mode (from CLI --speed).
+    default_speed: f32,
 }
 
 impl Replayer {
@@ -81,6 +84,7 @@ impl Replayer {
     /// * `client` - An MQTT client connected to the broker
     /// * `reader` - A CSV reader for the input file
     /// * `loop_replay` - Whether to loop replay continuously
+    /// * `speed` - Playback speed multiplier (0 = max speed, 1.0 = real-time)
     ///
     /// # Returns
     ///
@@ -98,13 +102,14 @@ impl Replayer {
     /// let client = MqttClient::new(config).await?;
     /// let reader = CsvReader::new(Path::new("input.csv"), false, None)?;
     ///
-    /// let replayer = Replayer::new(client, reader, false);
+    /// let replayer = Replayer::new(client, reader, false, 1.0);
     /// ```
-    pub fn new(client: AnyMqttClient, reader: CsvReader, loop_replay: bool) -> Self {
+    pub fn new(client: AnyMqttClient, reader: CsvReader, loop_replay: bool, speed: f32) -> Self {
         Self {
             client,
             reader,
             loop_replay,
+            default_speed: speed,
         }
     }
 
@@ -181,23 +186,18 @@ impl Replayer {
             }
         );
 
-        // Initial connection check - poll once to establish connection
-        match self.client.poll().await {
-            Ok(event) => {
-                if matches!(event, MqttIncoming::ConnAck) {
-                    if let Some(ref state) = tui_state {
-                        state.set_source_connected(true);
-                    }
-                }
-                info!("Connected to MQTT broker");
-            }
-            Err(e) => {
-                if let Some(ref state) = tui_state {
-                    state.set_source_connected(false);
-                }
-                warn!("Initial connection status: {}", e);
-            }
+        // Spawn background task to drive the MQTT event loop continuously.
+        // This handles sending queued publishes over the network, receiving
+        // acks, and keepalive — preventing channel backpressure from blocking
+        // publish() in the main loop.
+        let poll_handle = self.client.spawn_poll_task();
+
+        // Wait briefly for connection to establish
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(ref state) = tui_state {
+            state.set_source_connected(true);
         }
+        info!("Connected to MQTT broker");
 
         loop {
             // Check if TUI requested quit
@@ -211,37 +211,24 @@ impl Replayer {
 
             match record_result {
                 Some(Ok(record)) => {
+                    // Read current speed: TuiState (runtime adjustable) or CLI default
+                    let speed = tui_state
+                        .as_ref()
+                        .map(|s| s.get_playback_speed())
+                        .unwrap_or(self.default_speed);
+
                     // Calculate delay based on timestamp difference (Requirement 5.5)
                     if let Some(prev_ts) = previous_timestamp {
-                        let delay = Self::calculate_delay(&prev_ts, &record.timestamp);
+                        let delay = Self::calculate_delay(&prev_ts, &record.timestamp, speed);
                         if delay > Duration::ZERO {
-                            // Poll event loop continuously during delay to keep connection alive
-                            let deadline = Instant::now() + delay;
-                            loop {
-                                let remaining = deadline.saturating_duration_since(Instant::now());
-                                if remaining.is_zero() {
-                                    break;
+                            // Sleep for the delay; background task keeps connection alive
+                            tokio::select! {
+                                _ = shutdown.recv() => {
+                                    info!("Shutdown signal received during delay, stopping replayer...");
+                                    poll_handle.abort();
+                                    return Ok(message_count);
                                 }
-                                tokio::select! {
-                                    _ = shutdown.recv() => {
-                                        info!("Shutdown signal received during delay, stopping replayer...");
-                                        return Ok(message_count);
-                                    }
-                                    // Poll event loop to handle pings; this drives the connection
-                                    poll_result = self.client.poll() => {
-                                        match poll_result {
-                                            Ok(event) => {
-                                                if matches!(event, MqttIncoming::ConnAck) {
-                                                    if let Some(ref state) = tui_state {
-                                                        state.set_source_connected(true);
-                                                    }
-                                                }
-                                            }
-                                            Err(e) if crate::util::is_fatal_error(&e, false) => return Err(e),
-                                            Err(_) => {}
-                                        }
-                                    }
-                                }
+                                _ = tokio::time::sleep(delay) => {}
                             }
                         }
                     }
@@ -260,50 +247,87 @@ impl Replayer {
                         Err(e) => {
                             error!("Error publishing message: {}", e);
                             if crate::util::is_fatal_error(&e, false) {
+                                poll_handle.abort();
                                 return Err(e);
                             }
                         }
                     }
 
-                    // Poll to process pending events
-                    if let Err(e) = self.poll_events().await {
-                        if crate::util::is_fatal_error(&e, false) {
-                            return Err(e);
-                        }
-                    }
+                    // Periodically yield and check shutdown
+                    if message_count % crate::util::FLUSH_INTERVAL == 0 {
+                        tokio::task::yield_now().await;
 
-                    // Check for shutdown signal (non-blocking)
-                    match shutdown.try_recv() {
-                        Ok(_) => {
-                            info!("Shutdown signal received, stopping replayer...");
-                            break;
+                        match shutdown.try_recv() {
+                            Ok(_) => {
+                                info!("Shutdown signal received, stopping replayer...");
+                                break;
+                            }
+                            Err(broadcast::error::TryRecvError::Empty) => {}
+                            Err(broadcast::error::TryRecvError::Closed) => {
+                                info!("Shutdown channel closed, stopping replayer...");
+                                break;
+                            }
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                         }
-                        Err(broadcast::error::TryRecvError::Empty) => {}
-                        Err(broadcast::error::TryRecvError::Closed) => {
-                            info!("Shutdown channel closed, stopping replayer...");
-                            break;
-                        }
-                        Err(broadcast::error::TryRecvError::Lagged(_)) => {}
                     }
                 }
                 Some(Err(e)) => {
                     error!("Error reading CSV record: {}", e);
+                    poll_handle.abort();
                     return Err(e);
                 }
                 None => {
-                    if self.loop_replay {
+                    let looping = tui_state
+                        .as_ref()
+                        .map(|s| s.is_playback_looping())
+                        .unwrap_or(self.loop_replay);
+                    if looping {
                         info!(
                             "End of file reached, restarting replay... ({} messages so far)",
                             message_count
                         );
                         self.reader.reset()?;
                         previous_timestamp = None;
+                    } else if tui_state.is_some() {
+                        // Wait for user to enable looping or quit
+                        if let Some(ref state) = tui_state {
+                            state.playback_finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            if let Some(ref state) = tui_state {
+                                if state.is_quit_requested() {
+                                    break;
+                                }
+                                if state.is_playback_looping() {
+                                    state.playback_finished.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    self.reader.reset()?;
+                                    previous_timestamp = None;
+                                    break;
+                                }
+                            }
+                            if shutdown.try_recv().is_ok() {
+                                break;
+                            }
+                        }
+                        // If quit was requested, exit the outer loop
+                        if tui_state.as_ref().map(|s| s.is_quit_requested()).unwrap_or(false) {
+                            break;
+                        }
+                        // If looping wasn't enabled (shutdown), exit
+                        if !tui_state.as_ref().map(|s| s.is_playback_looping()).unwrap_or(false) {
+                            break;
+                        }
                     } else {
                         break;
                     }
                 }
             }
         }
+
+        // Give background poll task a moment to flush remaining publishes
+        tokio::time::sleep(Duration::from_millis(crate::util::POLL_BATCH_INTERVAL_MS)).await;
+        poll_handle.abort();
 
         let _ = tokio::time::timeout(
             tokio::time::Duration::from_secs(crate::util::DISCONNECT_TIMEOUT_SECS),
@@ -348,43 +372,31 @@ impl Replayer {
             .await
     }
 
-    /// Calculates the delay between two timestamps.
-    ///
-    /// This method computes the time difference between two message timestamps
-    /// to maintain the relative timing during replay.
+    /// Calculates the delay between two timestamps, adjusted by playback speed.
     ///
     /// # Arguments
     ///
     /// * `previous` - The timestamp of the previous message
     /// * `current` - The timestamp of the current message
+    /// * `speed` - Playback speed multiplier (0 = no delay, 1.0 = real-time, 2.0 = 2x faster)
     ///
     /// # Returns
     ///
     /// Returns the duration to wait before publishing the current message.
-    /// Returns `Duration::ZERO` if the current timestamp is before or equal
-    /// to the previous timestamp.
+    /// Returns `Duration::ZERO` if speed is 0 or timestamps are non-increasing.
     ///
     /// # Requirements
     ///
     /// - **5.5**: Maintain relative timing between messages based on recorded timestamps
-    fn calculate_delay(previous: &DateTime<Utc>, current: &DateTime<Utc>) -> Duration {
+    fn calculate_delay(previous: &DateTime<Utc>, current: &DateTime<Utc>, speed: f32) -> Duration {
+        if speed == 0.0 {
+            return Duration::ZERO;
+        }
         let diff = *current - *previous;
-
         if diff.num_milliseconds() > 0 {
-            Duration::from_millis(diff.num_milliseconds() as u64)
+            Duration::from_millis((diff.num_milliseconds() as f64 / speed as f64) as u64)
         } else {
             Duration::ZERO
-        }
-    }
-
-    /// Polls the MQTT event loop to process pending events.
-    ///
-    /// This is needed to maintain the connection and handle acknowledgments.
-    async fn poll_events(&self) -> Result<(), MqttRecorderError> {
-        // Use a short timeout to avoid blocking
-        match tokio::time::timeout(Duration::from_millis(10), self.client.poll()).await {
-            Ok(result) => result.map(|_| ()),
-            Err(_) => Ok(()), // Timeout is fine, just means no events pending
         }
     }
 }
@@ -399,7 +411,7 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 1).unwrap();
 
-        let delay = Replayer::calculate_delay(&ts1, &ts2);
+        let delay = Replayer::calculate_delay(&ts1, &ts2, 1.0);
         assert_eq!(delay, Duration::from_secs(1));
     }
 
@@ -410,7 +422,7 @@ mod tests {
             .checked_add_signed(chrono::Duration::milliseconds(500))
             .unwrap();
 
-        let delay = Replayer::calculate_delay(&ts1, &ts2);
+        let delay = Replayer::calculate_delay(&ts1, &ts2, 1.0);
         assert_eq!(delay, Duration::from_millis(500));
     }
 
@@ -418,7 +430,7 @@ mod tests {
     fn test_calculate_delay_zero_for_same_timestamp() {
         let ts = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
 
-        let delay = Replayer::calculate_delay(&ts, &ts);
+        let delay = Replayer::calculate_delay(&ts, &ts, 1.0);
         assert_eq!(delay, Duration::ZERO);
     }
 
@@ -427,7 +439,7 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 1).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
 
-        let delay = Replayer::calculate_delay(&ts1, &ts2);
+        let delay = Replayer::calculate_delay(&ts1, &ts2, 1.0);
         assert_eq!(delay, Duration::ZERO);
     }
 
@@ -436,7 +448,25 @@ mod tests {
         let ts1 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).unwrap();
         let ts2 = Utc.with_ymd_and_hms(2024, 1, 15, 11, 0, 0).unwrap();
 
-        let delay = Replayer::calculate_delay(&ts1, &ts2);
+        let delay = Replayer::calculate_delay(&ts1, &ts2, 1.0);
         assert_eq!(delay, Duration::from_secs(3600)); // 1 hour
+    }
+
+    #[test]
+    fn test_calculate_delay_speed_2x() {
+        let ts1 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 2).unwrap();
+
+        let delay = Replayer::calculate_delay(&ts1, &ts2, 2.0);
+        assert_eq!(delay, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_calculate_delay_speed_zero_max() {
+        let ts1 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+        let ts2 = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 5).unwrap();
+
+        let delay = Replayer::calculate_delay(&ts1, &ts2, 0.0);
+        assert_eq!(delay, Duration::ZERO);
     }
 }

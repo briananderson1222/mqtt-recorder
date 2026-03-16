@@ -2,9 +2,55 @@
 
 use crate::tui::types::{generate_default_filename, AuditArea, AuditEntry, AuditSeverity};
 use std::{
+    collections::VecDeque,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
+
+/// Rolling-window rate tracker. Records timestamps of events and computes
+/// the rate over the most recent `window` duration.
+pub struct RateTracker {
+    window: Duration,
+    ticks: std::sync::Mutex<VecDeque<Instant>>,
+}
+
+impl RateTracker {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            window,
+            ticks: std::sync::Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Record one event.
+    pub fn tick(&self) {
+        let now = Instant::now();
+        if let Ok(mut q) = self.ticks.lock() {
+            q.push_back(now);
+            let cutoff = now - self.window;
+            while q.front().is_some_and(|&t| t < cutoff) {
+                q.pop_front();
+            }
+        }
+    }
+
+    /// Current rate (events/sec) over the window. Returns `None` if no data.
+    pub fn rate(&self) -> Option<f64> {
+        let now = Instant::now();
+        if let Ok(mut q) = self.ticks.lock() {
+            let cutoff = now - self.window;
+            while q.front().is_some_and(|&t| t < cutoff) {
+                q.pop_front();
+            }
+            if q.is_empty() {
+                return None;
+            }
+            Some(q.len() as f64 / self.window.as_secs_f64())
+        } else {
+            None
+        }
+    }
+}
 
 /// Configuration for creating a new TuiState.
 pub struct TuiConfig {
@@ -26,6 +72,8 @@ pub struct TuiConfig {
     pub audit_enabled: bool,
     /// Seconds between health check polls (0 = disabled).
     pub health_check_interval: u64,
+    /// Initial playback speed multiplier (0 = max speed, 1.0 = real-time).
+    pub initial_speed: f32,
 }
 
 /// Shared state for the TUI
@@ -105,6 +153,12 @@ pub struct TuiState {
     // Health check timer
     last_health_check: std::sync::Mutex<Instant>,
     health_check_interval: u64,
+    // Playback speed (stored as speed * 100, e.g. 100 = 1.0x, 0 = max speed)
+    playback_speed: std::sync::atomic::AtomicU32,
+    // Instant rate tracking
+    source_rate_tracker: RateTracker,
+    // Connection state duration tracking
+    disconnected_since: std::sync::Mutex<Option<Instant>>,
 }
 
 impl TuiState {
@@ -174,6 +228,11 @@ impl TuiState {
             broker_failed_publishes: AtomicU64::new(0),
             last_health_check: std::sync::Mutex::new(Instant::now()),
             health_check_interval: config.health_check_interval,
+            playback_speed: std::sync::atomic::AtomicU32::new(
+                (config.initial_speed * 100.0) as u32,
+            ),
+            source_rate_tracker: RateTracker::new(Duration::from_secs(5)),
+            disconnected_since: std::sync::Mutex::new(None),
         }
     }
 
@@ -209,6 +268,9 @@ impl TuiState {
             if let Ok(mut guard) = self.connected_at.lock() {
                 *guard = Some(Instant::now());
             }
+            if let Ok(mut guard) = self.disconnected_since.lock() {
+                *guard = None;
+            }
             // Track first-ever connection
             if let Ok(mut guard) = self.first_connected_at.lock() {
                 if guard.is_none() {
@@ -241,6 +303,9 @@ impl TuiState {
                     uptime
                 ),
             );
+            if let Ok(mut guard) = self.disconnected_since.lock() {
+                *guard = Some(Instant::now());
+            }
         }
     }
 
@@ -343,6 +408,26 @@ impl TuiState {
         Some(self.get_received_count() as f64 / secs)
     }
 
+    /// Instant received messages per second (rolling 5s window).
+    pub fn get_instant_source_rate(&self) -> Option<f64> {
+        self.source_rate_tracker.rate()
+    }
+
+    /// How long the source has been in its current connection state.
+    pub fn get_connection_state_duration(&self) -> Option<Duration> {
+        if self.source_connected.load(Ordering::Relaxed) {
+            self.connected_at
+                .lock()
+                .ok()
+                .and_then(|g| g.map(|t| t.elapsed()))
+        } else {
+            self.disconnected_since
+                .lock()
+                .ok()
+                .and_then(|g| g.map(|t| t.elapsed()))
+        }
+    }
+
     /// Average published messages per second since broker started
     pub fn get_broker_rate(&self) -> f64 {
         let secs = self.get_broker_uptime().as_secs_f64();
@@ -441,6 +526,43 @@ impl TuiState {
     /// Returns whether the current playback pass has finished.
     pub fn is_playback_finished(&self) -> bool {
         self.playback_finished.load(Ordering::Relaxed)
+    }
+
+    /// Returns the current playback speed as f32 (0.0 = max, 1.0 = real-time).
+    pub fn get_playback_speed(&self) -> f32 {
+        self.playback_speed.load(Ordering::Relaxed) as f32 / 100.0
+    }
+
+    /// Sets the playback speed (0.0 = max, 1.0 = real-time).
+    pub fn set_playback_speed(&self, speed: f32) {
+        self.playback_speed
+            .store((speed * 100.0) as u32, Ordering::Relaxed);
+    }
+
+    /// Cycles playback speed to the next preset (forward=true) or previous (forward=false).
+    /// Returns the new speed value.
+    pub fn cycle_playback_speed(&self, forward: bool) -> f32 {
+        let current = self.get_playback_speed();
+        let presets = crate::util::SPEED_PRESETS;
+        // Find closest preset index
+        let idx = presets
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| {
+                ((**a - current).abs())
+                    .partial_cmp(&((**b - current).abs()))
+                    .unwrap()
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(3); // default to 1.0x
+        let next = if forward {
+            (idx + 1).min(presets.len() - 1)
+        } else {
+            idx.saturating_sub(1)
+        };
+        let speed = presets[next];
+        self.set_playback_speed(speed);
+        speed
     }
 
     /// Add a file to the playlist (used when switching files)
@@ -880,9 +1002,10 @@ impl TuiState {
         self.mirroring_enabled.store(enabled, Ordering::Relaxed);
     }
 
-    /// Increments the received message counter.
+    /// Increments the received message counter and ticks the rate tracker.
     pub fn increment_received(&self) {
         self.received_count.fetch_add(1, Ordering::Relaxed);
+        self.source_rate_tracker.tick();
     }
 
     /// Increments the mirrored message counter.
@@ -1005,6 +1128,7 @@ mod tests {
             playlist: vec![],
             audit_enabled: true,
             health_check_interval: 60,
+            initial_speed: 1.0,
         }
     }
 

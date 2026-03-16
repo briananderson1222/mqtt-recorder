@@ -102,22 +102,42 @@ fn draw_source_section(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
     let si = source_block.inner(area);
     frame.render_widget(source_block, area);
 
+    let state_dur = ctx.state.get_connection_state_duration();
     let conn_status = if !ctx.source_on {
         Line::from(Span::styled("Disabled", ctx.dim))
     } else if ctx.source_connected {
-        Line::from(Span::styled("Connected", Style::default().fg(Color::Green)))
+        let mut spans: Vec<Span> = vec![Span::styled("Connected", Style::default().fg(Color::Green))];
+        if let Some(d) = state_dur {
+            spans.push(Span::styled(
+                format!(" ({})", fmt_dur(d)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        Line::from(spans)
     } else {
-        Line::from(Span::styled(
+        let mut spans: Vec<Span> = vec![Span::styled(
             "Connecting...",
             Style::default().fg(Color::Yellow),
-        ))
+        )];
+        if let Some(d) = state_dur {
+            spans.push(Span::styled(
+                format!(" ({})", fmt_dur(d)),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        Line::from(spans)
     };
-    let rate_span = ctx.state.get_source_rate().map(|r| {
-        Span::styled(
-            format!(" ({:.1}/s)", r),
-            Style::default().fg(Color::DarkGray),
-        )
-    });
+    // Prefer instant rate, fall back to average
+    let rate_span = ctx
+        .state
+        .get_instant_source_rate()
+        .or_else(|| ctx.state.get_source_rate())
+        .map(|r| {
+            Span::styled(
+                format!(" ({:.1}/s)", r),
+                Style::default().fg(Color::DarkGray),
+            )
+        });
     frame.render_widget(
         Paragraph::new(vec![
             Line::from(
@@ -432,7 +452,10 @@ fn draw_playback_panel(
             Style::default().fg(Color::Magenta),
         )));
     }
-    frame.render_widget(Paragraph::new(play_lines), pi);
+    frame.render_widget(
+        Paragraph::new(play_lines).wrap(Wrap { trim: false }),
+        pi,
+    );
 }
 
 /// Render the audit log section
@@ -533,6 +556,12 @@ fn draw_controls(
     } else {
         let loop_on = ctx.state.loop_enabled.load(Ordering::Relaxed);
         let audit_on = ctx.state.is_audit_enabled();
+        let speed = ctx.state.get_playback_speed();
+        let speed_label = if speed == 0.0 {
+            "max".to_string()
+        } else {
+            format!("{}x", speed)
+        };
         let audit_color = if audit_on {
             Color::Green
         } else {
@@ -568,6 +597,11 @@ fn draw_controls(
             Span::styled("[l]", Style::default().fg(ctx.playback_color)),
             Span::styled(
                 format!(" Loop {} ", loop_ind),
+                Style::default().fg(ctx.playback_color),
+            ),
+            Span::styled("[+/-]", Style::default().fg(ctx.playback_color)),
+            Span::styled(
+                format!(" {} ", speed_label),
                 Style::default().fg(ctx.playback_color),
             ),
             Span::styled("[f]", Style::default().fg(Color::White)),

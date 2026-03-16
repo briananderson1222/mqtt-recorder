@@ -323,6 +323,7 @@ async fn test_mirror_tui_record_toggle() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     }));
     tui_state.set_recording(false); // Start with recording OFF
 
@@ -450,6 +451,7 @@ async fn test_mirror_toggle_stops_republish_but_continues_recording() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     }));
     tui_state.set_recording(true);
 
@@ -646,6 +648,7 @@ async fn test_mirror_handles_source_broker_disconnect() {
         playlist: vec![],
         audit_enabled: true,
         health_check_interval: 60,
+        initial_speed: 1.0,
     }));
 
     // Create mirror

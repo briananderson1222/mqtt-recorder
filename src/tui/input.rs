@@ -306,6 +306,38 @@ fn handle_normal_key(
             );
             KeyAction::None
         }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            let speed = state.cycle_playback_speed(true);
+            state.push_audit(
+                AuditArea::Playback,
+                AuditSeverity::Info,
+                format!(
+                    "Speed: {}x",
+                    if speed == 0.0 {
+                        "max".to_string()
+                    } else {
+                        format!("{}", speed)
+                    }
+                ),
+            );
+            KeyAction::None
+        }
+        KeyCode::Char('-') => {
+            let speed = state.cycle_playback_speed(false);
+            state.push_audit(
+                AuditArea::Playback,
+                AuditSeverity::Info,
+                format!(
+                    "Speed: {}x",
+                    if speed == 0.0 {
+                        "max".to_string()
+                    } else {
+                        format!("{}", speed)
+                    }
+                ),
+            );
+            KeyAction::None
+        }
         KeyCode::Up => {
             state.navigate_selection(-1);
             KeyAction::None
@@ -448,6 +480,7 @@ mod tests {
             playlist: vec![],
             audit_enabled: true,
             health_check_interval: 60,
+            initial_speed: 1.0,
         }))
     }
 

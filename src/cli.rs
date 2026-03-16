@@ -67,6 +67,10 @@ pub struct Args {
     #[arg(long = "loop", default_value = "false")]
     pub loop_replay: bool,
 
+    /// Playback speed multiplier (0 = max speed, 1.0 = real-time, 2.0 = 2x faster)
+    #[arg(long, default_value = "1.0")]
+    pub speed: f32,
+
     /// QoS level for subscriptions (0, 1, or 2)
     #[arg(long, default_value = "0")]
     pub qos: u8,
@@ -389,6 +393,7 @@ impl Default for Args {
             mode: None,
             file: None,
             loop_replay: false,
+            speed: 1.0,
             qos: 0,
             topics: None,
             topic: None,
