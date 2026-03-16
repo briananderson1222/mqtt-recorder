@@ -291,7 +291,9 @@ impl Replayer {
                     } else if tui_state.is_some() {
                         // Wait for user to enable looping or quit
                         if let Some(ref state) = tui_state {
-                            state.playback_finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                            state
+                                .playback_finished
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
                         loop {
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -300,7 +302,9 @@ impl Replayer {
                                     break;
                                 }
                                 if state.is_playback_looping() {
-                                    state.playback_finished.store(false, std::sync::atomic::Ordering::Relaxed);
+                                    state
+                                        .playback_finished
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
                                     self.reader.reset()?;
                                     previous_timestamp = None;
                                     break;
@@ -311,11 +315,19 @@ impl Replayer {
                             }
                         }
                         // If quit was requested, exit the outer loop
-                        if tui_state.as_ref().map(|s| s.is_quit_requested()).unwrap_or(false) {
+                        if tui_state
+                            .as_ref()
+                            .map(|s| s.is_quit_requested())
+                            .unwrap_or(false)
+                        {
                             break;
                         }
                         // If looping wasn't enabled (shutdown), exit
-                        if !tui_state.as_ref().map(|s| s.is_playback_looping()).unwrap_or(false) {
+                        if !tui_state
+                            .as_ref()
+                            .map(|s| s.is_playback_looping())
+                            .unwrap_or(false)
+                        {
                             break;
                         }
                     } else {

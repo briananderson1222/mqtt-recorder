@@ -106,7 +106,8 @@ fn draw_source_section(frame: &mut Frame, area: Rect, ctx: &DrawContext) {
     let conn_status = if !ctx.source_on {
         Line::from(Span::styled("Disabled", ctx.dim))
     } else if ctx.source_connected {
-        let mut spans: Vec<Span> = vec![Span::styled("Connected", Style::default().fg(Color::Green))];
+        let mut spans: Vec<Span> =
+            vec![Span::styled("Connected", Style::default().fg(Color::Green))];
         if let Some(d) = state_dur {
             spans.push(Span::styled(
                 format!(" ({})", fmt_dur(d)),
@@ -452,10 +453,7 @@ fn draw_playback_panel(
             Style::default().fg(Color::Magenta),
         )));
     }
-    frame.render_widget(
-        Paragraph::new(play_lines).wrap(Wrap { trim: false }),
-        pi,
-    );
+    frame.render_widget(Paragraph::new(play_lines).wrap(Wrap { trim: false }), pi);
 }
 
 /// Render the audit log section
