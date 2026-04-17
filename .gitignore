@@ -31,3 +31,4 @@ nohup.out
 coverage/
 lcov.info
 tarpaulin-report.html
+.kiro/reviews/
