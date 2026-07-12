@@ -514,3 +514,60 @@ async fn test_record_then_replay_roundtrip() {
         ]
     );
 }
+
+/// Test that binary (non-UTF-8) payloads are replayed byte-for-byte.
+///
+/// Regression test: replay previously went through a lossy String conversion
+/// that replaced invalid UTF-8 sequences with U+FFFD before publishing.
+#[tokio::test]
+async fn test_replayer_preserves_binary_payloads() {
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
+        .await
+        .expect("Failed to start broker");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let binary_payload: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x80, 0xDE, 0xAD, 0xBE, 0xEF];
+
+    let dir = tempdir().unwrap();
+    let csv_path = dir.path().join("binary.csv");
+    {
+        let mut writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
+        writer
+            .write_bytes(Utc::now(), "test/binary", &binary_payload, 0, false)
+            .expect("Failed to write binary record");
+        writer.flush().expect("Failed to flush");
+    }
+
+    let subscriber = make_client(port, "bin-subscriber").await;
+    subscriber
+        .subscribe(&["test/#".to_string()], QoS::AtMostOnce)
+        .await
+        .expect("Failed to subscribe");
+    let _ = subscriber.poll().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let replayer_client = AnyMqttClient::V5(make_client(port, "bin-replayer").await);
+    let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
+    let mut replayer = Replayer::new(replayer_client, reader, false, 0.0);
+
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
+
+    let messages = collect_messages(&subscriber, "test/#", 1, 5000).await;
+
+    let _ = shutdown_tx.send(());
+    let count = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("Timed out")
+        .expect("Panicked")
+        .expect("Error");
+
+    assert_eq!(count, 1, "Replayer should have published 1 message");
+    assert_eq!(messages.len(), 1, "Subscriber should have received 1 message");
+    assert_eq!(messages[0].0, "test/binary");
+    assert_eq!(
+        messages[0].1, binary_payload,
+        "Binary payload must arrive byte-for-byte identical"
+    );
+}

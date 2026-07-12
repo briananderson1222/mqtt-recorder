@@ -44,7 +44,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::broker::EmbeddedBroker;
-use crate::csv_handler::{CsvReader, CsvWriter, MessageRecord};
+use crate::csv_handler::{CsvReader, CsvWriter, MessageRecordBytes};
 use crate::error::MqttRecorderError;
 use crate::mqtt::{AnyMqttClient, MqttClientV5, MqttIncoming};
 use crate::topics::TopicFilter;
@@ -53,14 +53,15 @@ use crate::tui::{AuditArea, AuditSeverity, TuiState};
 /// Interval for polling broker metrics (in number of messages).
 const METRICS_POLL_INTERVAL: u64 = 100;
 
-fn process_event_impl(event: MqttIncoming) -> Option<MessageRecord> {
+fn process_event_impl(event: MqttIncoming) -> Option<MessageRecordBytes> {
     let (topic, payload, qos, retain) = crate::util::extract_publish(&event)?;
     let timestamp = Utc::now();
-    let payload_str = String::from_utf8_lossy(payload).to_string();
-    Some(MessageRecord::new(
+    // Keep the payload as raw bytes: converting through String would corrupt
+    // non-UTF-8 payloads before republish, CSV storage, and verify.
+    Some(MessageRecordBytes::new(
         timestamp,
         topic.to_string(),
-        payload_str,
+        payload.to_vec(),
         qos,
         retain,
     ))
@@ -691,7 +692,7 @@ impl Mirror {
         previous_ts: &mut Option<DateTime<Utc>>,
     ) -> Result<(), MqttRecorderError> {
         if let Some(ref mut reader) = playback_reader {
-            match reader.read_next() {
+            match reader.read_next_bytes() {
                 Some(Ok(record)) => {
                     // Apply speed-based delay between records
                     let speed = tui_state
@@ -713,8 +714,7 @@ impl Mirror {
                     *previous_ts = Some(record.timestamp);
                     if verify_ready.load(Ordering::Relaxed) {
                         if let Some(ref tx) = self.verify_tx {
-                            let _ =
-                                tx.send((record.topic.clone(), record.payload.as_bytes().to_vec()));
+                            let _ = tx.send((record.topic.clone(), record.payload.clone()));
                         }
                     }
                     match self.republish_message(&record).await {
@@ -786,7 +786,7 @@ impl Mirror {
     /// Handles recording logic including file path changes and recording toggles.
     fn handle_recording(
         &mut self,
-        record: &MessageRecord,
+        record: &MessageRecordBytes,
         tui_state: &Option<std::sync::Arc<TuiState>>,
         flush_counter: &mut u64,
         was_recording: &mut bool,
@@ -823,7 +823,13 @@ impl Mirror {
 
         if should_record {
             if let Some(ref mut writer) = self.writer {
-                writer.write(record)?;
+                writer.write_bytes(
+                    record.timestamp,
+                    &record.topic,
+                    &record.payload,
+                    record.qos,
+                    record.retain,
+                )?;
                 *flush_counter += 1;
 
                 if let Some(ref state) = tui_state {
@@ -877,7 +883,7 @@ impl Mirror {
                 // subscriber can't receive it before it's in the pending queue
                 if verify_ready.load(Ordering::Relaxed) {
                     if let Some(ref tx) = self.verify_tx {
-                        let _ = tx.send((record.topic.clone(), record.payload.as_bytes().to_vec()));
+                        let _ = tx.send((record.topic.clone(), record.payload.clone()));
                     }
                 }
                 if let Err(e) = self.republish_message(&record).await {
@@ -907,7 +913,7 @@ impl Mirror {
             }
 
             // Poll broker metrics periodically
-            if *message_count % METRICS_POLL_INTERVAL == 0 {
+            if (*message_count).is_multiple_of(METRICS_POLL_INTERVAL) {
                 if let Some(metrics) = self.broker.poll_metrics() {
                     if let Some(ref state) = tui_state {
                         state.update_broker_metrics(&metrics);
@@ -924,7 +930,9 @@ impl Mirror {
     /// Processes an MQTT event and extracts a message record if applicable.
     ///
     /// This method handles incoming MQTT events and converts publish messages
-    /// into [`MessageRecord`] instances for republishing and optional CSV storage.
+    /// into [`MessageRecordBytes`] instances for republishing and optional CSV
+    /// storage. Payloads stay as raw bytes end-to-end so binary content
+    /// survives mirroring unchanged.
     ///
     /// # Arguments
     ///
@@ -932,9 +940,9 @@ impl Mirror {
     ///
     /// # Returns
     ///
-    /// Returns `Some(MessageRecord)` if the event contains a publish message,
-    /// or `None` for other event types.
-    fn process_event(&self, event: MqttIncoming) -> Option<MessageRecord> {
+    /// Returns `Some(MessageRecordBytes)` if the event contains a publish
+    /// message, or `None` for other event types.
+    fn process_event(&self, event: MqttIncoming) -> Option<MessageRecordBytes> {
         process_event_impl(event)
     }
 
@@ -955,14 +963,14 @@ impl Mirror {
     ///
     /// - **11.4**: Republish received messages to the embedded broker
     /// - **11.6**: Preserve message topic, payload, QoS, and retain flag
-    async fn republish_message(&self, record: &MessageRecord) -> Result<(), MqttRecorderError> {
+    async fn republish_message(&self, record: &MessageRecordBytes) -> Result<(), MqttRecorderError> {
         // Convert QoS u8 to rumqttc QoS enum
         let qos = crate::util::u8_to_qos(record.qos);
 
         // Publish with preserved topic, payload, QoS, and retain flag
         // The message is queued internally; the local event loop select branch drains it.
         self.local_client
-            .publish(&record.topic, record.payload.as_bytes(), qos, record.retain)
+            .publish(&record.topic, &record.payload, qos, record.retain)
             .await?;
 
         Ok(())
@@ -1005,9 +1013,24 @@ mod tests {
         assert!(result.is_some());
         let record = result.unwrap();
         assert_eq!(record.topic, "test/topic");
-        assert_eq!(record.payload, "hello");
+        assert_eq!(record.payload, b"hello");
         assert_eq!(record.qos, 1);
         assert!(record.retain);
+    }
+
+    #[test]
+    fn test_process_event_preserves_non_utf8_payload() {
+        // 0xFF/0xFE are invalid UTF-8: a lossy string conversion would mangle
+        // them into U+FFFD. The bytes must survive untouched.
+        let payload = vec![0xFF, 0xFE, 0x00, 0x01, 0x80];
+        let event = MqttIncoming::Publish {
+            topic: "test/binary".to_string(),
+            payload: payload.clone(),
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let record = process_event_impl(event).unwrap();
+        assert_eq!(record.payload, payload);
     }
 
     #[test]
@@ -1032,7 +1055,7 @@ mod tests {
         assert!(result.is_some());
         let record = result.unwrap();
         assert_eq!(record.topic, "test/qos0");
-        assert_eq!(record.payload, "test");
+        assert_eq!(record.payload, b"test");
         assert_eq!(record.qos, 0);
         assert!(!record.retain);
     }
@@ -1076,7 +1099,7 @@ mod tests {
         let result = process_event_impl(event);
         assert!(result.is_some());
         let record = result.unwrap();
-        assert_eq!(record.payload, "");
+        assert!(record.payload.is_empty());
     }
 
     #[test]
@@ -1090,8 +1113,8 @@ mod tests {
         let result = process_event_impl(event);
         assert!(result.is_some());
         let record = result.unwrap();
-        // Should use lossy UTF-8 conversion
-        assert!(record.payload.contains('\u{FFFD}') || !record.payload.is_empty());
+        // Non-UTF-8 bytes must be preserved exactly (no lossy conversion)
+        assert_eq!(record.payload, vec![0xFF, 0xFE, 0x00, 0x01]);
     }
 
     #[test]
@@ -1105,7 +1128,7 @@ mod tests {
         let result = process_event_impl(event);
         assert!(result.is_some());
         let record = result.unwrap();
-        assert_eq!(record.payload, "Hello 世界! 🌍");
+        assert_eq!(record.payload, "Hello 世界! 🌍".as_bytes());
     }
 
     #[test]
