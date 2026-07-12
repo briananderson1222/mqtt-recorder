@@ -4,7 +4,8 @@ Thank you for your interest in contributing to mqtt-recorder! This document prov
 
 ## Code of Conduct
 
-Please be respectful and constructive in all interactions. We welcome contributors of all experience levels.
+This project follows the [Code of Conduct](CODE_OF_CONDUCT.md). Be respectful
+and constructive; we welcome contributors of all experience levels.
 
 ## Getting Started
 
@@ -13,7 +14,9 @@ Please be respectful and constructive in all interactions. We welcome contributo
 - Rust 1.88 or later
 - Cargo
 - Git
-- Docker (for integration tests)
+
+No Docker or external broker needed: integration tests run against the
+embedded rumqttd broker on dynamically allocated localhost ports.
 
 ### Setting Up the Development Environment
 
@@ -63,13 +66,13 @@ Use descriptive branch names:
 ### Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (or: make test)
 cargo test
 
-# Run unit tests only
+# Run unit tests only (or: make test-unit)
 cargo test --lib
 
-# Run property-based tests
+# Run property-based tests (or: make test-property)
 cargo test --test '*_props'
 
 # Run a specific test
@@ -78,6 +81,10 @@ cargo test test_name
 # Run tests with output
 cargo test -- --nocapture
 ```
+
+CI runs `make fmt-check`, `make clippy`, `make test-unit`, `make test-property`,
+`make test`, `make release`, and `cargo audit` — the Makefile targets are the
+source of truth for what must pass.
 
 ### Code Quality Checks
 
@@ -148,6 +155,9 @@ Guidelines:
 4. Wait for CI checks to pass
 5. Address any review feedback
 
+If your change alters flags or user-visible behavior, update README.md and
+add an entry under `Unreleased` in CHANGELOG.md as part of the same PR.
+
 ## Code Style Guidelines
 
 ### Rust Style
@@ -166,10 +176,10 @@ Guidelines:
 
 ### Error Handling
 
-- Use `thiserror` for defining error types
+- Use `thiserror` for defining error types (`src/error.rs` is the single
+  error enum; there is no `anyhow` in this codebase)
 - Provide descriptive error messages
 - Include context in error messages (file paths, values, etc.)
-- Use `anyhow` for error propagation in application code
 
 ### Testing
 
@@ -213,9 +223,13 @@ mqtt-recorder/
 │   └── integration/     # Integration tests
 ├── .github/
 │   └── workflows/       # CI/CD pipelines
+├── build.rs             # Embeds the git hash in --version
 ├── Cargo.toml
+├── Makefile             # Canonical build/test/lint targets (used by CI)
 ├── README.md
+├── CHANGELOG.md
 ├── CONTRIBUTING.md
+├── SECURITY.md
 ├── AGENTS.md
 └── LICENSE
 ```
@@ -265,9 +279,14 @@ Code contributions should:
 ## Release Process
 
 Releases are automated via GitHub Actions:
-1. Version tags (e.g., `v1.0.0`) trigger the release workflow
-2. Binaries are built for Linux, macOS, and Windows
-3. A GitHub Release is created with artifacts and checksums
+1. Move the `Unreleased` section of CHANGELOG.md under the new version and
+   bump `version` in Cargo.toml (one PR)
+2. Version tags (e.g., `v1.0.0`) trigger the release workflow
+3. Binaries are built for Linux, macOS, and Windows
+4. A GitHub Release is created with artifacts and checksums
+
+Security issues: see [SECURITY.md](SECURITY.md) — report privately, not via
+public issues.
 
 ## Getting Help
 
