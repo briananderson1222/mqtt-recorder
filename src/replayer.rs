@@ -227,8 +227,9 @@ impl Replayer {
                             tokio::select! {
                                 _ = shutdown.recv() => {
                                     info!("Shutdown signal received during delay, stopping replayer...");
-                                    poll_handle.abort();
-                                    return Ok(message_count);
+                                    // Fall through to the common epilogue so the
+                                    // MQTT client still disconnects gracefully.
+                                    break;
                                 }
                                 _ = tokio::time::sleep(delay) => {}
                             }

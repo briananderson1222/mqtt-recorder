@@ -473,6 +473,11 @@ impl Mirror {
         let mut was_playback_on = false;
         let mut was_recording = tui_state.as_ref().map(|s| s.is_recording()).unwrap_or(true);
         let mut previous_playback_ts: Option<DateTime<Utc>> = None;
+        // Next playback record, staged with the instant it becomes due. The
+        // replay delay is awaited inside the main select! below so a long gap
+        // between records never blocks shutdown, source polling, or TUI
+        // toggles (it used to be an uncancellable inline sleep).
+        let mut pending_playback: Option<(MessageRecordBytes, tokio::time::Instant)> = None;
 
         loop {
             if let Some(ref state) = tui_state {
@@ -497,39 +502,40 @@ impl Mirror {
             // Reset timestamp tracking on playback start/restart
             if was_playback_on && !prev_was_on {
                 previous_playback_ts = None;
+                pending_playback = None;
             }
 
-            // Process one playback record if active
-            if playback_reader.is_some() {
-                self.process_playback_record(
+            // Playback turned off: drop any staged-but-unpublished record
+            if playback_reader.is_none() {
+                pending_playback = None;
+            } else if pending_playback.is_none() {
+                pending_playback = self.stage_next_playback_record(
                     &mut playback_reader,
                     &tui_state,
-                    &verify_ready,
                     &mut previous_playback_ts,
-                )
-                .await?;
+                );
             }
 
-            // Check if source is enabled (pause incoming messages)
+            // Whether incoming source messages are enabled (pausable from TUI)
             let source_enabled = tui_state
                 .as_ref()
                 .map(|s| s.is_source_enabled())
                 .unwrap_or(true);
-            if !source_enabled {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                continue;
-            }
+
+            let playback_due = pending_playback.as_ref().map(|(_, due)| *due);
 
             tokio::select! {
                 _ = shutdown.recv() => {
                     break;
                 }
 
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)), if playback_reader.is_some() => {
-                    // Yield to process playback records at top of loop
+                _ = tokio::time::sleep_until(playback_due.unwrap_or_else(tokio::time::Instant::now)), if playback_due.is_some() => {
+                    if let Some((record, _)) = pending_playback.take() {
+                        self.publish_playback_record(&record, &tui_state, &verify_ready).await?;
+                    }
                 }
 
-                event_result = self.source_client.poll() => {
+                event_result = self.source_client.poll(), if source_enabled => {
                     match event_result {
                         Ok(event) => {
                             self.handle_source_event(event, &tui_state, &verify_ready, &mut message_count, &mut flush_counter, &mut was_recording).await?;
@@ -546,6 +552,11 @@ impl Mirror {
                         }
                     }
                 }
+
+                // Periodic wake-up so TUI toggles are noticed while playback
+                // is active (or while the source is paused and nothing else
+                // would wake the loop).
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)), if !source_enabled || playback_reader.is_some() => {}
             }
         }
 
@@ -684,99 +695,116 @@ impl Mirror {
         playback_on
     }
 
-    async fn process_playback_record(
+    /// Read the next playback record and compute the instant it is due.
+    ///
+    /// The delay (timestamp gap divided by playback speed, captured at stage
+    /// time) is returned as a deadline rather than slept here, so the caller
+    /// can await it cancellably alongside shutdown and source polling.
+    ///
+    /// Returns `None` when there is nothing to stage right now: a bad record
+    /// was skipped, or end-of-file was handled (reset for looping, or
+    /// playback stopped).
+    fn stage_next_playback_record(
         &self,
         playback_reader: &mut Option<CsvReader>,
         tui_state: &Option<std::sync::Arc<TuiState>>,
-        verify_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
         previous_ts: &mut Option<DateTime<Utc>>,
-    ) -> Result<(), MqttRecorderError> {
-        if let Some(ref mut reader) = playback_reader {
-            match reader.read_next_bytes() {
-                Some(Ok(record)) => {
-                    // Apply speed-based delay between records
-                    let speed = tui_state
-                        .as_ref()
-                        .map(|s| s.get_playback_speed())
-                        .unwrap_or(crate::util::DEFAULT_PLAYBACK_SPEED);
-                    if speed != 0.0 {
-                        if let Some(prev) = previous_ts {
-                            let diff = record.timestamp - *prev;
-                            if diff.num_milliseconds() > 0 {
-                                let delay_ms = diff.num_milliseconds() as f64 / speed as f64;
-                                tokio::time::sleep(tokio::time::Duration::from_millis(
-                                    delay_ms as u64,
-                                ))
-                                .await;
-                            }
-                        }
-                    }
-                    *previous_ts = Some(record.timestamp);
-                    if verify_ready.load(Ordering::Relaxed) {
-                        if let Some(ref tx) = self.verify_tx {
-                            let _ = tx.send((record.topic.clone(), record.payload.clone()));
-                        }
-                    }
-                    match self.republish_message(&record).await {
-                        Ok(()) => {
-                            if let Some(ref state) = tui_state {
-                                state.increment_replayed();
-                                state.increment_published();
-                            }
-                        }
-                        Err(e) => {
-                            error!("Playback publish error: {}", e);
-                            if crate::util::is_fatal_error(&e, true) {
-                                return Err(e);
-                            }
+    ) -> Option<(MessageRecordBytes, tokio::time::Instant)> {
+        let reader = playback_reader.as_mut()?;
+        match reader.read_next_bytes() {
+            Some(Ok(record)) => {
+                let speed = tui_state
+                    .as_ref()
+                    .map(|s| s.get_playback_speed())
+                    .unwrap_or(crate::util::DEFAULT_PLAYBACK_SPEED);
+                let mut due = tokio::time::Instant::now();
+                if speed != 0.0 {
+                    if let Some(prev) = previous_ts {
+                        let diff = record.timestamp - *prev;
+                        if diff.num_milliseconds() > 0 {
+                            let delay_ms = diff.num_milliseconds() as f64 / speed as f64;
+                            due += tokio::time::Duration::from_millis(delay_ms as u64);
                         }
                     }
                 }
-                Some(Err(e)) => {
-                    if let Some(ref state) = tui_state {
-                        state.push_audit(
-                            AuditArea::Playback,
-                            AuditSeverity::Warn,
-                            format!("Skipped bad CSV record: {}", e),
-                        );
-                    }
-                    // Skip bad record, continue playback
+                *previous_ts = Some(record.timestamp);
+                Some((record, due))
+            }
+            Some(Err(e)) => {
+                if let Some(ref state) = tui_state {
+                    state.push_audit(
+                        AuditArea::Playback,
+                        AuditSeverity::Warn,
+                        format!("Skipped bad CSV record: {}", e),
+                    );
                 }
-                None => {
-                    // End of file - loop or stop based on mode
-                    let looping = tui_state
-                        .as_ref()
-                        .map(|s| s.is_playback_looping())
-                        .unwrap_or(false);
-                    if looping {
-                        if let Err(e) = reader.reset() {
-                            if let Some(ref state) = tui_state {
-                                state.push_audit(
-                                    AuditArea::Playback,
-                                    AuditSeverity::Error,
-                                    format!("Failed to reset reader: {}", e),
-                                );
-                            }
-                            *playback_reader = None;
-                        }
-                        *previous_ts = None;
-                    } else {
-                        // One-time mode: mark finished
+                // Skip bad record, continue playback on the next loop pass
+                None
+            }
+            None => {
+                // End of file - loop or stop based on mode
+                let looping = tui_state
+                    .as_ref()
+                    .map(|s| s.is_playback_looping())
+                    .unwrap_or(false);
+                if looping {
+                    if let Err(e) = reader.reset() {
                         if let Some(ref state) = tui_state {
-                            state.playback_finished.store(true, Ordering::Relaxed);
-                            let session = state.get_playback_session_count();
-                            let total = state.get_replayed_count();
                             state.push_audit(
                                 AuditArea::Playback,
-                                AuditSeverity::Info,
-                                format!(
-                                    "Playback complete ({} this session, {} total)",
-                                    session, total
-                                ),
+                                AuditSeverity::Error,
+                                format!("Failed to reset reader: {}", e),
                             );
                         }
                         *playback_reader = None;
                     }
+                    *previous_ts = None;
+                } else {
+                    // One-time mode: mark finished
+                    if let Some(ref state) = tui_state {
+                        state.playback_finished.store(true, Ordering::Relaxed);
+                        let session = state.get_playback_session_count();
+                        let total = state.get_replayed_count();
+                        state.push_audit(
+                            AuditArea::Playback,
+                            AuditSeverity::Info,
+                            format!(
+                                "Playback complete ({} this session, {} total)",
+                                session, total
+                            ),
+                        );
+                    }
+                    *playback_reader = None;
+                }
+                None
+            }
+        }
+    }
+
+    /// Publish a staged playback record: enqueue for verify, republish to
+    /// the embedded broker, and update TUI counters.
+    async fn publish_playback_record(
+        &self,
+        record: &MessageRecordBytes,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        verify_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), MqttRecorderError> {
+        if verify_ready.load(Ordering::Relaxed) {
+            if let Some(ref tx) = self.verify_tx {
+                let _ = tx.send((record.topic.clone(), record.payload.clone()));
+            }
+        }
+        match self.republish_message(record).await {
+            Ok(()) => {
+                if let Some(ref state) = tui_state {
+                    state.increment_replayed();
+                    state.increment_published();
+                }
+            }
+            Err(e) => {
+                error!("Playback publish error: {}", e);
+                if crate::util::is_fatal_error(&e, true) {
+                    return Err(e);
                 }
             }
         }

@@ -275,6 +275,7 @@ mqtt-recorder --mode replay \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--mirror` | Start with mirroring enabled | `true` |
+| `--no-mirror` | Start with mirroring disabled | `false` |
 | `--verify` | Verify mirrored messages against embedded broker output | `false` |
 
 ### TUI Options
@@ -289,6 +290,7 @@ mqtt-recorder --mode replay \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--audit` | Enable audit logging in TUI | `true` |
+| `--no-audit` | Disable audit logging in the TUI | `false` |
 | `--audit-log` | Path to write audit log file (auto-enables file writing) | None |
 
 ### TLS/SSL Options
@@ -330,6 +332,18 @@ MQTT_PASSWORD=mypassword mqtt-recorder --mode record \
 | `--validate` | Validate CSV file format and integrity | `false` |
 | `--fix` | Repair corrupted CSV file | `false` |
 | `--output` | Output path for repaired CSV file | Required with `--fix` |
+
+### Shell Completions
+
+Generate completions for your shell (bash, zsh, fish, elvish, powershell):
+
+```bash
+# zsh example
+mqtt-recorder --completions zsh > ~/.zfunc/_mqtt-recorder
+
+# bash example
+mqtt-recorder --completions bash > /usr/local/etc/bash_completion.d/mqtt-recorder
+```
 
 ### Advanced Options
 

@@ -862,15 +862,31 @@ impl AnyMqttClient {
     ///
     /// Returns a `JoinHandle` that should be aborted when done.
     pub fn spawn_poll_task(&self) -> tokio::task::JoinHandle<()> {
+        // This task is the sole driver of the connection for the replayer, so
+        // a persistent failure (broker down, auth revoked) must be visible in
+        // the logs. Warn on state changes rather than every 100ms retry.
         match self {
             Self::V4(c) => {
                 let el = c.eventloop();
                 tokio::spawn(async move {
+                    let mut failing = false;
                     loop {
                         let mut eventloop = el.lock().await;
                         match eventloop.poll().await {
-                            Ok(_) => {}
-                            Err(_) => {
+                            Ok(_) => {
+                                if failing {
+                                    tracing::info!("MQTT connection recovered");
+                                    failing = false;
+                                }
+                            }
+                            Err(e) => {
+                                if !failing {
+                                    tracing::warn!(
+                                        "MQTT connection error (retrying every 100ms): {}",
+                                        e
+                                    );
+                                    failing = true;
+                                }
                                 drop(eventloop);
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
@@ -881,11 +897,24 @@ impl AnyMqttClient {
             Self::V5(c) => {
                 let el = c.eventloop();
                 tokio::spawn(async move {
+                    let mut failing = false;
                     loop {
                         let mut eventloop = el.lock().await;
                         match eventloop.poll().await {
-                            Ok(_) => {}
-                            Err(_) => {
+                            Ok(_) => {
+                                if failing {
+                                    tracing::info!("MQTT connection recovered");
+                                    failing = false;
+                                }
+                            }
+                            Err(e) => {
+                                if !failing {
+                                    tracing::warn!(
+                                        "MQTT connection error (retrying every 100ms): {}",
+                                        e
+                                    );
+                                    failing = true;
+                                }
                                 drop(eventloop);
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }

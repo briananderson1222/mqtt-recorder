@@ -72,6 +72,19 @@ const EXIT_RUNTIME_ERROR: u8 = 4;
 async fn main() -> ExitCode {
     // Parse CLI arguments (Requirements 1.1-1.18)
     let mut args = Args::parse();
+
+    // Print shell completions and exit (no other args allowed alongside)
+    if let Some(shell) = args.completions {
+        use clap::CommandFactory;
+        clap_complete::generate(
+            shell,
+            &mut Args::command(),
+            "mqtt-recorder",
+            &mut std::io::stdout(),
+        );
+        return ExitCode::from(EXIT_SUCCESS);
+    }
+
     args.apply_defaults();
 
     // Validate argument combinations (Requirements 1.19-1.26)
@@ -403,23 +416,8 @@ async fn run_record_mode(
 ) -> Result<(), MqttRecorderError> {
     info!("Starting record mode...");
 
-    // Create MQTT client configuration
-    let client_config = create_mqtt_client_config(args)?;
-
-    // Log connection attempt (Requirement 8.3)
-    info!(
-        "Connecting to MQTT broker at {}:{} (MQTT v{})...",
-        client_config.host, client_config.port, args.mqtt_version
-    );
-
-    // Create MQTT client (v5 by default, v4 if specified)
-    let client = create_any_mqtt_client(client_config, args.use_mqtt_v5())
-        .await
-        .map_err(|e| {
-            error!("Connection failed: {}", e);
-            info!("Hint: Verify the broker is running and the host/port are correct");
-            e
-        })?;
+    // Connect to the external broker (Requirement 8.3)
+    let client = connect_external_client(args, "MQTT broker").await?;
 
     // Create CSV writer (Requirement 4.5: writes header row)
     // args.file is already resolved (default filename generated earlier if needed)
@@ -476,20 +474,9 @@ async fn run_replay_mode(
     };
 
     // Determine which client to use for publishing
-    let client = if let Some(host) = &args.host {
+    let client = if args.host.is_some() {
         // Connect to external broker (v5 by default, v4 if specified)
-        let client_config = create_mqtt_client_config(args)?;
-        info!(
-            "Connecting to MQTT broker at {}:{} (MQTT v{})...",
-            host, args.port, args.mqtt_version
-        );
-        create_any_mqtt_client(client_config, args.use_mqtt_v5())
-            .await
-            .map_err(|e| {
-                error!("Connection failed: {}", e);
-                info!("Hint: Verify the broker is running and the host/port are correct");
-                e
-            })?
+        connect_external_client(args, "MQTT broker").await?
     } else if args.serve {
         // Connect to embedded broker via v5 (Requirement 1.22: host optional with --serve)
         let connect_host = broker
@@ -566,23 +553,8 @@ async fn run_mirror_mode(
     let broker =
         EmbeddedBroker::new_with_bind(args.bind_addr, args.serve_port, BrokerMode::Mirror).await?;
 
-    // Create source client configuration (connect to external broker)
-    let source_config = create_mqtt_client_config(args)?;
-
-    // Log connection attempt (Requirement 8.3)
-    info!(
-        "Connecting to source MQTT broker at {}:{} (MQTT v{})...",
-        source_config.host, source_config.port, args.mqtt_version
-    );
-
-    // Create source MQTT client (v5 by default, v4 if specified)
-    let source_client = create_any_mqtt_client(source_config, args.use_mqtt_v5())
-        .await
-        .map_err(|e| {
-            error!("Connection to source broker failed: {}", e);
-            info!("Hint: Verify the broker is running and the host/port are correct");
-            e
-        })?;
+    // Connect to the source (external) broker (Requirement 8.3)
+    let source_client = connect_external_client(args, "source MQTT broker").await?;
 
     // Create CSV writer - use args.file, or fall back to TUI state's file path
     // (which may have been generated as a default for record mode)
@@ -659,7 +631,8 @@ async fn shutdown_broker_with_audit(
         state.push_audit(
             AuditArea::Broker,
             AuditSeverity::Info,
-            "Broker shutdown complete".into(),
+            // rumqttd has no clean shutdown; the thread ends with the process
+            "Broker released (listener ends with process exit)".into(),
         );
     }
     Ok(())
@@ -706,7 +679,7 @@ fn create_tui_state(args: &Args) -> Option<std::sync::Arc<TuiState>> {
     let (initial_record, initial_mirror) = match mode {
         Some(Mode::Record) => (args.record.or(Some(true)), false),
         Some(Mode::Replay) => (Some(false), false),
-        Some(Mode::Mirror) => (args.record, args.mirror),
+        Some(Mode::Mirror) => (args.record, args.mirror_enabled()),
         None => (Some(false), false), // standalone broker
     };
 
@@ -723,7 +696,7 @@ fn create_tui_state(args: &Args) -> Option<std::sync::Arc<TuiState>> {
         initial_record,
         initial_mirror,
         playlist,
-        audit_enabled: args.audit,
+        audit_enabled: args.audit_enabled(),
         health_check_interval: args.health_check,
         initial_speed: args.speed,
     }));
@@ -789,6 +762,26 @@ fn create_mqtt_client_config(args: &Args) -> Result<MqttClientConfig, MqttRecord
     }
 
     Ok(config)
+}
+
+/// Connect to the external broker named by --host, with shared logging and
+/// connection-failure hints (Requirement 8.3).
+async fn connect_external_client(
+    args: &Args,
+    label: &str,
+) -> Result<AnyMqttClient, MqttRecorderError> {
+    let client_config = create_mqtt_client_config(args)?;
+    info!(
+        "Connecting to {} at {}:{} (MQTT v{})...",
+        label, client_config.host, client_config.port, args.mqtt_version
+    );
+    create_any_mqtt_client(client_config, args.use_mqtt_v5())
+        .await
+        .map_err(|e| {
+            error!("Connection to {} failed: {}", label, e);
+            info!("Hint: Verify the broker is running and the host/port are correct");
+            e
+        })
 }
 
 /// Create an MQTT client from configuration, using v5 or v4 based on the flag.

@@ -407,16 +407,16 @@ impl EmbeddedBroker {
     /// broker.shutdown().await?;
     /// ```
     pub async fn shutdown(self) -> Result<(), MqttRecorderError> {
-        info!("Shutting down embedded broker on port {}", self.port);
-
-        // The broker thread will be dropped when self is dropped.
-        // rumqttd doesn't provide a clean shutdown mechanism through the public API,
-        // so we rely on the thread being terminated when the process exits or
-        // when the broker handle is dropped.
-        //
-        // Note: In a production scenario, we might want to implement a more
-        // sophisticated shutdown mechanism using channels or other synchronization
-        // primitives.
+        // rumqttd provides no shutdown mechanism through its public API, and
+        // dropping the JoinHandle only detaches the broker thread — it keeps
+        // running until the process exits. That is fine for this one-shot
+        // CLI (the process exits right after), but do not reuse this type in
+        // a long-running daemon without solving real broker termination.
+        info!(
+            "Releasing embedded broker on port {} (rumqttd offers no clean shutdown; \
+             the listener thread ends when the process exits)",
+            self.port
+        );
 
         Ok(())
     }
