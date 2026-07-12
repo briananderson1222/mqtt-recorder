@@ -186,18 +186,42 @@ impl Replayer {
             }
         );
 
+        // Wait for the broker's CONNACK before replaying anything. Publishes
+        // only queue locally, so replaying into a connection that never
+        // establishes would report success without delivering a single
+        // message (and exit 0 instead of the documented exit 2).
+        let connect_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(crate::util::CONNACK_TIMEOUT_SECS);
+        loop {
+            match tokio::time::timeout_at(connect_deadline, self.client.poll()).await {
+                Ok(Ok(crate::mqtt::MqttIncoming::ConnAck)) => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    if crate::util::is_fatal_error(&e, false) {
+                        error!("Connection failed: {}", e);
+                        return Err(e);
+                    }
+                    // Transient error: retry until the deadline
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(_) => {
+                    return Err(MqttRecorderError::ConnectTimeout(format!(
+                        "no CONNACK from broker within {}s",
+                        crate::util::CONNACK_TIMEOUT_SECS
+                    )));
+                }
+            }
+        }
+        if let Some(ref state) = tui_state {
+            state.set_source_connected(true);
+        }
+        info!("Connected to MQTT broker");
+
         // Spawn background task to drive the MQTT event loop continuously.
         // This handles sending queued publishes over the network, receiving
         // acks, and keepalive — preventing channel backpressure from blocking
         // publish() in the main loop.
         let poll_handle = self.client.spawn_poll_task();
-
-        // Wait briefly for connection to establish
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if let Some(ref state) = tui_state {
-            state.set_source_connected(true);
-        }
-        info!("Connected to MQTT broker");
 
         loop {
             // Check if TUI requested quit

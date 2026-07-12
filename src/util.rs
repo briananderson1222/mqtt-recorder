@@ -20,6 +20,11 @@ pub const RETRY_DELAY_SECS: u64 = 1;
 /// Timeout in seconds when waiting for the embedded broker to become ready.
 pub const BROKER_READY_TIMEOUT_SECS: u64 = 5;
 
+/// How long the replayer waits for the broker's CONNACK before failing.
+/// Replaying into an unacknowledged connection would queue publishes
+/// locally and report success without delivering anything.
+pub const CONNACK_TIMEOUT_SECS: u64 = 10;
+
 /// Timeout in seconds when waiting for the embedded broker to shut down.
 pub const BROKER_SHUTDOWN_TIMEOUT_SECS: u64 = 2;
 
@@ -188,6 +193,7 @@ pub fn is_fatal_error(error: &MqttRecorderError, recoverable_connection: bool) -
         MqttRecorderError::Json(_) => false,
         MqttRecorderError::ValidationFailed(_) => false,
         MqttRecorderError::Tls(_) => false,
+        MqttRecorderError::ConnectTimeout(_) => !recoverable_connection,
         MqttRecorderError::Broker(_) => false,
     }
 }

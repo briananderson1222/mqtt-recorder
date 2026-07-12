@@ -99,6 +99,14 @@ pub enum MqttRecorderError {
     #[error("TLS configuration error: {0}")]
     Tls(String),
 
+    /// Connection establishment timeout.
+    ///
+    /// This error occurs when the broker never acknowledges the MQTT
+    /// connection (no CONNACK) within the allowed window. Maps to exit
+    /// code 2 like other connection errors.
+    #[error("Connection timeout: {0}")]
+    ConnectTimeout(String),
+
     /// Embedded broker error.
     ///
     /// This error occurs when the embedded MQTT broker (rumqttd) fails to

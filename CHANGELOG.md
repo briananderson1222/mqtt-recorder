@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Replay mode now exits with code 2 when the broker never accepts the
+  connection, instead of "replaying" into a locally-queued void and
+  reporting success. The replayer waits for CONNACK (10s timeout) before
+  publishing anything.
+
 ## [0.3.0] - 2026-07-12
 
 ### Fixed

@@ -832,6 +832,7 @@ fn error_to_exit_code(error: &MqttRecorderError) -> u8 {
         MqttRecorderError::V5Connection(_) => EXIT_CONNECTION_ERROR,
         MqttRecorderError::V5Client(_) => EXIT_CONNECTION_ERROR,
         MqttRecorderError::Tls(_) => EXIT_CONNECTION_ERROR,
+        MqttRecorderError::ConnectTimeout(_) => EXIT_CONNECTION_ERROR,
         MqttRecorderError::Io(_) => EXIT_IO_ERROR,
         MqttRecorderError::Csv(_) => EXIT_IO_ERROR,
         MqttRecorderError::Json(_) => EXIT_IO_ERROR,

@@ -652,3 +652,32 @@ async fn test_replayer_speed_scales_wall_clock_timing() {
         gap
     );
 }
+
+/// Test that replaying to an unreachable broker fails with an error instead
+/// of reporting success.
+///
+/// Regression test: publishes only queue locally, so the replayer used to
+/// "complete" against a dead broker and exit 0 with nothing delivered.
+#[tokio::test]
+async fn test_replayer_fails_fast_on_unreachable_broker() {
+    let dead_port = get_free_port(); // allocated then released: nothing listens
+
+    let dir = tempdir().unwrap();
+    let csv_path = dir.path().join("input.csv");
+    create_test_csv(&csv_path, &[("test/a", "payload-a", 0, false)]);
+
+    let client = AnyMqttClient::V5(make_client(dead_port, "dead-replayer").await);
+    let reader = CsvReader::new(&csv_path, false, None).expect("reader");
+    let mut replayer = Replayer::new(client, reader, false, 0.0);
+
+    let (_shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let result = timeout(Duration::from_secs(15), replayer.run(shutdown_rx, None))
+        .await
+        .expect("replayer should fail well before the 15s harness timeout");
+
+    assert!(
+        result.is_err(),
+        "replaying to an unreachable broker must error, got {:?}",
+        result
+    );
+}
