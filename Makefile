@@ -26,7 +26,13 @@ test-integration:
 	cargo test --test mirror_test
 
 test-property:
-	cargo test --test cli_props --test topics_props --test csv_props --test csv_validation_props --test tui_props -- --test-threads=1
+	cargo test --test cli_props --test topics_props --test csv_props \
+		--test csv_validation_binary_detection_props \
+		--test csv_validation_b64_marker_props \
+		--test csv_validation_roundtrip_props \
+		--test csv_validation_field_limits_props \
+		--test csv_validation_repair_mode_props \
+		--test tui_props -- --test-threads=1
 
 # Linting
 clippy:

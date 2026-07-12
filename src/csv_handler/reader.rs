@@ -897,7 +897,10 @@ mod tests {
         let huge = "x".repeat(1024 * 1024);
         std::fs::write(
             &path,
-            format!("timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.123Z,t,{},0,false\n", huge),
+            format!(
+                "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.123Z,t,{},0,false\n",
+                huge
+            ),
         )
         .unwrap();
 
@@ -918,7 +921,10 @@ mod tests {
         let payload = "y".repeat(1000);
         std::fs::write(
             &path,
-            format!("timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.123Z,t,{},0,false\n", payload),
+            format!(
+                "timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.123Z,t,{},0,false\n",
+                payload
+            ),
         )
         .unwrap();
 

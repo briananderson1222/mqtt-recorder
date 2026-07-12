@@ -163,9 +163,7 @@ fn build_insecure_rustls_config(
                     MqttRecorderError::Tls(format!("Failed to parse client certificate: {}", e))
                 })?;
             let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
-                .map_err(|e| {
-                    MqttRecorderError::Tls(format!("Failed to parse client key: {}", e))
-                })?
+                .map_err(|e| MqttRecorderError::Tls(format!("Failed to parse client key: {}", e)))?
                 .ok_or_else(|| {
                     MqttRecorderError::Tls("No private key found in keyfile".to_string())
                 })?;
@@ -1220,8 +1218,9 @@ mod tests {
 
     #[test]
     fn test_build_insecure_rustls_config_rejects_garbage_client_auth() {
-        let err = build_insecure_rustls_config(Some((b"not a cert".to_vec(), b"not a key".to_vec())))
-            .unwrap_err();
+        let err =
+            build_insecure_rustls_config(Some((b"not a cert".to_vec(), b"not a key".to_vec())))
+                .unwrap_err();
         assert!(err.to_string().contains("key"), "got: {}", err);
     }
 }

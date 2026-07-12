@@ -11,8 +11,8 @@ pub mod writer;
 pub use encoding::{is_binary_payload, AUTO_ENCODE_MARKER};
 pub use reader::CsvReader;
 // Budget guard shared with the validator (bounds memory per CSV record)
-pub(crate) use reader::{per_record_budget, BudgetedReader};
 pub use reader::FIELD_SIZE_BUDGET_ERROR;
+pub(crate) use reader::{per_record_budget, BudgetedReader};
 pub use record::MessageRecord;
 pub use writer::CsvWriter;
 

@@ -991,7 +991,10 @@ impl Mirror {
     ///
     /// - **11.4**: Republish received messages to the embedded broker
     /// - **11.6**: Preserve message topic, payload, QoS, and retain flag
-    async fn republish_message(&self, record: &MessageRecordBytes) -> Result<(), MqttRecorderError> {
+    async fn republish_message(
+        &self,
+        record: &MessageRecordBytes,
+    ) -> Result<(), MqttRecorderError> {
         // Convert QoS u8 to rumqttc QoS enum
         let qos = crate::util::u8_to_qos(record.qos);
 

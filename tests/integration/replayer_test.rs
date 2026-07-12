@@ -564,7 +564,11 @@ async fn test_replayer_preserves_binary_payloads() {
         .expect("Error");
 
     assert_eq!(count, 1, "Replayer should have published 1 message");
-    assert_eq!(messages.len(), 1, "Subscriber should have received 1 message");
+    assert_eq!(
+        messages.len(),
+        1,
+        "Subscriber should have received 1 message"
+    );
     assert_eq!(messages[0].0, "test/binary");
     assert_eq!(
         messages[0].1, binary_payload,
