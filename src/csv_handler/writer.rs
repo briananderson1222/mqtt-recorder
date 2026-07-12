@@ -44,8 +44,19 @@ pub struct CsvWriter {
 
 impl CsvWriter {
     /// Creates a new CSV writer, writing the header row to the file.
+    ///
+    /// On Unix the file is created with mode 0600: recorded payloads often
+    /// contain credentials or PII and must not be world-readable.
     pub fn new(path: &Path, encode_b64: bool) -> Result<Self, MqttRecorderError> {
-        let mut writer = Writer::from_path(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(path)?;
+        let mut writer = Writer::from_writer(file);
 
         // Write the header row as required by 4.5
         writer.write_record(["timestamp", "topic", "payload", "qos", "retain"])?;

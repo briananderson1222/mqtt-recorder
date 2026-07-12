@@ -514,3 +514,141 @@ async fn test_record_then_replay_roundtrip() {
         ]
     );
 }
+
+/// Test that binary (non-UTF-8) payloads are replayed byte-for-byte.
+///
+/// Regression test: replay previously went through a lossy String conversion
+/// that replaced invalid UTF-8 sequences with U+FFFD before publishing.
+#[tokio::test]
+async fn test_replayer_preserves_binary_payloads() {
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
+        .await
+        .expect("Failed to start broker");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let binary_payload: Vec<u8> = vec![0xFF, 0xFE, 0x00, 0x01, 0x80, 0xDE, 0xAD, 0xBE, 0xEF];
+
+    let dir = tempdir().unwrap();
+    let csv_path = dir.path().join("binary.csv");
+    {
+        let mut writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
+        writer
+            .write_bytes(Utc::now(), "test/binary", &binary_payload, 0, false)
+            .expect("Failed to write binary record");
+        writer.flush().expect("Failed to flush");
+    }
+
+    let subscriber = make_client(port, "bin-subscriber").await;
+    subscriber
+        .subscribe(&["test/#".to_string()], QoS::AtMostOnce)
+        .await
+        .expect("Failed to subscribe");
+    let _ = subscriber.poll().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let replayer_client = AnyMqttClient::V5(make_client(port, "bin-replayer").await);
+    let reader = CsvReader::new(&csv_path, false, None).expect("Failed to create reader");
+    let mut replayer = Replayer::new(replayer_client, reader, false, 0.0);
+
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
+
+    let messages = collect_messages(&subscriber, "test/#", 1, 5000).await;
+
+    let _ = shutdown_tx.send(());
+    let count = timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("Timed out")
+        .expect("Panicked")
+        .expect("Error");
+
+    assert_eq!(count, 1, "Replayer should have published 1 message");
+    assert_eq!(
+        messages.len(),
+        1,
+        "Subscriber should have received 1 message"
+    );
+    assert_eq!(messages[0].0, "test/binary");
+    assert_eq!(
+        messages[0].1, binary_payload,
+        "Binary payload must arrive byte-for-byte identical"
+    );
+}
+
+/// Test that --speed actually scales wall-clock replay timing.
+///
+/// Two records 1200ms apart replayed at speed 4.0 should arrive ~300ms
+/// apart. Bounds are deliberately loose for CI: the gap must be clearly
+/// nonzero (timing preserved, >=150ms) and clearly compressed (<1200ms).
+#[tokio::test]
+async fn test_replayer_speed_scales_wall_clock_timing() {
+    let port = get_free_port();
+    let _broker = EmbeddedBroker::new(port, BrokerMode::Standalone)
+        .await
+        .expect("Failed to start broker");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let dir = tempdir().unwrap();
+    let csv_path = dir.path().join("timed.csv");
+    {
+        let mut writer = CsvWriter::new(&csv_path, false).expect("Failed to create writer");
+        let t0 = Utc::now();
+        let t1 = t0 + chrono::Duration::milliseconds(1200);
+        writer
+            .write_bytes(t0, "timed/a", b"first", 0, false)
+            .expect("write");
+        writer
+            .write_bytes(t1, "timed/b", b"second", 0, false)
+            .expect("write");
+        writer.flush().expect("flush");
+    }
+
+    let subscriber = make_client(port, "timed-subscriber").await;
+    subscriber
+        .subscribe(&["timed/#".to_string()], QoS::AtMostOnce)
+        .await
+        .expect("subscribe");
+    let _ = subscriber.poll().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let replayer_client = AnyMqttClient::V5(make_client(port, "timed-replayer").await);
+    let reader = CsvReader::new(&csv_path, false, None).expect("reader");
+    let mut replayer = Replayer::new(replayer_client, reader, false, 4.0);
+
+    let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+    let handle = tokio::spawn(async move { replayer.run(shutdown_rx, None).await });
+
+    // Record arrival instants of both messages
+    let mut arrivals: Vec<(String, tokio::time::Instant)> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(8000);
+    while arrivals.len() < 2 && tokio::time::Instant::now() < deadline {
+        if let Ok(Ok(event)) =
+            tokio::time::timeout(Duration::from_millis(500), subscriber.poll()).await
+        {
+            use rumqttc::v5::mqttbytes::v5::Packet;
+            if let rumqttc::v5::Event::Incoming(Packet::Publish(p)) = event {
+                arrivals.push((
+                    String::from_utf8_lossy(&p.topic).into_owned(),
+                    tokio::time::Instant::now(),
+                ));
+            }
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    let _ = timeout(Duration::from_secs(5), handle).await;
+
+    assert_eq!(arrivals.len(), 2, "expected both timed messages");
+    let gap = arrivals[1].1.duration_since(arrivals[0].1);
+    assert!(
+        gap >= Duration::from_millis(150),
+        "gap {:?} too small: replay timing was not preserved",
+        gap
+    );
+    assert!(
+        gap < Duration::from_millis(1200),
+        "gap {:?} too large: --speed 4.0 did not compress the 1200ms recording gap",
+        gap
+    );
+}

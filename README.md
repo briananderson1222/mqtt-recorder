@@ -28,7 +28,7 @@ A command-line tool for recording and replaying MQTT messages, written in Rust.
 
 ### From Source
 
-Ensure you have Rust installed (1.70 or later recommended), then:
+Ensure you have Rust installed (1.88 or later required), then:
 
 ```bash
 git clone https://github.com/briananderson1222/mqtt-recorder.git
@@ -80,7 +80,7 @@ mqtt-recorder --mode replay --host localhost --file messages.csv --loop
 Mirror messages from an external broker to a local embedded broker:
 
 ```bash
-mqtt-recorder --mode mirror --host external-broker.example.com --serve --serve_port 1884
+mqtt-recorder --mode mirror --host external-broker.example.com --serve --serve-port 1884
 ```
 
 Mirror and record simultaneously:
@@ -94,7 +94,7 @@ mqtt-recorder --mode mirror --host external-broker.example.com --serve --file ba
 Run an embedded MQTT broker:
 
 ```bash
-mqtt-recorder --serve --serve_port 1883
+mqtt-recorder --serve --serve-port 1883
 ```
 
 ### Validate CSV File
@@ -108,7 +108,7 @@ mqtt-recorder --validate --file messages.csv
 Validate with base64 decoding enabled:
 
 ```bash
-mqtt-recorder --validate --file messages.csv --encode_b64
+mqtt-recorder --validate --file messages.csv --encode-b64
 ```
 
 ### Repair CSV File
@@ -137,8 +137,8 @@ mqtt-recorder --mode record \
 mqtt-recorder --mode record \
   --host secure-broker.example.com \
   --port 8883 \
-  --enable_ssl \
-  --ca_cert /path/to/ca.crt \
+  --enable-ssl \
+  --ca-cert /path/to/ca.crt \
   --file messages.csv
 ```
 
@@ -148,8 +148,8 @@ mqtt-recorder --mode record \
 mqtt-recorder --mode record \
   --host secure-broker.example.com \
   --port 8883 \
-  --enable_ssl \
-  --ca_cert /path/to/ca.crt \
+  --enable-ssl \
+  --ca-cert /path/to/ca.crt \
   --certfile /path/to/client.crt \
   --keyfile /path/to/client.key \
   --file messages.csv
@@ -163,10 +163,10 @@ For binary payloads, use base64 encoding to encode all payloads:
 mqtt-recorder --mode record \
   --host localhost \
   --file messages.csv \
-  --encode_b64
+  --encode-b64
 ```
 
-Without `--encode_b64`, binary payloads are automatically detected and encoded with a `b64:` prefix, while text payloads are stored as-is. This provides the best of both worlds: human-readable text and safe binary storage.
+Without `--encode-b64`, binary payloads are automatically detected and encoded with a `b64:` prefix, while text payloads are stored as-is. This provides the best of both worlds: human-readable text and safe binary storage.
 
 ### Subscribing to Multiple Topics
 
@@ -185,7 +185,7 @@ mqtt-recorder --mode record --host localhost --file messages.csv --topics topics
 Replay messages to an embedded broker (no external broker needed):
 
 ```bash
-mqtt-recorder --mode replay --serve --serve_port 1884 --file messages.csv
+mqtt-recorder --mode replay --serve --serve-port 1884 --file messages.csv
 ```
 
 ### Replay to Both External and Embedded Broker
@@ -194,7 +194,7 @@ mqtt-recorder --mode replay --serve --serve_port 1884 --file messages.csv
 mqtt-recorder --mode replay \
   --host external-broker.example.com \
   --serve \
-  --serve_port 1884 \
+  --serve-port 1884 \
   --file messages.csv
 ```
 
@@ -204,7 +204,7 @@ The TUI is enabled by default when running interactively. Disable it for scripti
 
 ```bash
 # Run mirror mode without TUI
-mqtt-recorder --mode mirror --host broker.example.com --serve --no_interactive
+mqtt-recorder --mode mirror --host broker.example.com --serve --no-interactive
 ```
 
 ### Verify Mirrored Messages
@@ -215,7 +215,7 @@ Compare source messages against what the embedded broker actually delivers:
 mqtt-recorder --mode mirror \
   --host broker.example.com \
   --serve \
-  --serve_port 1884 \
+  --serve-port 1884 \
   --verify
 ```
 
@@ -227,7 +227,7 @@ Write structured audit events to a file:
 mqtt-recorder --mode mirror \
   --host broker.example.com \
   --serve \
-  --audit_log /tmp/audit.log
+  --audit-log /tmp/audit.log
 ```
 
 ### Playlist Replay
@@ -250,7 +250,7 @@ mqtt-recorder --mode replay \
 |----------|-------------|---------|
 | `--host` | MQTT broker address | Required (unless `--serve` in replay mode) |
 | `--port` | MQTT broker port | `1883` |
-| `--client_id` | MQTT client identifier | Auto-generated |
+| `--client-id` | MQTT client identifier | Auto-generated |
 | `--mode` | Operation mode: `record`, `replay`, or `mirror` | Required (unless `--serve` alone) |
 | `--file` | CSV file path for recording/replaying | Required for record/replay |
 
@@ -267,6 +267,7 @@ mqtt-recorder --mode replay \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--loop` | Loop replay continuously | `false` |
+| `--speed` | Playback speed multiplier (`0` = max speed, `1.0` = real-time, `2.0` = 2x faster) | `1.0` |
 | `--playlist` | Additional CSV files for playback selection (repeatable) | None |
 
 ### Mirror Options
@@ -274,13 +275,14 @@ mqtt-recorder --mode replay \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--mirror` | Start with mirroring enabled | `true` |
+| `--no-mirror` | Start with mirroring disabled | `false` |
 | `--verify` | Verify mirrored messages against embedded broker output | `false` |
 
 ### TUI Options
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--no_interactive` | Disable interactive TUI mode | `false` |
+| `--no-interactive` | Disable interactive TUI mode | `false` |
 | `--record` | Start with recording enabled | `true` if `--file` provided |
 
 ### Audit Options
@@ -288,15 +290,16 @@ mqtt-recorder --mode replay \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--audit` | Enable audit logging in TUI | `true` |
-| `--audit_log` | Path to write audit log file (auto-enables file writing) | None |
+| `--no-audit` | Disable audit logging in the TUI | `false` |
+| `--audit-log` | Path to write audit log file (auto-enables file writing) | None |
 
 ### TLS/SSL Options
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--enable_ssl` | Enable TLS/SSL connection | `false` |
-| `--tls_insecure` | Skip TLS certificate verification | `false` |
-| `--ca_cert` | Path to CA certificate file | None |
+| `--enable-ssl` | Enable TLS/SSL connection | `false` |
+| `--tls-insecure` | Skip all server certificate verification (self-signed certs; connection stays encrypted but the peer is unauthenticated) | `false` |
+| `--ca-cert` | Path to CA certificate file | None |
 | `--certfile` | Path to client certificate file | None |
 | `--keyfile` | Path to client private key file | None |
 
@@ -304,15 +307,23 @@ mqtt-recorder --mode replay \
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--username` | MQTT broker username | None |
-| `--password` | MQTT broker password | None |
+| `--username` | MQTT broker username (or `MQTT_USERNAME` env var) | None |
+| `--password` | MQTT broker password (or `MQTT_PASSWORD` env var) | None |
+
+Prefer the environment variables for the password: a `--password` flag is
+visible to other local users via `ps` and lands in shell history.
+
+```bash
+MQTT_PASSWORD=mypassword mqtt-recorder --mode record \
+  --host broker.example.com --username myuser --file messages.csv
+```
 
 ### Encoding Options
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--encode_b64` | Encode all payloads as base64 | `false` |
-| `--csv_field_size_limit` | Maximum CSV field size in bytes | None |
+| `--encode-b64` | Encode all payloads as base64 | `false` |
+| `--csv-field-size_limit` | Maximum CSV field size in bytes | None |
 
 ### Validation and Repair Options
 
@@ -322,20 +333,39 @@ mqtt-recorder --mode replay \
 | `--fix` | Repair corrupted CSV file | `false` |
 | `--output` | Output path for repaired CSV file | Required with `--fix` |
 
+### Shell Completions
+
+Generate completions for your shell (bash, zsh, fish, elvish, powershell):
+
+```bash
+# zsh example
+mqtt-recorder --completions zsh > ~/.zfunc/_mqtt-recorder
+
+# bash example
+mqtt-recorder --completions bash > /usr/local/etc/bash_completion.d/mqtt-recorder
+```
+
 ### Advanced Options
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--max_packet_size` | Maximum MQTT packet size in bytes | `1048576` (1MB) |
-| `--mqtt_version` | MQTT protocol version for external brokers (`3.1.1` or `5`) | `5` |
-| `--health_check` | Health check interval in seconds (0 to disable) | `60` |
+| `--max-packet-size` | Maximum MQTT packet size in bytes | `1048576` (1MB) |
+| `--mqtt-version` | MQTT protocol version for external brokers (`3.1.1` or `5`) | `5` |
+| `--health-check` | Health check interval in seconds (0 to disable) | `60` |
 
 ### Embedded Broker Options
 
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--serve` | Start embedded MQTT broker (MQTT v5) | `false` |
-| `--serve_port` | Embedded broker port | `1883` |
+| `--serve-port` | Embedded broker port | `1883` |
+| `--bind-addr` | Bind address for the embedded broker | `127.0.0.1` |
+
+> **Security note:** the embedded broker has no authentication and no TLS.
+> It binds to loopback by default so only local processes can reach it. Pass
+> `--bind-addr 0.0.0.0` (or a specific interface address) only on networks
+> where every reachable host is trusted — anyone who can reach the port can
+> read all mirrored/replayed traffic and publish arbitrary messages.
 
 ## CSV File Format
 
@@ -351,11 +381,11 @@ Messages are stored in RFC 4180 compliant CSV format with the following columns:
 
 ### Payload Encoding
 
-When `--encode_b64` is **not** set (default):
+When `--encode-b64` is **not** set (default):
 - **Text payloads** (valid UTF-8 without control characters) are stored as-is
 - **Binary payloads** (non-UTF-8 or containing control characters) are automatically base64 encoded and prefixed with `b64:`
 
-When `--encode_b64` is set:
+When `--encode-b64` is set:
 - **All payloads** are base64 encoded without any prefix
 
 The `b64:` prefix marker allows the reader to distinguish between:
@@ -414,7 +444,7 @@ During shutdown:
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.88 or later
 - Cargo
 
 ### Build Commands

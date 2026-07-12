@@ -41,7 +41,7 @@ use tokio::sync::broadcast;
 use tokio::time::Duration;
 use tracing::{error, info};
 
-use crate::csv_handler::{CsvReader, MessageRecord};
+use crate::csv_handler::{CsvReader, MessageRecordBytes};
 use crate::error::MqttRecorderError;
 use crate::mqtt::AnyMqttClient;
 use crate::tui::TuiState;
@@ -207,7 +207,9 @@ impl Replayer {
                 }
             }
 
-            let record_result = self.reader.next();
+            // Read as raw bytes so binary payloads are republished exactly as
+            // recorded (the String-based path is lossy for non-UTF-8 data).
+            let record_result = self.reader.read_next_bytes();
 
             match record_result {
                 Some(Ok(record)) => {
@@ -225,8 +227,9 @@ impl Replayer {
                             tokio::select! {
                                 _ = shutdown.recv() => {
                                     info!("Shutdown signal received during delay, stopping replayer...");
-                                    poll_handle.abort();
-                                    return Ok(message_count);
+                                    // Fall through to the common epilogue so the
+                                    // MQTT client still disconnects gracefully.
+                                    break;
                                 }
                                 _ = tokio::time::sleep(delay) => {}
                             }
@@ -254,7 +257,7 @@ impl Replayer {
                     }
 
                     // Periodically yield and check shutdown
-                    if message_count % crate::util::FLUSH_INTERVAL == 0 {
+                    if message_count.is_multiple_of(crate::util::FLUSH_INTERVAL) {
                         tokio::task::yield_now().await;
 
                         match shutdown.try_recv() {
@@ -372,7 +375,7 @@ impl Replayer {
     /// - **5.3**: Preserve the original QoS level for each message
     /// - **5.4**: Preserve the original retain flag for each message
     /// - **5.6**: Decode base64 payloads before publishing (handled by CsvReader)
-    async fn publish_message(&self, record: &MessageRecord) -> Result<(), MqttRecorderError> {
+    async fn publish_message(&self, record: &MessageRecordBytes) -> Result<(), MqttRecorderError> {
         // Convert QoS u8 to rumqttc QoS enum (Requirement 5.3)
         let qos = crate::util::u8_to_qos(record.qos);
 
@@ -380,7 +383,7 @@ impl Replayer {
         // (Requirements 5.2, 5.3, 5.4)
         // Note: Base64 decoding is handled by CsvReader if configured (Requirement 5.6)
         self.client
-            .publish(&record.topic, record.payload.as_bytes(), qos, record.retain)
+            .publish(&record.topic, &record.payload, qos, record.retain)
             .await
     }
 

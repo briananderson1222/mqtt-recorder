@@ -242,7 +242,7 @@ When modifying core logic, ensure property tests still pass.
 
 ### Automatic Binary Detection
 
-- When `--encode_b64` is not set, payloads are automatically analyzed
+- When `--encode-b64` is not set, payloads are automatically analyzed
 - Binary payloads (non-UTF8 or control characters) are auto-encoded with `b64:` prefix
 - Text payloads are stored as-is for human readability
 - The `b64:` prefix allows distinguishing auto-encoded from literal content

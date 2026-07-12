@@ -2,7 +2,7 @@
 name = "mqtt-recorder"
 version = "0.2.1"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.88"
 resolver = "2"
 description = "Record and replay MQTT messages"
 license = "Apache-2.0"
@@ -18,11 +18,16 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI argument parsing
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 
 # MQTT client and broker
-rumqttc = "0.24"
-rumqttd = "0.19"
+rumqttc = "0.25"
+rumqttd = "0.20"
+
+# TLS (for the --tls-insecure custom verifier; version matches rumqttc's rustls)
+rustls = "0.23"
+rustls-pemfile = "2"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -41,15 +46,15 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [dev-dependencies]
 # Property-based testing
@@ -69,8 +74,24 @@ name = "csv_props"
 path = "tests/property/csv_props.rs"
 
 [[test]]
-name = "csv_validation_props"
-path = "tests/property/csv_validation_props.rs"
+name = "csv_validation_binary_detection_props"
+path = "tests/property/csv_validation_binary_detection_props.rs"
+
+[[test]]
+name = "csv_validation_b64_marker_props"
+path = "tests/property/csv_validation_b64_marker_props.rs"
+
+[[test]]
+name = "csv_validation_roundtrip_props"
+path = "tests/property/csv_validation_roundtrip_props.rs"
+
+[[test]]
+name = "csv_validation_field_limits_props"
+path = "tests/property/csv_validation_field_limits_props.rs"
+
+[[test]]
+name = "csv_validation_repair_mode_props"
+path = "tests/property/csv_validation_repair_mode_props.rs"
 
 [[test]]
 name = "tui_props"

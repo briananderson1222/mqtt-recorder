@@ -26,7 +26,13 @@ test-integration:
 	cargo test --test mirror_test
 
 test-property:
-	cargo test --test cli_props --test topics_props --test csv_props --test csv_validation_props --test tui_props -- --test-threads=1
+	cargo test --test cli_props --test topics_props --test csv_props \
+		--test csv_validation_binary_detection_props \
+		--test csv_validation_b64_marker_props \
+		--test csv_validation_roundtrip_props \
+		--test csv_validation_field_limits_props \
+		--test csv_validation_repair_mode_props \
+		--test tui_props -- --test-threads=1
 
 # Linting
 clippy:
@@ -39,9 +45,11 @@ fmt-check:
 	cargo fmt -- --check
 
 # Coverage (requires cargo-llvm-cov: cargo install cargo-llvm-cov)
-# Auto-detects Homebrew LLVM on macOS if rustup llvm-tools-preview is not available
+# Auto-detects Homebrew LLVM on macOS if rustup llvm-tools-preview is not available.
+# brew --prefix prints a path even when llvm isn't installed, so verify the
+# binary exists before overriding — otherwise rustup's llvm-tools is used.
 LLVM_PREFIX := $(shell brew --prefix llvm 2>/dev/null)
-ifdef LLVM_PREFIX
+ifneq ($(wildcard $(LLVM_PREFIX)/bin/llvm-profdata),)
   export LLVM_COV := $(LLVM_PREFIX)/bin/llvm-cov
   export LLVM_PROFDATA := $(LLVM_PREFIX)/bin/llvm-profdata
 endif

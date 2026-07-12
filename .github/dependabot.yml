@@ -1,0 +1,20 @@
+# Keeps pinned action SHAs and Cargo dependencies fresh with low noise:
+# monthly, grouped into one PR per ecosystem. Security advisories still
+# trigger PRs immediately regardless of schedule.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      cargo-deps:
+        patterns: ["*"]

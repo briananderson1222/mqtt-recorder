@@ -41,8 +41,17 @@ pub enum Mode {
 #[derive(Parser, Debug)]
 #[command(name = "mqtt-recorder")]
 #[command(about = "Record and replay MQTT messages")]
-#[command(version)]
+#[command(version, long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")"))]
 pub struct Args {
+    /// Print shell completions for the given shell and exit
+    ///
+    /// Deliberately not `exclusive`: clap counts env-sourced args
+    /// (MQTT_USERNAME/MQTT_PASSWORD) as "specified", so exclusivity would
+    /// break `--completions` for anyone exporting those in their profile.
+    /// main() short-circuits before any other argument is acted on.
+    #[arg(long, value_enum)]
+    pub completions: Option<clap_complete::Shell>,
+
     /// MQTT broker address (required unless --serve in replay mode)
     #[arg(long)]
     pub host: Option<String>,
@@ -103,12 +112,13 @@ pub struct Args {
     #[arg(long)]
     pub keyfile: Option<PathBuf>,
 
-    /// MQTT username
-    #[arg(long)]
+    /// MQTT username (or set MQTT_USERNAME)
+    #[arg(long, env = "MQTT_USERNAME")]
     pub username: Option<String>,
 
-    /// MQTT password
-    #[arg(long)]
+    /// MQTT password (or set MQTT_PASSWORD; preferred over the flag, which
+    /// is visible in `ps` output and shell history)
+    #[arg(long, env = "MQTT_PASSWORD", hide_env_values = true)]
     pub password: Option<String>,
 
     /// Encode payloads as base64
@@ -130,6 +140,11 @@ pub struct Args {
     /// Embedded broker port
     #[arg(long, default_value = "1883")]
     pub serve_port: u16,
+
+    /// Bind address for the embedded broker. Loopback by default; the broker
+    /// has no authentication, so only set e.g. 0.0.0.0 on a trusted network.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind_addr: std::net::IpAddr,
 
     /// Validate CSV file without replaying
     #[arg(long, default_value = "false")]
@@ -155,6 +170,11 @@ pub struct Args {
     #[arg(long, default_value = "true")]
     pub mirror: bool,
 
+    /// Start with mirroring disabled (the bare `--mirror` flag cannot turn
+    /// mirroring off because it defaults to on)
+    #[arg(long, default_value = "false", conflicts_with = "mirror")]
+    pub no_mirror: bool,
+
     /// Additional CSV files for playback selection (can be specified multiple times)
     #[arg(long = "playlist")]
     pub playlist: Vec<PathBuf>,
@@ -162,6 +182,11 @@ pub struct Args {
     /// Enable audit logging in TUI (default: true)
     #[arg(long, default_value = "true")]
     pub audit: bool,
+
+    /// Disable audit logging in the TUI (the bare `--audit` flag cannot turn
+    /// auditing off because it defaults to on)
+    #[arg(long, default_value = "false", conflicts_with = "audit")]
+    pub no_audit: bool,
 
     /// Path to write audit log file (auto-enables file writing)
     #[arg(long)]
@@ -350,6 +375,16 @@ impl Args {
         self.mqtt_version == "5"
     }
 
+    /// Effective mirroring toggle: on by default, disabled by `--no-mirror`.
+    pub fn mirror_enabled(&self) -> bool {
+        self.mirror && !self.no_mirror
+    }
+
+    /// Effective audit-logging toggle: on by default, disabled by `--no-audit`.
+    pub fn audit_enabled(&self) -> bool {
+        self.audit && !self.no_audit
+    }
+
     /// Check if running in standalone broker mode.
     ///
     /// Standalone broker mode is when `--serve` is enabled without specifying a mode.
@@ -387,6 +422,7 @@ impl Args {
 impl Default for Args {
     fn default() -> Self {
         Args {
+            completions: None,
             host: None,
             port: 1883,
             client_id: None,
@@ -409,14 +445,17 @@ impl Default for Args {
             max_packet_size: 1048576,
             serve: false,
             serve_port: 1883,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             validate: false,
             fix: false,
             output: None,
             no_interactive: false,
             record: None,
             mirror: true,
+            no_mirror: false,
             playlist: vec![],
             audit: true,
+            no_audit: false,
             audit_log: None,
             mqtt_version: "5".to_string(),
             verify: false,
