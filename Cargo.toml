@@ -60,6 +60,8 @@ crossterm = "0.29"
 # Property-based testing
 proptest = "1"
 tempfile = "3"
+# Self-signed certificate generation for the TLS integration test
+rcgen = "0.14"
 
 [[test]]
 name = "cli_props"
@@ -117,6 +119,10 @@ path = "tests/integration/replayer_test.rs"
 [[test]]
 name = "verify_test"
 path = "tests/integration/verify_test.rs"
+
+[[test]]
+name = "tls_test"
+path = "tests/integration/tls_test.rs"
 
 [profile.release]
 lto = true
