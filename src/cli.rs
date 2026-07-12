@@ -44,7 +44,12 @@ pub enum Mode {
 #[command(version, long_version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")"))]
 pub struct Args {
     /// Print shell completions for the given shell and exit
-    #[arg(long, value_enum, exclusive = true)]
+    ///
+    /// Deliberately not `exclusive`: clap counts env-sourced args
+    /// (MQTT_USERNAME/MQTT_PASSWORD) as "specified", so exclusivity would
+    /// break `--completions` for anyone exporting those in their profile.
+    /// main() short-circuits before any other argument is acted on.
+    #[arg(long, value_enum)]
     pub completions: Option<clap_complete::Shell>,
 
     /// MQTT broker address (required unless --serve in replay mode)

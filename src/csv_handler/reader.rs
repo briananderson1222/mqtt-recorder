@@ -33,6 +33,13 @@ pub const FIELD_SIZE_BUDGET_ERROR: &str = "record exceeds the --csv-field-size-l
 /// memory: a crafted multi-gigabyte field is fully buffered first. This
 /// wrapper fails the read itself once the current record has consumed its
 /// budget. The owner replenishes the budget before each record.
+///
+/// CAUTION: a budget error poisons the underlying csv reader — it cannot
+/// resync mid-record, and subsequent reads return EOF (even after reset()
+/// on the same oversized file). Callers must treat this error as terminal
+/// for the file (abort or re-open), never as a skippable per-record error.
+/// Fields over the *limit* but under the *budget* are still reported as
+/// clean per-record errors by the after-the-fact check.
 pub(crate) struct BudgetedReader<R> {
     inner: R,
     remaining: Arc<AtomicUsize>,

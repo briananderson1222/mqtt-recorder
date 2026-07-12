@@ -74,8 +74,24 @@ name = "csv_props"
 path = "tests/property/csv_props.rs"
 
 [[test]]
-name = "csv_validation_props"
-path = "tests/property/csv_validation_props.rs"
+name = "csv_validation_binary_detection_props"
+path = "tests/property/csv_validation_binary_detection_props.rs"
+
+[[test]]
+name = "csv_validation_b64_marker_props"
+path = "tests/property/csv_validation_b64_marker_props.rs"
+
+[[test]]
+name = "csv_validation_roundtrip_props"
+path = "tests/property/csv_validation_roundtrip_props.rs"
+
+[[test]]
+name = "csv_validation_field_limits_props"
+path = "tests/property/csv_validation_field_limits_props.rs"
+
+[[test]]
+name = "csv_validation_repair_mode_props"
+path = "tests/property/csv_validation_repair_mode_props.rs"
 
 [[test]]
 name = "tui_props"
