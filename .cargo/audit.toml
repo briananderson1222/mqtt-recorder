@@ -1,0 +1,14 @@
+# cargo-audit configuration.
+#
+# The ignored advisories below all affect rustls-webpki < 0.103, which is
+# pinned transitively by rumqttc/rumqttd (their rustls stacks cap webpki at
+# 0.102.x). The fixes only exist in webpki 0.103+, so these cannot be
+# resolved from this crate until rumqttc/rumqttd move to rustls >= 0.23 with
+# webpki 0.103. Revisit on every rumqttc/rumqttd upgrade.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0098", # webpki: URI name constraints incorrectly accepted
+    "RUSTSEC-2026-0099", # webpki: wildcard name constraints incorrectly accepted
+    "RUSTSEC-2026-0104", # webpki: reachable panic in CRL parsing
+    "RUSTSEC-2026-0049", # webpki: CRL distribution-point matching bug
+]
