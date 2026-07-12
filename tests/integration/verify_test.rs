@@ -338,6 +338,18 @@ async fn test_verify_combined_source_and_playback() {
     // Wait for everything to flow through verify
     tokio::time::sleep(Duration::from_secs(4)).await;
 
+    // Quiesce playback before shutdown: looping playback always has a
+    // just-published record in flight, and shutting down mid-flight makes
+    // the verify sweep count it as missing (observed as a rare CI flake).
+    // Stop staging new records, then give the in-flight tail time to drain.
+    tui_state
+        .loop_enabled
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    tui_state
+        .playback_looping
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
     let _ = shutdown_tx.send(());
     let _ = timeout(Duration::from_secs(5), mirror_handle).await;
 
