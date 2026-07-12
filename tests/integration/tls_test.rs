@@ -25,11 +25,9 @@ fn get_free_port() -> u16 {
 /// Generate a self-signed certificate valid for localhost/127.0.0.1 and
 /// write the PEM cert + key into the temp dir.
 fn write_self_signed_cert(dir: &TempDir) -> (PathBuf, PathBuf) {
-    let certified = rcgen::generate_simple_self_signed(vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-    ])
-    .expect("cert generation");
+    let certified =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string()])
+            .expect("cert generation");
     let cert_path = dir.path().join("server.crt");
     let key_path = dir.path().join("server.key");
     std::fs::write(&cert_path, certified.cert.pem()).expect("write cert");
@@ -101,8 +99,7 @@ async fn wait_for_port(port: u16) {
 /// Connect with the given TLS config and drive the event loop until CONNACK
 /// or the first error.
 async fn try_connect(port: u16, id: &str, tls: TlsConfig) -> Result<(), String> {
-    let config =
-        MqttClientConfig::new("127.0.0.1".to_string(), port, id.to_string()).with_tls(tls);
+    let config = MqttClientConfig::new("127.0.0.1".to_string(), port, id.to_string()).with_tls(tls);
     let client = MqttClientV5::new(config).await.map_err(|e| e.to_string())?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
