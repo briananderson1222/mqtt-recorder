@@ -10,7 +10,7 @@ Please be respectful and constructive in all interactions. We welcome contributo
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust 1.88 or later
 - Cargo
 - Git
 - Docker (for integration tests)

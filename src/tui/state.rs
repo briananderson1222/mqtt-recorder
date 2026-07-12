@@ -713,7 +713,15 @@ impl TuiState {
             // Preload existing file content into TUI log
             self.preload_audit_file(&path);
             use std::fs::OpenOptions;
-            match OpenOptions::new().create(true).append(true).open(&path) {
+            let mut options = OpenOptions::new();
+            options.create(true).append(true);
+            // Audit logs carry host/session metadata; keep them private on Unix.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&path) {
                 Ok(file) => {
                     if let Ok(mut guard) = self.audit_file.lock() {
                         *guard = Some(file);

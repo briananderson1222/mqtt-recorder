@@ -1,0 +1,17 @@
+# cargo-audit configuration.
+#
+# The ignored advisories below affect rustls-webpki < 0.103. Since the
+# rumqttc 0.25 upgrade, actual certificate verification on the MQTT client
+# TLS path (--enable-ssl) goes through rustls 0.23 / webpki 0.103, which has
+# the fixes (rumqttc still links webpki 0.102 directly, but only for its
+# error type). The vulnerable 0.102 lineage otherwise remains via rumqttd's
+# broker-side TLS stack, which this tool never enables (the embedded broker
+# is plaintext, loopback by default). Revisit on every rumqttc/rumqttd
+# upgrade; drop these ignores once both are on rustls >= 0.23.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0098", # webpki: URI name constraints incorrectly accepted
+    "RUSTSEC-2026-0099", # webpki: wildcard name constraints incorrectly accepted
+    "RUSTSEC-2026-0104", # webpki: reachable panic in CRL parsing
+    "RUSTSEC-2026-0049", # webpki: CRL distribution-point matching bug
+]

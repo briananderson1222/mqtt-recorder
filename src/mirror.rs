@@ -44,7 +44,7 @@ use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
 use crate::broker::EmbeddedBroker;
-use crate::csv_handler::{CsvReader, CsvWriter, MessageRecord};
+use crate::csv_handler::{CsvReader, CsvWriter, MessageRecordBytes};
 use crate::error::MqttRecorderError;
 use crate::mqtt::{AnyMqttClient, MqttClientV5, MqttIncoming};
 use crate::topics::TopicFilter;
@@ -53,14 +53,15 @@ use crate::tui::{AuditArea, AuditSeverity, TuiState};
 /// Interval for polling broker metrics (in number of messages).
 const METRICS_POLL_INTERVAL: u64 = 100;
 
-fn process_event_impl(event: MqttIncoming) -> Option<MessageRecord> {
+fn process_event_impl(event: MqttIncoming) -> Option<MessageRecordBytes> {
     let (topic, payload, qos, retain) = crate::util::extract_publish(&event)?;
     let timestamp = Utc::now();
-    let payload_str = String::from_utf8_lossy(payload).to_string();
-    Some(MessageRecord::new(
+    // Keep the payload as raw bytes: converting through String would corrupt
+    // non-UTF-8 payloads before republish, CSV storage, and verify.
+    Some(MessageRecordBytes::new(
         timestamp,
         topic.to_string(),
-        payload_str,
+        payload.to_vec(),
         qos,
         retain,
     ))
@@ -472,6 +473,11 @@ impl Mirror {
         let mut was_playback_on = false;
         let mut was_recording = tui_state.as_ref().map(|s| s.is_recording()).unwrap_or(true);
         let mut previous_playback_ts: Option<DateTime<Utc>> = None;
+        // Next playback record, staged with the instant it becomes due. The
+        // replay delay is awaited inside the main select! below so a long gap
+        // between records never blocks shutdown, source polling, or TUI
+        // toggles (it used to be an uncancellable inline sleep).
+        let mut pending_playback: Option<(MessageRecordBytes, tokio::time::Instant)> = None;
 
         loop {
             if let Some(ref state) = tui_state {
@@ -496,39 +502,40 @@ impl Mirror {
             // Reset timestamp tracking on playback start/restart
             if was_playback_on && !prev_was_on {
                 previous_playback_ts = None;
+                pending_playback = None;
             }
 
-            // Process one playback record if active
-            if playback_reader.is_some() {
-                self.process_playback_record(
+            // Playback turned off: drop any staged-but-unpublished record
+            if playback_reader.is_none() {
+                pending_playback = None;
+            } else if pending_playback.is_none() {
+                pending_playback = self.stage_next_playback_record(
                     &mut playback_reader,
                     &tui_state,
-                    &verify_ready,
                     &mut previous_playback_ts,
-                )
-                .await?;
+                );
             }
 
-            // Check if source is enabled (pause incoming messages)
+            // Whether incoming source messages are enabled (pausable from TUI)
             let source_enabled = tui_state
                 .as_ref()
                 .map(|s| s.is_source_enabled())
                 .unwrap_or(true);
-            if !source_enabled {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                continue;
-            }
+
+            let playback_due = pending_playback.as_ref().map(|(_, due)| *due);
 
             tokio::select! {
                 _ = shutdown.recv() => {
                     break;
                 }
 
-                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)), if playback_reader.is_some() => {
-                    // Yield to process playback records at top of loop
+                _ = tokio::time::sleep_until(playback_due.unwrap_or_else(tokio::time::Instant::now)), if playback_due.is_some() => {
+                    if let Some((record, _)) = pending_playback.take() {
+                        self.publish_playback_record(&record, &tui_state, &verify_ready).await?;
+                    }
                 }
 
-                event_result = self.source_client.poll() => {
+                event_result = self.source_client.poll(), if source_enabled => {
                     match event_result {
                         Ok(event) => {
                             self.handle_source_event(event, &tui_state, &verify_ready, &mut message_count, &mut flush_counter, &mut was_recording).await?;
@@ -545,6 +552,11 @@ impl Mirror {
                         }
                     }
                 }
+
+                // Periodic wake-up so TUI toggles are noticed while playback
+                // is active (or while the source is paused and nothing else
+                // would wake the loop).
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)), if !source_enabled || playback_reader.is_some() => {}
             }
         }
 
@@ -683,100 +695,116 @@ impl Mirror {
         playback_on
     }
 
-    async fn process_playback_record(
+    /// Read the next playback record and compute the instant it is due.
+    ///
+    /// The delay (timestamp gap divided by playback speed, captured at stage
+    /// time) is returned as a deadline rather than slept here, so the caller
+    /// can await it cancellably alongside shutdown and source polling.
+    ///
+    /// Returns `None` when there is nothing to stage right now: a bad record
+    /// was skipped, or end-of-file was handled (reset for looping, or
+    /// playback stopped).
+    fn stage_next_playback_record(
         &self,
         playback_reader: &mut Option<CsvReader>,
         tui_state: &Option<std::sync::Arc<TuiState>>,
-        verify_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
         previous_ts: &mut Option<DateTime<Utc>>,
-    ) -> Result<(), MqttRecorderError> {
-        if let Some(ref mut reader) = playback_reader {
-            match reader.read_next() {
-                Some(Ok(record)) => {
-                    // Apply speed-based delay between records
-                    let speed = tui_state
-                        .as_ref()
-                        .map(|s| s.get_playback_speed())
-                        .unwrap_or(crate::util::DEFAULT_PLAYBACK_SPEED);
-                    if speed != 0.0 {
-                        if let Some(prev) = previous_ts {
-                            let diff = record.timestamp - *prev;
-                            if diff.num_milliseconds() > 0 {
-                                let delay_ms = diff.num_milliseconds() as f64 / speed as f64;
-                                tokio::time::sleep(tokio::time::Duration::from_millis(
-                                    delay_ms as u64,
-                                ))
-                                .await;
-                            }
-                        }
-                    }
-                    *previous_ts = Some(record.timestamp);
-                    if verify_ready.load(Ordering::Relaxed) {
-                        if let Some(ref tx) = self.verify_tx {
-                            let _ =
-                                tx.send((record.topic.clone(), record.payload.as_bytes().to_vec()));
-                        }
-                    }
-                    match self.republish_message(&record).await {
-                        Ok(()) => {
-                            if let Some(ref state) = tui_state {
-                                state.increment_replayed();
-                                state.increment_published();
-                            }
-                        }
-                        Err(e) => {
-                            error!("Playback publish error: {}", e);
-                            if crate::util::is_fatal_error(&e, true) {
-                                return Err(e);
-                            }
+    ) -> Option<(MessageRecordBytes, tokio::time::Instant)> {
+        let reader = playback_reader.as_mut()?;
+        match reader.read_next_bytes() {
+            Some(Ok(record)) => {
+                let speed = tui_state
+                    .as_ref()
+                    .map(|s| s.get_playback_speed())
+                    .unwrap_or(crate::util::DEFAULT_PLAYBACK_SPEED);
+                let mut due = tokio::time::Instant::now();
+                if speed != 0.0 {
+                    if let Some(prev) = previous_ts {
+                        let diff = record.timestamp - *prev;
+                        if diff.num_milliseconds() > 0 {
+                            let delay_ms = diff.num_milliseconds() as f64 / speed as f64;
+                            due += tokio::time::Duration::from_millis(delay_ms as u64);
                         }
                     }
                 }
-                Some(Err(e)) => {
-                    if let Some(ref state) = tui_state {
-                        state.push_audit(
-                            AuditArea::Playback,
-                            AuditSeverity::Warn,
-                            format!("Skipped bad CSV record: {}", e),
-                        );
-                    }
-                    // Skip bad record, continue playback
+                *previous_ts = Some(record.timestamp);
+                Some((record, due))
+            }
+            Some(Err(e)) => {
+                if let Some(ref state) = tui_state {
+                    state.push_audit(
+                        AuditArea::Playback,
+                        AuditSeverity::Warn,
+                        format!("Skipped bad CSV record: {}", e),
+                    );
                 }
-                None => {
-                    // End of file - loop or stop based on mode
-                    let looping = tui_state
-                        .as_ref()
-                        .map(|s| s.is_playback_looping())
-                        .unwrap_or(false);
-                    if looping {
-                        if let Err(e) = reader.reset() {
-                            if let Some(ref state) = tui_state {
-                                state.push_audit(
-                                    AuditArea::Playback,
-                                    AuditSeverity::Error,
-                                    format!("Failed to reset reader: {}", e),
-                                );
-                            }
-                            *playback_reader = None;
-                        }
-                        *previous_ts = None;
-                    } else {
-                        // One-time mode: mark finished
+                // Skip bad record, continue playback on the next loop pass
+                None
+            }
+            None => {
+                // End of file - loop or stop based on mode
+                let looping = tui_state
+                    .as_ref()
+                    .map(|s| s.is_playback_looping())
+                    .unwrap_or(false);
+                if looping {
+                    if let Err(e) = reader.reset() {
                         if let Some(ref state) = tui_state {
-                            state.playback_finished.store(true, Ordering::Relaxed);
-                            let session = state.get_playback_session_count();
-                            let total = state.get_replayed_count();
                             state.push_audit(
                                 AuditArea::Playback,
-                                AuditSeverity::Info,
-                                format!(
-                                    "Playback complete ({} this session, {} total)",
-                                    session, total
-                                ),
+                                AuditSeverity::Error,
+                                format!("Failed to reset reader: {}", e),
                             );
                         }
                         *playback_reader = None;
                     }
+                    *previous_ts = None;
+                } else {
+                    // One-time mode: mark finished
+                    if let Some(ref state) = tui_state {
+                        state.playback_finished.store(true, Ordering::Relaxed);
+                        let session = state.get_playback_session_count();
+                        let total = state.get_replayed_count();
+                        state.push_audit(
+                            AuditArea::Playback,
+                            AuditSeverity::Info,
+                            format!(
+                                "Playback complete ({} this session, {} total)",
+                                session, total
+                            ),
+                        );
+                    }
+                    *playback_reader = None;
+                }
+                None
+            }
+        }
+    }
+
+    /// Publish a staged playback record: enqueue for verify, republish to
+    /// the embedded broker, and update TUI counters.
+    async fn publish_playback_record(
+        &self,
+        record: &MessageRecordBytes,
+        tui_state: &Option<std::sync::Arc<TuiState>>,
+        verify_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<(), MqttRecorderError> {
+        if verify_ready.load(Ordering::Relaxed) {
+            if let Some(ref tx) = self.verify_tx {
+                let _ = tx.send((record.topic.clone(), record.payload.clone()));
+            }
+        }
+        match self.republish_message(record).await {
+            Ok(()) => {
+                if let Some(ref state) = tui_state {
+                    state.increment_replayed();
+                    state.increment_published();
+                }
+            }
+            Err(e) => {
+                error!("Playback publish error: {}", e);
+                if crate::util::is_fatal_error(&e, true) {
+                    return Err(e);
                 }
             }
         }
@@ -786,7 +814,7 @@ impl Mirror {
     /// Handles recording logic including file path changes and recording toggles.
     fn handle_recording(
         &mut self,
-        record: &MessageRecord,
+        record: &MessageRecordBytes,
         tui_state: &Option<std::sync::Arc<TuiState>>,
         flush_counter: &mut u64,
         was_recording: &mut bool,
@@ -823,7 +851,13 @@ impl Mirror {
 
         if should_record {
             if let Some(ref mut writer) = self.writer {
-                writer.write(record)?;
+                writer.write_bytes(
+                    record.timestamp,
+                    &record.topic,
+                    &record.payload,
+                    record.qos,
+                    record.retain,
+                )?;
                 *flush_counter += 1;
 
                 if let Some(ref state) = tui_state {
@@ -877,7 +911,7 @@ impl Mirror {
                 // subscriber can't receive it before it's in the pending queue
                 if verify_ready.load(Ordering::Relaxed) {
                     if let Some(ref tx) = self.verify_tx {
-                        let _ = tx.send((record.topic.clone(), record.payload.as_bytes().to_vec()));
+                        let _ = tx.send((record.topic.clone(), record.payload.clone()));
                     }
                 }
                 if let Err(e) = self.republish_message(&record).await {
@@ -907,7 +941,7 @@ impl Mirror {
             }
 
             // Poll broker metrics periodically
-            if *message_count % METRICS_POLL_INTERVAL == 0 {
+            if (*message_count).is_multiple_of(METRICS_POLL_INTERVAL) {
                 if let Some(metrics) = self.broker.poll_metrics() {
                     if let Some(ref state) = tui_state {
                         state.update_broker_metrics(&metrics);
@@ -924,7 +958,9 @@ impl Mirror {
     /// Processes an MQTT event and extracts a message record if applicable.
     ///
     /// This method handles incoming MQTT events and converts publish messages
-    /// into [`MessageRecord`] instances for republishing and optional CSV storage.
+    /// into [`MessageRecordBytes`] instances for republishing and optional CSV
+    /// storage. Payloads stay as raw bytes end-to-end so binary content
+    /// survives mirroring unchanged.
     ///
     /// # Arguments
     ///
@@ -932,9 +968,9 @@ impl Mirror {
     ///
     /// # Returns
     ///
-    /// Returns `Some(MessageRecord)` if the event contains a publish message,
-    /// or `None` for other event types.
-    fn process_event(&self, event: MqttIncoming) -> Option<MessageRecord> {
+    /// Returns `Some(MessageRecordBytes)` if the event contains a publish
+    /// message, or `None` for other event types.
+    fn process_event(&self, event: MqttIncoming) -> Option<MessageRecordBytes> {
         process_event_impl(event)
     }
 
@@ -955,14 +991,17 @@ impl Mirror {
     ///
     /// - **11.4**: Republish received messages to the embedded broker
     /// - **11.6**: Preserve message topic, payload, QoS, and retain flag
-    async fn republish_message(&self, record: &MessageRecord) -> Result<(), MqttRecorderError> {
+    async fn republish_message(
+        &self,
+        record: &MessageRecordBytes,
+    ) -> Result<(), MqttRecorderError> {
         // Convert QoS u8 to rumqttc QoS enum
         let qos = crate::util::u8_to_qos(record.qos);
 
         // Publish with preserved topic, payload, QoS, and retain flag
         // The message is queued internally; the local event loop select branch drains it.
         self.local_client
-            .publish(&record.topic, record.payload.as_bytes(), qos, record.retain)
+            .publish(&record.topic, &record.payload, qos, record.retain)
             .await?;
 
         Ok(())
@@ -1005,9 +1044,24 @@ mod tests {
         assert!(result.is_some());
         let record = result.unwrap();
         assert_eq!(record.topic, "test/topic");
-        assert_eq!(record.payload, "hello");
+        assert_eq!(record.payload, b"hello");
         assert_eq!(record.qos, 1);
         assert!(record.retain);
+    }
+
+    #[test]
+    fn test_process_event_preserves_non_utf8_payload() {
+        // 0xFF/0xFE are invalid UTF-8: a lossy string conversion would mangle
+        // them into U+FFFD. The bytes must survive untouched.
+        let payload = vec![0xFF, 0xFE, 0x00, 0x01, 0x80];
+        let event = MqttIncoming::Publish {
+            topic: "test/binary".to_string(),
+            payload: payload.clone(),
+            qos: RumqttcQoS::AtMostOnce,
+            retain: false,
+        };
+        let record = process_event_impl(event).unwrap();
+        assert_eq!(record.payload, payload);
     }
 
     #[test]
@@ -1032,7 +1086,7 @@ mod tests {
         assert!(result.is_some());
         let record = result.unwrap();
         assert_eq!(record.topic, "test/qos0");
-        assert_eq!(record.payload, "test");
+        assert_eq!(record.payload, b"test");
         assert_eq!(record.qos, 0);
         assert!(!record.retain);
     }
@@ -1076,7 +1130,7 @@ mod tests {
         let result = process_event_impl(event);
         assert!(result.is_some());
         let record = result.unwrap();
-        assert_eq!(record.payload, "");
+        assert!(record.payload.is_empty());
     }
 
     #[test]
@@ -1090,8 +1144,8 @@ mod tests {
         let result = process_event_impl(event);
         assert!(result.is_some());
         let record = result.unwrap();
-        // Should use lossy UTF-8 conversion
-        assert!(record.payload.contains('\u{FFFD}') || !record.payload.is_empty());
+        // Non-UTF-8 bytes must be preserved exactly (no lossy conversion)
+        assert_eq!(record.payload, vec![0xFF, 0xFE, 0x00, 0x01]);
     }
 
     #[test]
@@ -1105,7 +1159,7 @@ mod tests {
         let result = process_event_impl(event);
         assert!(result.is_some());
         let record = result.unwrap();
-        assert_eq!(record.payload, "Hello 世界! 🌍");
+        assert_eq!(record.payload, "Hello 世界! 🌍".as_bytes());
     }
 
     #[test]

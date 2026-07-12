@@ -87,10 +87,94 @@ pub struct TlsConfig {
     /// Used together with `client_cert` for mutual TLS authentication.
     pub client_key: Option<PathBuf>,
 
-    /// When true, skip certificate hostname verification.
-    /// This is useful for self-signed certificates but reduces security.
-    /// Use with caution in production environments.
+    /// When true, skip all server certificate verification (chain, hostname,
+    /// expiry). Useful for self-signed certificates in test environments;
+    /// the connection is still encrypted but the peer is unauthenticated,
+    /// so this must never be used where man-in-the-middle is a concern.
     pub insecure: bool,
+}
+
+/// Server certificate verifier that accepts any certificate.
+///
+/// Only reachable behind the explicit `--tls-insecure` opt-in: encryption
+/// stays on, but the server's identity is not verified at all.
+#[derive(Debug)]
+struct NoServerCertVerification {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for NoServerCertVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Build a rustls client config that skips server certificate verification.
+///
+/// Client certificate auth (PEM cert + key) is still honored when provided.
+fn build_insecure_rustls_config(
+    client_auth: Option<(Vec<u8>, Vec<u8>)>,
+) -> Result<rustls::ClientConfig, MqttRecorderError> {
+    // Match rumqttc's crypto provider (aws-lc-rs) so exactly one provider
+    // backs every ClientConfig in the process.
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| MqttRecorderError::Tls(format!("TLS setup failed: {}", e)))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoServerCertVerification { provider }));
+
+    let config = match client_auth {
+        Some((cert_pem, key_pem)) => {
+            let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+                .collect::<Result<_, _>>()
+                .map_err(|e| {
+                    MqttRecorderError::Tls(format!("Failed to parse client certificate: {}", e))
+                })?;
+            let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+                .map_err(|e| MqttRecorderError::Tls(format!("Failed to parse client key: {}", e)))?
+                .ok_or_else(|| {
+                    MqttRecorderError::Tls("No private key found in keyfile".to_string())
+                })?;
+            builder.with_client_auth_cert(certs, key).map_err(|e| {
+                MqttRecorderError::Tls(format!("Invalid client certificate/key: {}", e))
+            })?
+        }
+        None => builder.with_no_client_auth(),
+    };
+
+    Ok(config)
 }
 
 impl MqttClientConfig {
@@ -454,10 +538,16 @@ impl MqttClient {
             None
         };
 
-        // For insecure mode or when no CA is provided, use default TLS config
-        // (Requirement 2.8)
-        if tls_config.insecure || ca_bytes.is_empty() {
-            // Use default TLS configuration which doesn't verify certificates
+        if tls_config.insecure {
+            // Requirement 2.8: genuinely skip certificate verification.
+            // (Previously this fell through to the default config, which
+            // verifies against system roots — the flag was a no-op.)
+            let config = build_insecure_rustls_config(client_auth)?;
+            Ok(Transport::Tls(rumqttc::TlsConfiguration::Rustls(
+                std::sync::Arc::new(config),
+            )))
+        } else if ca_bytes.is_empty() {
+            // No CA provided: verify against the system root store.
             Ok(Transport::tls_with_default_config())
         } else {
             // Use TLS with CA certificate and optional client auth
@@ -770,15 +860,31 @@ impl AnyMqttClient {
     ///
     /// Returns a `JoinHandle` that should be aborted when done.
     pub fn spawn_poll_task(&self) -> tokio::task::JoinHandle<()> {
+        // This task is the sole driver of the connection for the replayer, so
+        // a persistent failure (broker down, auth revoked) must be visible in
+        // the logs. Warn on state changes rather than every 100ms retry.
         match self {
             Self::V4(c) => {
                 let el = c.eventloop();
                 tokio::spawn(async move {
+                    let mut failing = false;
                     loop {
                         let mut eventloop = el.lock().await;
                         match eventloop.poll().await {
-                            Ok(_) => {}
-                            Err(_) => {
+                            Ok(_) => {
+                                if failing {
+                                    tracing::info!("MQTT connection recovered");
+                                    failing = false;
+                                }
+                            }
+                            Err(e) => {
+                                if !failing {
+                                    tracing::warn!(
+                                        "MQTT connection error (retrying every 100ms): {}",
+                                        e
+                                    );
+                                    failing = true;
+                                }
                                 drop(eventloop);
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
@@ -789,11 +895,24 @@ impl AnyMqttClient {
             Self::V5(c) => {
                 let el = c.eventloop();
                 tokio::spawn(async move {
+                    let mut failing = false;
                     loop {
                         let mut eventloop = el.lock().await;
                         match eventloop.poll().await {
-                            Ok(_) => {}
-                            Err(_) => {
+                            Ok(_) => {
+                                if failing {
+                                    tracing::info!("MQTT connection recovered");
+                                    failing = false;
+                                }
+                            }
+                            Err(e) => {
+                                if !failing {
+                                    tracing::warn!(
+                                        "MQTT connection error (retrying every 100ms): {}",
+                                        e
+                                    );
+                                    failing = true;
+                                }
                                 drop(eventloop);
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
@@ -1085,5 +1204,23 @@ mod tests {
         // Verify client creates successfully with 256 channel capacity
         let client = MqttClient::new(config).await;
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_build_insecure_rustls_config_no_client_auth() {
+        // The dangerous no-verify config must build cleanly (this is the
+        // path --tls-insecure takes); failure here would mean the flag
+        // regressed to unusable at runtime.
+        let config = build_insecure_rustls_config(None).expect("insecure config should build");
+        // TLS 1.2 and 1.3 both enabled via safe default protocol versions
+        assert!(!config.crypto_provider().cipher_suites.is_empty());
+    }
+
+    #[test]
+    fn test_build_insecure_rustls_config_rejects_garbage_client_auth() {
+        let err =
+            build_insecure_rustls_config(Some((b"not a cert".to_vec(), b"not a key".to_vec())))
+                .unwrap_err();
+        assert!(err.to_string().contains("key"), "got: {}", err);
     }
 }

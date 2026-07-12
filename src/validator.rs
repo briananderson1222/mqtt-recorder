@@ -692,17 +692,30 @@ impl CsvValidator {
         let mut stats = ValidationStats::new();
 
         // Open the CSV file with headers enabled and flexible mode to allow
-        // records with different field counts (we validate field count ourselves)
+        // records with different field counts (we validate field count ourselves).
+        // The budget wrapper bounds memory for a single crafted oversized record;
+        // the exact per-field limit is still checked in validate_record.
+        let per_record = crate::csv_handler::per_record_budget(self.field_size_limit);
+        let budget = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(per_record));
+        let file = std::fs::File::open(path)?;
         let mut reader = ReaderBuilder::new()
             .has_headers(true)
             .flexible(true)
-            .from_path(path)?;
+            .from_reader(crate::csv_handler::BudgetedReader::new(
+                file,
+                budget.clone(),
+            ));
 
         // Line 1 is the header row, data records start at line 2
         let mut line_number: u64 = 1;
 
         // Process each record, continuing even after errors (Requirement 4.11)
-        for result in reader.records() {
+        loop {
+            budget.store(per_record, std::sync::atomic::Ordering::Relaxed);
+            let result = match reader.records().next() {
+                Some(r) => r,
+                None => break,
+            };
             line_number += 1;
 
             match result {
@@ -728,12 +741,15 @@ impl CsvValidator {
                 }
                 Err(e) => {
                     // CSV parsing error - record as parse error and continue
-                    stats.record_invalid(
-                        line_number,
-                        ValidationResult::ParseError {
-                            error: e.to_string(),
-                        },
-                    );
+                    let error = e.to_string();
+                    let budget_exhausted =
+                        error.contains(crate::csv_handler::FIELD_SIZE_BUDGET_ERROR);
+                    stats.record_invalid(line_number, ValidationResult::ParseError { error });
+                    if budget_exhausted {
+                        // The reader is stuck mid-record and cannot resync;
+                        // report what we have instead of looping on a dead reader.
+                        break;
+                    }
                 }
             }
         }

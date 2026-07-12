@@ -749,3 +749,43 @@ proptest! {
         prop_assert_eq!(first_read.retain, second_read.retain, "Retain should match after reset");
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(100))]
+
+    /// Property: arbitrary byte payloads survive a write_bytes -> read_next_bytes
+    /// round trip exactly, in both encoding modes.
+    ///
+    /// This guards the lossless path used by record, replay, and mirror modes.
+    /// Regression test for the lossy String conversion that corrupted non-UTF-8
+    /// payloads during mirror/replay.
+    #[test]
+    fn property_binary_payload_bytes_roundtrip(
+        payload in proptest::collection::vec(any::<u8>(), 0..2048),
+        encode_b64 in any::<bool>(),
+        qos in 0u8..=2,
+        retain in any::<bool>(),
+    ) {
+        let temp_dir = tempdir().expect("Failed to create temp dir");
+        let file_path = temp_dir.path().join("bytes_roundtrip.csv");
+        let timestamp = Utc.with_ymd_and_hms(2024, 1, 15, 10, 30, 0).unwrap();
+
+        let mut writer = CsvWriter::new(&file_path, encode_b64).expect("Failed to create writer");
+        writer
+            .write_bytes(timestamp, "test/binary", &payload, qos, retain)
+            .expect("Failed to write bytes");
+        writer.flush().expect("Failed to flush");
+
+        let mut reader =
+            CsvReader::new(&file_path, encode_b64, None).expect("Failed to create reader");
+        let record = reader
+            .read_next_bytes()
+            .expect("Expected a record")
+            .expect("Failed to read record");
+
+        prop_assert_eq!(&record.payload, &payload, "Payload bytes must round-trip exactly");
+        prop_assert_eq!(record.qos, qos);
+        prop_assert_eq!(record.retain, retain);
+        prop_assert_eq!(&record.topic, "test/binary");
+    }
+}
