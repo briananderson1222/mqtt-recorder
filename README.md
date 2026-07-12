@@ -1,213 +1,95 @@
 # mqtt-recorder
 
-A command-line tool for recording and replaying MQTT messages, written in Rust.
+Record MQTT traffic to CSV files and replay it later — with an embedded broker,
+live mirroring, and an interactive terminal dashboard.
 
 [![CI](https://github.com/briananderson1222/mqtt-recorder/actions/workflows/ci.yml/badge.svg)](https://github.com/briananderson1222/mqtt-recorder/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-## Features
+`mqtt-recorder` has four modes:
 
-- **Record Mode**: Subscribe to MQTT topics and save messages to a CSV file
-- **Replay Mode**: Read messages from a CSV file and publish them to a broker with timing preservation
-- **Mirror Mode**: Subscribe to an external broker and republish messages to an embedded broker in real-time
-- **Standalone Broker**: Run an embedded MQTT broker without any recording or replaying
-- **Interactive TUI**: Real-time terminal dashboard with controls for recording, mirroring, playback, and audit log viewing
-- **Verify Mode**: Independent message verification for mirror mode — compares source messages against embedded broker output
-- **Audit Logging**: Structured audit log with area/severity, viewable in TUI and optionally written to file
-- **Playlist Support**: Load multiple CSV files for playback selection in replay mode
-- **Health Check Monitoring**: Periodic broker health checks reporting connections, subscriptions, and publish metrics
-- **MQTT v3.1.1 and v5**: Configurable protocol version for external broker connections (v5 default); embedded broker runs v5
-- **TLS/SSL Support**: Connect to secured brokers with certificate authentication
-- **Base64 Encoding**: Optionally encode binary payloads as base64 for safe CSV storage
-- **Automatic Binary Detection**: Automatically detects and encodes binary payloads with a `b64:` prefix
-- **CSV Validation**: Validate CSV files for format correctness and data integrity
-- **CSV Repair**: Repair corrupted CSV files by re-encoding binary payloads
-- **Flexible Topic Filtering**: Subscribe to specific topics, use wildcards, or load topics from a JSON file
+- **Record** — subscribe to topics on a broker and save every message to a CSV file
+- **Replay** — publish a recorded CSV back to a broker, preserving the original timing
+- **Mirror** — relay messages from an external broker onto a local embedded broker in real time
+- **Serve** — run a standalone embedded MQTT broker (v5), no recording required
+
+Binary payloads survive round-trips byte-for-byte (automatic base64 encoding),
+timing is preserved and speed-adjustable on replay, and long-running modes get
+a live TUI with toggles for everything.
+
+## Contents
+
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [The Interactive TUI](#the-interactive-tui)
+- [Common Recipes](#common-recipes)
+- [Security Notes](#security-notes)
+- [Reference](#reference) — [CLI options](#cli-options) · [CSV format](#csv-file-format) · [Exit codes](#exit-codes) · [Signals](#signal-handling)
+- [Development](#development)
 
 ## Installation
 
-### From Source
+### Pre-built binaries (recommended)
 
-Ensure you have Rust installed (1.88 or later required), then:
+Download from the [Releases](https://github.com/briananderson1222/mqtt-recorder/releases) page:
+Linux (x86_64, aarch64), macOS (x86_64, aarch64), and Windows (x86_64), with
+SHA-256 checksums.
+
+### From source
+
+Requires Rust 1.88 or later:
 
 ```bash
 git clone https://github.com/briananderson1222/mqtt-recorder.git
 cd mqtt-recorder
 cargo build --release
+# binary at target/release/mqtt-recorder
 ```
-
-The binary will be available at `target/release/mqtt-recorder`.
-
-### From Releases
-
-Download pre-built binaries from the [Releases](https://github.com/briananderson1222/mqtt-recorder/releases) page for:
-- Linux (x86_64)
-- macOS (x86_64, aarch64)
-- Windows (x86_64)
 
 ## Quick Start
 
-### Record Messages
-
-Record all messages from a broker to a CSV file:
+Record everything a broker publishes:
 
 ```bash
 mqtt-recorder --mode record --host localhost --file messages.csv
 ```
 
-Record messages from specific topics:
+Record only specific topics:
 
 ```bash
 mqtt-recorder --mode record --host localhost --file messages.csv -t "sensors/temperature"
 ```
 
-### Replay Messages
-
-Replay recorded messages to a broker:
+Replay a recording (original timing preserved; add `--loop` to repeat, `--speed 2.0` for 2x):
 
 ```bash
 mqtt-recorder --mode replay --host localhost --file messages.csv
 ```
 
-Replay messages in a continuous loop:
-
-```bash
-mqtt-recorder --mode replay --host localhost --file messages.csv --loop
-```
-
-### Mirror Mode
-
-Mirror messages from an external broker to a local embedded broker:
+Mirror an external broker onto a local embedded one:
 
 ```bash
 mqtt-recorder --mode mirror --host external-broker.example.com --serve --serve-port 1884
 ```
 
-Mirror and record simultaneously:
-
-```bash
-mqtt-recorder --mode mirror --host external-broker.example.com --serve --file backup.csv
-```
-
-### Standalone Broker
-
-Run an embedded MQTT broker:
+Run a standalone local broker:
 
 ```bash
 mqtt-recorder --serve --serve-port 1883
 ```
 
-### Validate CSV File
-
-Check a CSV file for format errors:
+Check or repair a CSV recording:
 
 ```bash
 mqtt-recorder --validate --file messages.csv
-```
-
-Validate with base64 decoding enabled:
-
-```bash
-mqtt-recorder --validate --file messages.csv --encode-b64
-```
-
-### Repair CSV File
-
-Repair a corrupted CSV file by re-encoding binary payloads:
-
-```bash
 mqtt-recorder --fix --file corrupted.csv --output repaired.csv
 ```
 
-## Usage Examples
+## The Interactive TUI
 
-### Recording with Authentication
-
-```bash
-mqtt-recorder --mode record \
-  --host broker.example.com \
-  --username myuser \
-  --password mypassword \
-  --file messages.csv
-```
-
-### Recording with TLS
-
-```bash
-mqtt-recorder --mode record \
-  --host secure-broker.example.com \
-  --port 8883 \
-  --enable-ssl \
-  --ca-cert /path/to/ca.crt \
-  --file messages.csv
-```
-
-### Recording with Client Certificates
-
-```bash
-mqtt-recorder --mode record \
-  --host secure-broker.example.com \
-  --port 8883 \
-  --enable-ssl \
-  --ca-cert /path/to/ca.crt \
-  --certfile /path/to/client.crt \
-  --keyfile /path/to/client.key \
-  --file messages.csv
-```
-
-### Recording with Base64 Encoding
-
-For binary payloads, use base64 encoding to encode all payloads:
-
-```bash
-mqtt-recorder --mode record \
-  --host localhost \
-  --file messages.csv \
-  --encode-b64
-```
-
-Without `--encode-b64`, binary payloads are automatically detected and encoded with a `b64:` prefix, while text payloads are stored as-is. This provides the best of both worlds: human-readable text and safe binary storage.
-
-### Subscribing to Multiple Topics
-
-Using a JSON file:
-
-```bash
-# Create topics.json
-echo '{"topics": ["sensors/+/temperature", "actuators/#", "home/livingroom/light"]}' > topics.json
-
-# Record from those topics
-mqtt-recorder --mode record --host localhost --file messages.csv --topics topics.json
-```
-
-### Replay to Embedded Broker
-
-Replay messages to an embedded broker (no external broker needed):
-
-```bash
-mqtt-recorder --mode replay --serve --serve-port 1884 --file messages.csv
-```
-
-### Replay to Both External and Embedded Broker
-
-```bash
-mqtt-recorder --mode replay \
-  --host external-broker.example.com \
-  --serve \
-  --serve-port 1884 \
-  --file messages.csv
-```
-
-### Interactive TUI Mode
-
-The TUI is enabled by default when running interactively. Disable it for scripting:
-
-```bash
-# Run mirror mode without TUI
-mqtt-recorder --mode mirror --host broker.example.com --serve --no-interactive
-```
-
-#### TUI Key Bindings
+Any mode that runs the embedded broker (`--serve`) gets a live dashboard by
+default when run in a terminal: source/mirror/broker panels with message
+rates, recording and playback controls, and a scrollable audit log.
 
 | Key | Action |
 |-----|--------|
@@ -224,44 +106,141 @@ mqtt-recorder --mode mirror --host broker.example.com --serve --no-interactive
 | `A` | Set an audit log file path |
 | `j` / `k` | Scroll the audit log down / up |
 
-### Verify Mirrored Messages
-
-Compare source messages against what the embedded broker actually delivers:
+Disable the TUI for scripting or CI:
 
 ```bash
-mqtt-recorder --mode mirror \
-  --host broker.example.com \
-  --serve \
-  --serve-port 1884 \
-  --verify
+mqtt-recorder --mode mirror --host broker.example.com --serve --no-interactive
 ```
 
-### Audit Logging to File
+## Common Recipes
 
-Write structured audit events to a file:
+### Authentication
 
 ```bash
-mqtt-recorder --mode mirror \
-  --host broker.example.com \
-  --serve \
-  --audit-log /tmp/audit.log
+# Environment variables (preferred: flags are visible in `ps` and shell history)
+MQTT_PASSWORD=mypassword mqtt-recorder --mode record \
+  --host broker.example.com --username myuser --file messages.csv
+
+# Or flags
+mqtt-recorder --mode record --host broker.example.com \
+  --username myuser --password mypassword --file messages.csv
 ```
 
-### Playlist Replay
+`MQTT_USERNAME` works the same way for the username.
 
-Load multiple CSV files for playback selection:
+### TLS
 
 ```bash
-mqtt-recorder --mode replay \
-  --serve \
-  --file main.csv \
-  --playlist extra1.csv \
-  --playlist extra2.csv
+# Verify against a CA certificate
+mqtt-recorder --mode record --host secure-broker.example.com --port 8883 \
+  --enable-ssl --ca-cert /path/to/ca.crt --file messages.csv
+
+# Mutual TLS with client certificates
+mqtt-recorder --mode record --host secure-broker.example.com --port 8883 \
+  --enable-ssl --ca-cert /path/to/ca.crt \
+  --certfile /path/to/client.crt --keyfile /path/to/client.key \
+  --file messages.csv
+
+# Self-signed certs in test environments: skip server verification entirely.
+# The connection stays encrypted but the peer is NOT authenticated.
+mqtt-recorder --mode record --host test-broker.local --port 8883 \
+  --enable-ssl --tls-insecure --file messages.csv
 ```
 
-## CLI Reference
+With `--enable-ssl` and no `--ca-cert`, the server is verified against the
+system root store.
 
-### Global Options
+### Topic filtering
+
+```bash
+# Single topic (repeatable via a JSON file below); default is everything (#)
+mqtt-recorder --mode record --host localhost --file messages.csv -t "sensors/+/temperature"
+
+# Multiple topics from a JSON file
+echo '{"topics": ["sensors/+/temperature", "actuators/#", "home/livingroom/light"]}' > topics.json
+mqtt-recorder --mode record --host localhost --file messages.csv --topics topics.json
+```
+
+MQTT wildcards are supported: `+` matches one level, `#` matches all remaining
+levels.
+
+### Binary payloads
+
+Nothing to configure: non-UTF-8 payloads are automatically base64 encoded with
+a `b64:` prefix in the CSV and decoded on replay, byte-for-byte. To base64
+encode *all* payloads instead (no prefix), pass `--encode-b64` when recording
+and replaying. Details in [CSV file format](#csv-file-format).
+
+### Replay targets, speed, and playlists
+
+```bash
+# Replay into an embedded broker (no external broker needed)
+mqtt-recorder --mode replay --serve --serve-port 1884 --file messages.csv
+
+# Replay to an external broker AND an embedded one simultaneously
+mqtt-recorder --mode replay --host external-broker.example.com \
+  --serve --serve-port 1884 --file messages.csv
+
+# Continuous loop at 4x speed (0 = as fast as possible)
+mqtt-recorder --mode replay --host localhost --file messages.csv --loop --speed 4.0
+
+# Load extra files for playback selection in the TUI (repeatable)
+mqtt-recorder --mode replay --serve --file main.csv \
+  --playlist extra1.csv --playlist extra2.csv
+```
+
+### Mirroring and verification
+
+```bash
+# Mirror and record at the same time
+mqtt-recorder --mode mirror --host external-broker.example.com --serve --file backup.csv
+
+# Independently verify that the embedded broker delivers exactly what the
+# source sent (reports matched / unexpected / missing)
+mqtt-recorder --mode mirror --host broker.example.com --serve --serve-port 1884 --verify
+```
+
+### Audit logging
+
+Structured audit events (connections, toggles, health checks) are shown in the
+TUI by default (`--no-audit` disables). Write them to a file too:
+
+```bash
+mqtt-recorder --mode mirror --host broker.example.com --serve --audit-log /tmp/audit.log
+```
+
+### Shell completions
+
+```bash
+# zsh
+mqtt-recorder --completions zsh > ~/.zfunc/_mqtt-recorder
+# bash
+mqtt-recorder --completions bash > /usr/local/etc/bash_completion.d/mqtt-recorder
+```
+
+Also available: `fish`, `elvish`, `powershell`.
+
+## Security Notes
+
+- **The embedded broker has no authentication and no TLS.** It binds to
+  loopback (`127.0.0.1`) by default so only local processes can reach it.
+  Pass `--bind-addr 0.0.0.0` (or a specific interface) only on networks where
+  every reachable host is trusted — anyone who can reach the port can read
+  all mirrored/replayed traffic and publish arbitrary messages.
+- **Recordings and audit logs may contain sensitive payloads.** They are
+  created with mode `0600` on Unix.
+- **`--tls-insecure` disables server identity verification.** Encrypted but
+  unauthenticated — never use it where man-in-the-middle is a concern.
+- Prefer `MQTT_PASSWORD`/`MQTT_USERNAME` over the credential flags.
+
+See [SECURITY.md](SECURITY.md) for the full policy and private vulnerability
+reporting.
+
+## Reference
+
+### CLI options
+
+#### Connection
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -270,8 +249,11 @@ mqtt-recorder --mode replay \
 | `--client-id` | MQTT client identifier | Auto-generated |
 | `--mode` | Operation mode: `record`, `replay`, or `mirror` | Required (unless `--serve` alone) |
 | `--file` | CSV file path for recording/replaying | Required for record/replay |
+| `--mqtt-version` | MQTT protocol version for external brokers (`3.1.1` or `5`) | `5` |
+| `--max-packet-size` | Maximum MQTT packet size in bytes | `1048576` (1MB) |
+| `--health-check` | Health check interval in seconds (0 to disable) | `60` |
 
-### Topic Options
+#### Topics
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -279,7 +261,19 @@ mqtt-recorder --mode replay \
 | `--topics` | JSON file containing topics to subscribe | None |
 | `--qos` | QoS level for subscriptions (0, 1, or 2) | `0` |
 
-### Replay Options
+#### Authentication and TLS
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--username` | MQTT broker username (or `MQTT_USERNAME` env var) | None |
+| `--password` | MQTT broker password (or `MQTT_PASSWORD` env var) | None |
+| `--enable-ssl` | Enable TLS/SSL connection | `false` |
+| `--tls-insecure` | Skip all server certificate verification (self-signed certs; connection stays encrypted but the peer is unauthenticated) | `false` |
+| `--ca-cert` | Path to CA certificate file | None |
+| `--certfile` | Path to client certificate file | None |
+| `--keyfile` | Path to client private key file | None |
+
+#### Replay
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -287,7 +281,7 @@ mqtt-recorder --mode replay \
 | `--speed` | Playback speed multiplier (`0` = max speed, `1.0` = real-time, `2.0` = 2x faster) | `1.0` |
 | `--playlist` | Additional CSV files for playback selection (repeatable) | None |
 
-### Mirror Options
+#### Mirror
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -295,82 +289,7 @@ mqtt-recorder --mode replay \
 | `--no-mirror` | Start with mirroring disabled | `false` |
 | `--verify` | Verify mirrored messages against embedded broker output | `false` |
 
-### TUI Options
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--no-interactive` | Disable interactive TUI mode | `false` |
-| `--record` | Start with recording enabled | `true` if `--file` provided |
-
-### Audit Options
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--audit` | Enable audit logging in TUI | `true` |
-| `--no-audit` | Disable audit logging in the TUI | `false` |
-| `--audit-log` | Path to write audit log file (auto-enables file writing) | None |
-
-### TLS/SSL Options
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--enable-ssl` | Enable TLS/SSL connection | `false` |
-| `--tls-insecure` | Skip all server certificate verification (self-signed certs; connection stays encrypted but the peer is unauthenticated) | `false` |
-| `--ca-cert` | Path to CA certificate file | None |
-| `--certfile` | Path to client certificate file | None |
-| `--keyfile` | Path to client private key file | None |
-
-### Authentication Options
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--username` | MQTT broker username (or `MQTT_USERNAME` env var) | None |
-| `--password` | MQTT broker password (or `MQTT_PASSWORD` env var) | None |
-
-Prefer the environment variables for the password: a `--password` flag is
-visible to other local users via `ps` and lands in shell history.
-
-```bash
-MQTT_PASSWORD=mypassword mqtt-recorder --mode record \
-  --host broker.example.com --username myuser --file messages.csv
-```
-
-### Encoding Options
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--encode-b64` | Encode all payloads as base64 | `false` |
-| `--csv-field-size-limit` | Maximum CSV field size in bytes | None |
-
-### Validation and Repair Options
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--validate` | Validate CSV file format and integrity | `false` |
-| `--fix` | Repair corrupted CSV file | `false` |
-| `--output` | Output path for repaired CSV file | Required with `--fix` |
-
-### Shell Completions
-
-Generate completions for your shell (bash, zsh, fish, elvish, powershell):
-
-```bash
-# zsh example
-mqtt-recorder --completions zsh > ~/.zfunc/_mqtt-recorder
-
-# bash example
-mqtt-recorder --completions bash > /usr/local/etc/bash_completion.d/mqtt-recorder
-```
-
-### Advanced Options
-
-| Argument | Description | Default |
-|----------|-------------|---------|
-| `--max-packet-size` | Maximum MQTT packet size in bytes | `1048576` (1MB) |
-| `--mqtt-version` | MQTT protocol version for external brokers (`3.1.1` or `5`) | `5` |
-| `--health-check` | Health check interval in seconds (0 to disable) | `60` |
-
-### Embedded Broker Options
+#### Embedded broker
 
 | Argument | Description | Default |
 |----------|-------------|---------|
@@ -378,15 +297,36 @@ mqtt-recorder --completions bash > /usr/local/etc/bash_completion.d/mqtt-recorde
 | `--serve-port` | Embedded broker port | `1883` |
 | `--bind-addr` | Bind address for the embedded broker | `127.0.0.1` |
 
-> **Security note:** the embedded broker has no authentication and no TLS.
-> It binds to loopback by default so only local processes can reach it. Pass
-> `--bind-addr 0.0.0.0` (or a specific interface address) only on networks
-> where every reachable host is trusted — anyone who can reach the port can
-> read all mirrored/replayed traffic and publish arbitrary messages.
+#### TUI and audit
 
-## CSV File Format
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--no-interactive` | Disable interactive TUI mode | `false` |
+| `--record` | Start with recording enabled | `true` if `--file` provided |
+| `--audit` | Enable audit logging in TUI | `true` |
+| `--no-audit` | Disable audit logging in the TUI | `false` |
+| `--audit-log` | Path to write audit log file (auto-enables file writing) | None |
 
-Messages are stored in RFC 4180 compliant CSV format with the following columns:
+#### Encoding, validation, and repair
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--encode-b64` | Encode all payloads as base64 | `false` |
+| `--csv-field-size-limit` | Maximum CSV field size in bytes | None |
+| `--validate` | Validate CSV file format and integrity | `false` |
+| `--fix` | Repair corrupted CSV file | `false` |
+| `--output` | Output path for repaired CSV file | Required with `--fix` |
+
+#### Misc
+
+| Argument | Description |
+|----------|-------------|
+| `--completions <SHELL>` | Print shell completions and exit |
+| `--version` | Print version (includes git commit hash) |
+
+### CSV file format
+
+Messages are stored in RFC 4180 compliant CSV with the column order:
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -396,20 +336,14 @@ Messages are stored in RFC 4180 compliant CSV format with the following columns:
 | `qos` | Integer | Quality of Service level (0, 1, or 2) |
 | `retain` | Boolean | Retain flag (`true` or `false`) |
 
-### Payload Encoding
+**Payload encoding.** By default (no `--encode-b64`):
 
-When `--encode-b64` is **not** set (default):
-- **Text payloads** (valid UTF-8 without control characters) are stored as-is
-- **Binary payloads** (non-UTF-8 or containing control characters) are automatically base64 encoded and prefixed with `b64:`
+- Text payloads (valid UTF-8 without control characters) are stored as-is
+- Binary payloads are automatically base64 encoded and prefixed with `b64:`
 
-When `--encode-b64` is set:
-- **All payloads** are base64 encoded without any prefix
-
-The `b64:` prefix marker allows the reader to distinguish between:
-- Intentionally stored text that happens to look like base64
-- Automatically encoded binary data
-
-Example:
+With `--encode-b64`, *all* payloads are base64 encoded without a prefix. The
+`b64:` marker lets the reader distinguish intentionally-stored text that
+happens to look like base64 from automatically encoded binary data.
 
 ```csv
 timestamp,topic,payload,qos,retain
@@ -418,9 +352,7 @@ timestamp,topic,payload,qos,retain
 2024-01-15T10:30:02.789Z,binary/data,b64:CAoSGA==,0,false
 ```
 
-## Topics JSON Format
-
-When using `--topics`, provide a JSON file with the following structure:
+### Topics JSON format
 
 ```json
 {
@@ -432,11 +364,7 @@ When using `--topics`, provide a JSON file with the following structure:
 }
 ```
 
-MQTT wildcards are supported:
-- `+` matches a single level (e.g., `sensors/+/temperature` matches `sensors/kitchen/temperature`)
-- `#` matches multiple levels (e.g., `actuators/#` matches `actuators/fan/speed`)
-
-## Exit Codes
+### Exit codes
 
 | Code | Meaning |
 |------|---------|
@@ -446,86 +374,42 @@ MQTT wildcards are supported:
 | 3 | File I/O error or validation/repair failure |
 | 4 | Runtime error (unrecoverable) |
 
-## Signal Handling
+### Signal handling
 
-The tool handles the following signals gracefully:
-- **SIGINT** (Ctrl+C): Initiates graceful shutdown
-- **SIGTERM**: Initiates graceful shutdown
+**SIGINT** (Ctrl+C) and **SIGTERM** both trigger graceful shutdown: recording
+flushes and closes the CSV file, brokers disconnect cleanly, and the embedded
+broker is released.
 
-During shutdown:
-- Recording mode: Flushes and closes the CSV file
-- All modes: Disconnects cleanly from the broker
-- Embedded broker: Shuts down gracefully
+## Development
 
-## Building from Source
-
-### Prerequisites
-
-- Rust 1.88 or later
-- Cargo
-
-### Build Commands
-
-```bash
-# Debug build
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run with clippy lints
-cargo clippy
-
-# Format code
-cargo fmt
-```
-
-### Using Make
-
-A Makefile is provided for common tasks:
+Requires Rust 1.88 or later. The Makefile targets are what CI runs:
 
 ```bash
 make build          # Debug build
 make release        # Release build
 make test           # Run all tests
-make test-unit      # Run unit tests only
-make test-property  # Run property-based tests
-make clippy         # Run clippy lints
+make test-unit      # Unit tests only
+make test-property  # Property-based tests
+make clippy         # Lints (CI fails on warnings)
 make fmt            # Format code
-make coverage       # Show coverage summary
-make coverage-html  # Generate HTML coverage report
+make coverage       # Coverage summary (requires cargo-llvm-cov)
+make coverage-html  # HTML coverage report
 ```
 
-### Code Coverage
+For coverage, install [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov)
+(`cargo install cargo-llvm-cov`). On macOS with Homebrew Rust you may need
+`brew install llvm`.
 
-To generate coverage reports, install `cargo-llvm-cov`:
-
-```bash
-cargo install cargo-llvm-cov
-```
-
-Then run:
-
-```bash
-# Summary only
-make coverage
-
-# HTML report (opens target/llvm-cov/html/index.html)
-make coverage-html
-```
-
-Note: On macOS with Homebrew Rust, you may need LLVM tools:
-```bash
-brew install llvm
-```
-
-## License
-
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+Project layout, conventions, and the release process are documented in
+[CONTRIBUTING.md](CONTRIBUTING.md); the changelog is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for
+guidelines.
+
+## License
+
+This project is licensed under the Apache License 2.0 — see the
+[LICENSE](LICENSE) file for details.
