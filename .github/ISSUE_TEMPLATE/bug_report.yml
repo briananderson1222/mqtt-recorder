@@ -1,0 +1,43 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `mqtt-recorder --version`
+      placeholder: "0.2.1 (abc1234)"
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and configuration
+      description: The exact command you ran (redact credentials/hosts as needed)
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include output/logs. Run with `RUST_LOG=mqtt_recorder=debug` for verbose logs.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS / platform
+      placeholder: "macOS 15 arm64 / Ubuntu 24.04 x86_64"
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Broker type/version, sample CSV (redacted), etc.
