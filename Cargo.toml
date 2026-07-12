@@ -2,7 +2,7 @@
 name = "mqtt-recorder"
 version = "0.2.1"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.88"
 resolver = "2"
 description = "Record and replay MQTT messages"
 license = "Apache-2.0"
@@ -21,8 +21,8 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 
 # MQTT client and broker
-rumqttc = "0.24"
-rumqttd = "0.19"
+rumqttc = "0.25"
+rumqttd = "0.20"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -41,15 +41,15 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 
 # Error handling
-thiserror = "1"
+thiserror = "2"
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # TUI
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 
 [dev-dependencies]
 # Property-based testing
