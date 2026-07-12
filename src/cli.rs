@@ -103,12 +103,13 @@ pub struct Args {
     #[arg(long)]
     pub keyfile: Option<PathBuf>,
 
-    /// MQTT username
-    #[arg(long)]
+    /// MQTT username (or set MQTT_USERNAME)
+    #[arg(long, env = "MQTT_USERNAME")]
     pub username: Option<String>,
 
-    /// MQTT password
-    #[arg(long)]
+    /// MQTT password (or set MQTT_PASSWORD; preferred over the flag, which
+    /// is visible in `ps` output and shell history)
+    #[arg(long, env = "MQTT_PASSWORD", hide_env_values = true)]
     pub password: Option<String>,
 
     /// Encode payloads as base64
@@ -130,6 +131,11 @@ pub struct Args {
     /// Embedded broker port
     #[arg(long, default_value = "1883")]
     pub serve_port: u16,
+
+    /// Bind address for the embedded broker. Loopback by default; the broker
+    /// has no authentication, so only set e.g. 0.0.0.0 on a trusted network.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub bind_addr: std::net::IpAddr,
 
     /// Validate CSV file without replaying
     #[arg(long, default_value = "false")]
@@ -409,6 +415,7 @@ impl Default for Args {
             max_packet_size: 1048576,
             serve: false,
             serve_port: 1883,
+            bind_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             validate: false,
             fix: false,
             output: None,

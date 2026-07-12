@@ -18,11 +18,15 @@ path = "src/main.rs"
 
 [dependencies]
 # CLI argument parsing
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 
 # MQTT client and broker
 rumqttc = "0.25"
 rumqttd = "0.20"
+
+# TLS (for the --tls-insecure custom verifier; version matches rumqttc's rustls)
+rustls = "0.23"
+rustls-pemfile = "2"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

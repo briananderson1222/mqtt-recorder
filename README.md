@@ -296,7 +296,7 @@ mqtt-recorder --mode replay \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--enable-ssl` | Enable TLS/SSL connection | `false` |
-| `--tls-insecure` | Skip TLS certificate verification | `false` |
+| `--tls-insecure` | Skip all server certificate verification (self-signed certs; connection stays encrypted but the peer is unauthenticated) | `false` |
 | `--ca-cert` | Path to CA certificate file | None |
 | `--certfile` | Path to client certificate file | None |
 | `--keyfile` | Path to client private key file | None |
@@ -305,8 +305,16 @@ mqtt-recorder --mode replay \
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--username` | MQTT broker username | None |
-| `--password` | MQTT broker password | None |
+| `--username` | MQTT broker username (or `MQTT_USERNAME` env var) | None |
+| `--password` | MQTT broker password (or `MQTT_PASSWORD` env var) | None |
+
+Prefer the environment variables for the password: a `--password` flag is
+visible to other local users via `ps` and lands in shell history.
+
+```bash
+MQTT_PASSWORD=mypassword mqtt-recorder --mode record \
+  --host broker.example.com --username myuser --file messages.csv
+```
 
 ### Encoding Options
 
@@ -337,6 +345,13 @@ mqtt-recorder --mode replay \
 |----------|-------------|---------|
 | `--serve` | Start embedded MQTT broker (MQTT v5) | `false` |
 | `--serve-port` | Embedded broker port | `1883` |
+| `--bind-addr` | Bind address for the embedded broker | `127.0.0.1` |
+
+> **Security note:** the embedded broker has no authentication and no TLS.
+> It binds to loopback by default so only local processes can reach it. Pass
+> `--bind-addr 0.0.0.0` (or a specific interface address) only on networks
+> where every reachable host is trusted — anyone who can reach the port can
+> read all mirrored/replayed traffic and publish arbitrary messages.
 
 ## CSV File Format
 

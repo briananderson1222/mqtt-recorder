@@ -26,10 +26,10 @@ use rumqttd::{
 };
 use std::collections::HashMap;
 use std::fmt;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Maximum number of concurrent connections the embedded broker accepts.
 const MAX_BROKER_CONNECTIONS: usize = 1000;
@@ -139,6 +139,9 @@ pub struct EmbeddedBroker {
     /// The port the broker is listening on
     #[allow(dead_code)] // Public API
     port: u16,
+    /// Host that internal/local clients use to reach the broker
+    /// (loopback when bound to the unspecified address).
+    connect_host: String,
     /// Metrics link for polling connection counts
     meters_link: Option<rumqttd::meters::MetersLink>,
     /// Cached connection count
@@ -186,15 +189,37 @@ impl EmbeddedBroker {
     ///
     /// let broker = EmbeddedBroker::new(1883, BrokerMode::Standalone).await?;
     /// ```
+    #[allow(dead_code)] // Public API (binary always goes through new_with_bind)
     pub async fn new(port: u16, mode: BrokerMode) -> Result<Self, MqttRecorderError> {
+        Self::new_with_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), port, mode).await
+    }
+
+    /// Creates a new embedded broker bound to a specific address.
+    ///
+    /// The broker has no authentication, so binding beyond loopback exposes
+    /// it to every host that can reach that interface. `new()` defaults to
+    /// loopback; non-loopback binds are an explicit caller decision
+    /// (`--bind-addr` on the CLI).
+    pub async fn new_with_bind(
+        bind_addr: IpAddr,
+        port: u16,
+        mode: BrokerMode,
+    ) -> Result<Self, MqttRecorderError> {
         // Log the mode on startup (Requirement 10.10)
         info!(
-            "Starting embedded MQTT broker on port {} in {} mode",
-            port, mode
+            "Starting embedded MQTT broker on {}:{} in {} mode",
+            bind_addr, port, mode
         );
+        if !bind_addr.is_loopback() {
+            warn!(
+                "Embedded broker is listening on {} without authentication — \
+                 any host that can reach this interface can publish and subscribe",
+                bind_addr
+            );
+        }
 
         // Create the broker configuration
-        let config = Self::create_config(port)?;
+        let config = Self::create_config(bind_addr, port)?;
 
         // Create and start the broker
         let mut broker = Broker::new(config);
@@ -209,12 +234,21 @@ impl EmbeddedBroker {
             }
         });
 
-        Self::wait_for_broker_ready(port).await?;
+        // Local/internal clients cannot dial the unspecified address, so
+        // reach a 0.0.0.0/:: bind via loopback.
+        let connect_host = if bind_addr.is_unspecified() {
+            IpAddr::V4(Ipv4Addr::LOCALHOST).to_string()
+        } else {
+            bind_addr.to_string()
+        };
+
+        Self::wait_for_broker_ready(&connect_host, port).await?;
 
         Ok(Self {
             _handle: BrokerHandle { _thread: handle },
             mode,
             port,
+            connect_host,
             meters_link,
             connection_count: AtomicUsize::new(0),
             subscription_count: AtomicUsize::new(0),
@@ -226,8 +260,8 @@ impl EmbeddedBroker {
     }
 
     /// Wait for the broker to be ready by probing the TCP port.
-    async fn wait_for_broker_ready(port: u16) -> Result<(), MqttRecorderError> {
-        let addr = format!("127.0.0.1:{}", port);
+    async fn wait_for_broker_ready(host: &str, port: u16) -> Result<(), MqttRecorderError> {
+        let addr = format!("{}:{}", host, port);
         let deadline = std::time::Instant::now()
             + std::time::Duration::from_secs(crate::util::BROKER_READY_TIMEOUT_SECS);
         loop {
@@ -249,7 +283,7 @@ impl EmbeddedBroker {
     ///
     /// This creates a minimal configuration suitable for an embedded broker
     /// with reasonable defaults for local operation.
-    fn create_config(port: u16) -> Result<Config, MqttRecorderError> {
+    fn create_config(bind_addr: IpAddr, port: u16) -> Result<Config, MqttRecorderError> {
         // Create router configuration with reasonable defaults
         // Use Default and override specific fields
         let router = RouterConfig {
@@ -271,10 +305,10 @@ impl EmbeddedBroker {
             dynamic_filters: true, // Allow dynamic topic creation
         };
 
-        // Create server settings for MQTT v5
-        let listen_addr: SocketAddr = format!("0.0.0.0:{}", port)
-            .parse()
-            .map_err(|e| MqttRecorderError::Broker(format!("Invalid port {}: {}", port, e)))?;
+        // Create server settings for MQTT v5.
+        // Binds to loopback unless the caller explicitly opted into a wider
+        // bind (--bind-addr): the broker has no authentication.
+        let listen_addr = SocketAddr::new(bind_addr, port);
 
         let server_settings = ServerSettings {
             name: "mqtt-recorder-broker".to_string(),
@@ -340,12 +374,17 @@ impl EmbeddedBroker {
     pub async fn get_local_client(&self) -> Result<MqttClientV5, MqttRecorderError> {
         let id = self.client_counter.fetch_add(1, Ordering::Relaxed);
         let config = MqttClientConfig::new(
-            "127.0.0.1".to_string(),
+            self.connect_host.clone(),
             self.port,
             format!("mqtt-recorder-internal-{}-{}", std::process::id(), id),
         );
 
         MqttClientV5::new(config).await
+    }
+
+    /// Host that local clients should use to connect to this broker.
+    pub fn connect_host(&self) -> &str {
+        &self.connect_host
     }
 
     /// Shutdown the broker gracefully.
@@ -484,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_create_config_valid_port() {
-        let result = EmbeddedBroker::create_config(1883);
+        let result = EmbeddedBroker::create_config(IpAddr::V4(Ipv4Addr::LOCALHOST), 1883);
         assert!(result.is_ok());
 
         let config = result.unwrap();
@@ -500,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_create_config_custom_port() {
-        let result = EmbeddedBroker::create_config(9883);
+        let result = EmbeddedBroker::create_config(IpAddr::V4(Ipv4Addr::LOCALHOST), 9883);
         assert!(result.is_ok());
 
         let config = result.unwrap();
@@ -511,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_create_config_router_settings() {
-        let config = EmbeddedBroker::create_config(1883).unwrap();
+        let config = EmbeddedBroker::create_config(IpAddr::V4(Ipv4Addr::LOCALHOST), 1883).unwrap();
 
         assert_eq!(config.router.max_connections, 1000);
         assert_eq!(config.router.max_outgoing_packet_count, 10000);
@@ -521,7 +560,7 @@ mod tests {
 
     #[test]
     fn test_create_config_connection_settings() {
-        let config = EmbeddedBroker::create_config(1883).unwrap();
+        let config = EmbeddedBroker::create_config(IpAddr::V4(Ipv4Addr::LOCALHOST), 1883).unwrap();
         let v5 = config.v5.unwrap();
         let server = v5.get("1").unwrap();
 
@@ -533,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_create_config_max_payload_matches_client_default() {
-        let config = EmbeddedBroker::create_config(1883).unwrap();
+        let config = EmbeddedBroker::create_config(IpAddr::V4(Ipv4Addr::LOCALHOST), 1883).unwrap();
         let v5 = config.v5.unwrap();
         let server = v5.get("1").unwrap();
 

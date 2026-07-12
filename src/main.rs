@@ -355,7 +355,9 @@ async fn run_standalone_broker(
     info!("Starting standalone MQTT broker mode...");
 
     // Start the embedded broker
-    let broker = EmbeddedBroker::new(args.serve_port, BrokerMode::Standalone).await?;
+    let broker =
+        EmbeddedBroker::new_with_bind(args.bind_addr, args.serve_port, BrokerMode::Standalone)
+            .await?;
 
     info!(
         "Embedded broker running on port {}. Press Ctrl+C to stop.",
@@ -465,7 +467,10 @@ async fn run_replay_mode(
     // Optionally start embedded broker (Requirement 10.3)
     let broker = if args.serve {
         info!("Starting embedded broker on port {}...", args.serve_port);
-        Some(EmbeddedBroker::new(args.serve_port, BrokerMode::Replay).await?)
+        Some(
+            EmbeddedBroker::new_with_bind(args.bind_addr, args.serve_port, BrokerMode::Replay)
+                .await?,
+        )
     } else {
         None
     };
@@ -487,8 +492,12 @@ async fn run_replay_mode(
             })?
     } else if args.serve {
         // Connect to embedded broker via v5 (Requirement 1.22: host optional with --serve)
+        let connect_host = broker
+            .as_ref()
+            .map(|b| b.connect_host().to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
         let config = MqttClientConfig::new(
-            "127.0.0.1".to_string(),
+            connect_host,
             args.serve_port,
             crate::util::generate_client_id(&args.client_id),
         );
@@ -554,7 +563,8 @@ async fn run_mirror_mode(
     info!("Starting mirror mode...");
 
     // Start embedded broker (Requirement 11.2: mirror mode requires --serve)
-    let broker = EmbeddedBroker::new(args.serve_port, BrokerMode::Mirror).await?;
+    let broker =
+        EmbeddedBroker::new_with_bind(args.bind_addr, args.serve_port, BrokerMode::Mirror).await?;
 
     // Create source client configuration (connect to external broker)
     let source_config = create_mqtt_client_config(args)?;

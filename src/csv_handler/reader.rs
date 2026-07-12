@@ -8,10 +8,70 @@ use chrono::{DateTime, Utc};
 use csv::{Reader, ReaderBuilder};
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use super::encoding::AUTO_ENCODE_MARKER;
 use super::record::{MessageRecord, MessageRecordBytes};
 use crate::error::MqttRecorderError;
+
+/// Number of fields in a message record (timestamp, topic, payload, qos, retain).
+const RECORD_FIELD_COUNT: usize = 5;
+
+/// Slack added to the per-record byte budget to cover CSV quoting overhead
+/// and the csv crate's buffered read-ahead.
+const RECORD_BUDGET_SLACK: usize = 64 * 1024;
+
+/// Error message emitted when a record blows through the byte budget.
+/// Also matched by the validator to abort instead of looping on a dead reader.
+pub const FIELD_SIZE_BUDGET_ERROR: &str = "record exceeds the --csv-field-size-limit byte budget";
+
+/// I/O wrapper that refuses to read past a per-record byte budget.
+///
+/// The csv crate allocates an entire record into memory before any field
+/// length can be inspected, so an after-the-fact field check cannot bound
+/// memory: a crafted multi-gigabyte field is fully buffered first. This
+/// wrapper fails the read itself once the current record has consumed its
+/// budget. The owner replenishes the budget before each record.
+pub(crate) struct BudgetedReader<R> {
+    inner: R,
+    remaining: Arc<AtomicUsize>,
+}
+
+impl<R> BudgetedReader<R> {
+    pub(crate) fn new(inner: R, remaining: Arc<AtomicUsize>) -> Self {
+        Self { inner, remaining }
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for BudgetedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.remaining.load(Ordering::Relaxed);
+        if remaining == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                FIELD_SIZE_BUDGET_ERROR,
+            ));
+        }
+        let cap = buf.len().min(remaining);
+        let n = self.inner.read(&mut buf[..cap])?;
+        self.remaining.fetch_sub(n, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
+/// Byte budget one record may consume: quoting can double every payload
+/// byte, so allow 2x per field plus fixed slack. `usize::MAX` when no
+/// limit is configured.
+pub(crate) fn per_record_budget(field_size_limit: Option<usize>) -> usize {
+    match field_size_limit {
+        Some(limit) => limit
+            .saturating_mul(2)
+            .saturating_mul(RECORD_FIELD_COUNT)
+            .saturating_add(RECORD_BUDGET_SLACK),
+        None => usize::MAX,
+    }
+}
 
 /// Intermediate parsed fields shared between parse_record and parse_record_bytes.
 #[derive(Debug)]
@@ -42,12 +102,16 @@ struct ParsedFields {
 /// The input CSV must have the column order:
 /// `timestamp,topic,payload,qos,retain`
 pub struct CsvReader {
-    /// The underlying CSV reader wrapping a file handle.
-    reader: Reader<File>,
+    /// The underlying CSV reader wrapping a budget-guarded file handle.
+    reader: Reader<BudgetedReader<File>>,
     /// Whether to decode payloads from base64.
     decode_b64: bool,
     /// Optional maximum field size limit.
     field_size_limit: Option<usize>,
+    /// Per-record byte budget, replenished before each record is read.
+    budget: Arc<AtomicUsize>,
+    /// The value the budget is replenished to for each record.
+    per_record_budget: usize,
     /// Path to the CSV file (stored for reset functionality).
     path: PathBuf,
     /// Current line number (1-indexed, accounts for header row).
@@ -62,35 +126,47 @@ impl CsvReader {
         decode_b64: bool,
         field_size_limit: Option<usize>,
     ) -> Result<Self, MqttRecorderError> {
-        let reader = Self::create_reader(path, field_size_limit)?;
+        let per_record = per_record_budget(field_size_limit);
+        let (reader, budget) = Self::create_reader(path, per_record)?;
 
         Ok(Self {
             reader,
             decode_b64,
             field_size_limit,
+            budget,
+            per_record_budget: per_record,
             path: path.to_path_buf(),
             current_line: 1, // Start at 1 (header row is line 1, first data row is line 2)
         })
     }
 
     /// Creates a CSV reader with the specified configuration.
+    ///
+    /// The file handle is wrapped in a [`BudgetedReader`] so a single
+    /// oversized record fails fast instead of being buffered unbounded;
+    /// the exact per-field limit is still enforced in `parse_common_fields`.
     fn create_reader(
         path: &Path,
-        _field_size_limit: Option<usize>,
-    ) -> Result<Reader<File>, MqttRecorderError> {
+        per_record_budget: usize,
+    ) -> Result<(Reader<BudgetedReader<File>>, Arc<AtomicUsize>), MqttRecorderError> {
+        let budget = Arc::new(AtomicUsize::new(per_record_budget));
+        let file = File::open(path)?;
+
         let mut builder = ReaderBuilder::new();
         builder.has_headers(true);
+        let reader = builder.from_reader(BudgetedReader::new(file, budget.clone()));
+        Ok((reader, budget))
+    }
 
-        // Note: The csv crate doesn't have a built-in field size limit.
-        // We enforce the limit manually in parse_record() when reading fields.
-
-        let reader = builder.from_path(path)?;
-        Ok(reader)
+    /// Replenish the per-record byte budget before reading a record.
+    fn replenish_budget(&self) {
+        self.budget.store(self.per_record_budget, Ordering::Relaxed);
     }
 
     /// Reads the next message record from the CSV file.
     pub fn read_next(&mut self) -> Option<Result<MessageRecord, MqttRecorderError>> {
         // Get the next record from the CSV reader
+        self.replenish_budget();
         let result = self.reader.records().next()?;
 
         // Increment line counter for error reporting
@@ -102,7 +178,9 @@ impl CsvReader {
     /// Resets the reader to the beginning of the file.
     pub fn reset(&mut self) -> Result<(), MqttRecorderError> {
         // Recreate the reader from the stored path
-        self.reader = Self::create_reader(&self.path, self.field_size_limit)?;
+        let (reader, budget) = Self::create_reader(&self.path, self.per_record_budget)?;
+        self.reader = reader;
+        self.budget = budget;
         // Reset line counter (header row is line 1, first data row is line 2)
         self.current_line = 1;
         Ok(())
@@ -112,6 +190,7 @@ impl CsvReader {
     #[allow(dead_code)] // Public API for library users
     pub fn read_next_bytes(&mut self) -> Option<Result<MessageRecordBytes, MqttRecorderError>> {
         // Get the next record from the CSV reader
+        self.replenish_budget();
         let result = self.reader.records().next()?;
 
         // Increment line counter for error reporting
@@ -800,5 +879,44 @@ mod tests {
         assert_eq!(read_record.payload, b"test payload");
         assert_eq!(read_record.qos, 0);
         assert!(!read_record.retain);
+    }
+
+    #[test]
+    fn test_budget_rejects_oversized_record_without_buffering_it() {
+        // One field far beyond the limit: the budget guard must fail the read
+        // before the csv crate buffers the whole multi-megabyte field.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.csv");
+        let huge = "x".repeat(1024 * 1024);
+        std::fs::write(
+            &path,
+            format!("timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.123Z,t,{},0,false\n", huge),
+        )
+        .unwrap();
+
+        let mut reader = CsvReader::new(&path, false, Some(100)).unwrap();
+        let err = reader.read_next().unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("csv-field-size-limit"),
+            "expected budget error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_budget_allows_fields_at_the_limit() {
+        // Fields at (not over) the limit must pass the budget guard.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("at_limit.csv");
+        let payload = "y".repeat(1000);
+        std::fs::write(
+            &path,
+            format!("timestamp,topic,payload,qos,retain\n2024-01-15T10:30:00.123Z,t,{},0,false\n", payload),
+        )
+        .unwrap();
+
+        let mut reader = CsvReader::new(&path, false, Some(1000)).unwrap();
+        let record = reader.read_next().unwrap().unwrap();
+        assert_eq!(record.payload.len(), 1000);
     }
 }
