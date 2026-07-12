@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-12
+
 ### Fixed
 - **Binary payloads are no longer corrupted by mirror and replay.** Both paths
   converted payloads through a lossy UTF-8 string, mangling non-UTF-8 data
@@ -67,7 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mirrors, CSV validation and repair, MQTT v3.1.1/v5 support, TLS support,
   automatic base64 encoding for binary payloads.
 
-[Unreleased]: https://github.com/briananderson1222/mqtt-recorder/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/briananderson1222/mqtt-recorder/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/briananderson1222/mqtt-recorder/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/briananderson1222/mqtt-recorder/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/briananderson1222/mqtt-recorder/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/briananderson1222/mqtt-recorder/releases/tag/v0.1.0

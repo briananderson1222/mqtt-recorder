@@ -68,7 +68,7 @@ src/
 - **csv**: CSV file handling
 - **base64**: Payload encoding
 - **chrono**: Timestamp handling
-- **thiserror/anyhow**: Error handling
+- **thiserror**: Error handling (single error enum in src/error.rs; no anyhow)
 
 ## Code Conventions
 
@@ -85,7 +85,6 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) format:
 ### Error Handling
 
 - Use `thiserror` for defining error types in `src/error.rs`
-- Use `anyhow` for error propagation in application code
 - Return `Result<T, MqttRecorderError>` from library functions
 - Provide descriptive error messages with context
 
@@ -99,7 +98,7 @@ Use [Conventional Commits](https://www.conventionalcommits.org/) format:
 
 - Unit tests are co-located in source files (`#[cfg(test)]` modules)
 - Property-based tests use `proptest` crate in `tests/property/`
-- Integration tests in `tests/integration/` (require Docker for MQTT broker)
+- Integration tests in `tests/integration/` (run against the embedded rumqttd broker on dynamic localhost ports; no Docker needed)
 
 ### Documentation
 

@@ -207,6 +207,23 @@ The TUI is enabled by default when running interactively. Disable it for scripti
 mqtt-recorder --mode mirror --host broker.example.com --serve --no-interactive
 ```
 
+#### TUI Key Bindings
+
+| Key | Action |
+|-----|--------|
+| `q` / `Ctrl+C` | Quit (graceful shutdown) |
+| `m` | Toggle mirroring on/off |
+| `r` | Toggle recording on/off |
+| `s` | Pause/resume the source broker connection |
+| `p` | Toggle playback on/off |
+| `l` | Toggle loop mode for playback |
+| `+` / `-` | Increase / decrease playback speed |
+| `f` | Choose a recording/playback file (playlist selection) |
+| `↑` / `↓`, `Enter` | Navigate and confirm file selection |
+| `a` | Toggle the audit log panel |
+| `A` | Set an audit log file path |
+| `j` / `k` | Scroll the audit log down / up |
+
 ### Verify Mirrored Messages
 
 Compare source messages against what the embedded broker actually delivers:
@@ -323,7 +340,7 @@ MQTT_PASSWORD=mypassword mqtt-recorder --mode record \
 | Argument | Description | Default |
 |----------|-------------|---------|
 | `--encode-b64` | Encode all payloads as base64 | `false` |
-| `--csv-field-size_limit` | Maximum CSV field size in bytes | None |
+| `--csv-field-size-limit` | Maximum CSV field size in bytes | None |
 
 ### Validation and Repair Options
 
