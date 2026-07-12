@@ -190,8 +190,8 @@ impl Replayer {
         // only queue locally, so replaying into a connection that never
         // establishes would report success without delivering a single
         // message (and exit 0 instead of the documented exit 2).
-        let connect_deadline = tokio::time::Instant::now()
-            + Duration::from_secs(crate::util::CONNACK_TIMEOUT_SECS);
+        let connect_deadline =
+            tokio::time::Instant::now() + Duration::from_secs(crate::util::CONNACK_TIMEOUT_SECS);
         loop {
             match tokio::time::timeout_at(connect_deadline, self.client.poll()).await {
                 Ok(Ok(crate::mqtt::MqttIncoming::ConnAck)) => break,
