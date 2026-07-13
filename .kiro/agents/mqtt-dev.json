@@ -1,0 +1,22 @@
+{
+  "name": "mqtt-dev",
+  "description": "Development agent with the living-spec hook bridged for kiro-cli 2.x (native in IDE 1.0 / CLI 3.0 via .kiro/hooks/living-spec.json)",
+  "hooks": {
+    "postToolUse": [
+      {
+        "matcher": "fs_write",
+        "command": ".kiro/scripts/living-spec-sync.sh"
+      }
+    ]
+  },
+  "tools": [
+    "fs_read",
+    "fs_write",
+    "execute_bash"
+  ],
+  "allowedTools": [
+    "fs_read",
+    "fs_write",
+    "execute_bash"
+  ]
+}
