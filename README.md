@@ -404,6 +404,31 @@ Project layout, conventions, and the release process are documented in
 [CONTRIBUTING.md](CONTRIBUTING.md); the changelog is in
 [CHANGELOG.md](CHANGELOG.md).
 
+### The living-spec hook
+
+This project was built spec-first with [Kiro](kiro.dev) — the specs in
+[`.kiro/specs/`](.kiro/specs/) generated much of the code. But spec-driven
+development is usually a one-way street: specs write the code, then rot as the
+code evolves.
+
+The [`living-spec` hook](.kiro/hooks/living-spec.json) closes the loop. Every
+time a file in `src/` is saved in Kiro, an agent:
+
+1. Diffs the change and finds the spec that owns the modified behavior
+2. **Repairs drift** — updates requirements/design sections to match the code
+   as-built, or flags a `:warning: DRIFT` marker for a human when the change
+   contradicts a recorded design decision
+3. **Fills gaps** — if the module was never spec'd (code that grew past the
+   original specs), it scaffolds a `:memo: DRAFT` spec reverse-engineered from the
+   code for human review
+4. Keeps the [CLI options](#cli-options) tables in sync with the `clap`
+   definitions in `src/cli.rs`
+5. Adds a [Keep a Changelog](keepachangelog.com) entry under
+   `[Unreleased]`
+
+The hook never commits — it leaves everything in the working tree for review.
+Specs wrote the code; the code keeps the specs honest.
+
 ## Contributing
 
 Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for
