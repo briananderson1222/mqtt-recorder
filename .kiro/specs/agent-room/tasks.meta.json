@@ -1,0 +1,37 @@
+{
+  "pbtResults": {
+    "1.5 Write property test for malformed payload rejection": {
+      "status": "passed",
+      "lastRunTimestamp": 1784054247545
+    },
+    "1.7 Write property test for rendered lines": {
+      "status": "passed",
+      "lastRunTimestamp": 1784054247550
+    },
+    "4.5 Write property test for never self-reply (stretch)": {
+      "status": "passed",
+      "lastRunTimestamp": 1784055415781
+    },
+    "4.6 Write property test for human messages always trigger (stretch)": {
+      "status": "passed",
+      "lastRunTimestamp": 1784055417742
+    },
+    "4.7 Write property test for mention-gated agent replies (stretch)": {
+      "status": "passed",
+      "lastRunTimestamp": 1784055418755
+    },
+    "4.8 Write property test for reply limit monotonicity (stretch)": {
+      "status": "passed",
+      "lastRunTimestamp": 1784055420739
+    },
+    "4.9 Write property test for bounded, ordered history window (stretch)": {
+      "status": "passed",
+      "lastRunTimestamp": 1784055422652
+    },
+    "5.4 Write property test for transcript reconstruction (stretch)": {
+      "status": "passed",
+      "lastRunTimestamp": 1784055422733
+    }
+  },
+  "executionHistory": {}
+}
