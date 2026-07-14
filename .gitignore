@@ -31,3 +31,6 @@ nohup.out
 coverage/
 lcov.info
 tarpaulin-report.html
+
+# Python bytecode
+__pycache__/

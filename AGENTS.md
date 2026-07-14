@@ -26,6 +26,8 @@ Additionally, it provides utility modes for CSV file management:
 5. **Validate**: Check CSV files for format correctness and data integrity
 6. **Fix**: Repair corrupted CSV files by re-encoding binary payloads
 
+The `room/` directory contains the Agent Room demo clients (human REPL, Kiro agent participants, PRD generator) built on the embedded broker — see `.kiro/specs/agent-room/`.
+
 ## Architecture
 
 ```
@@ -300,3 +302,10 @@ Capture corrections and unique patterns discovered while working in this repo:
 - `run_record_mode` only runs without `--serve` (simple CLI recording, no TUI)
 - `run_replay_mode` only runs for `--serve` without `--host` (playback to embedded broker, no source)
 - This ensures all TUI toggles (record/mirror/playback) actually work regardless of which `--mode` was specified
+
+
+### Agent Room (room/)
+
+- The embedded rumqttd broker exposes an **MQTT v5 listener only** — paho-mqtt clients MUST pass `protocol=mqtt.MQTTv5` or the broker silently never acknowledges the v3.1.1 CONNECT and every publish is lost with no error. `room/common.py`'s `RoomClient` handles this; any new Python client must too.
+- `kiro-cli chat --no-interactive` output contains an **OSC escape sequence** (`ESC ] 9;Response complete BEL`) and a leading colored `> ` prompt echo. Naive ANSI regexes leak the literal text "9;Response complete" mid-word (the two-char-escape branch eats only `ESC ]`). Use `room.common.clean_output` — it strips OSC-first, then CSI, then two-char escapes, removes stray BELs, and drops the single leading `> ` (later-line `> ` is preserved as Markdown blockquote).
+- Agent loop safety relies on three stacked guards: mention-gated agent-to-agent replies, hard `--max-replies`, and a serial worker queue. Error notices are role "agent" without mentions specifically so they can never trigger other agents.
