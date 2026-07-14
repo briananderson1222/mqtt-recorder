@@ -406,7 +406,7 @@ Project layout, conventions, and the release process are documented in
 
 ### The living-spec hook
 
-This project was built spec-first with [Kiro](kiro.dev) — the specs in
+This project was built spec-first with [Kiro](https://kiro.dev) — the specs in
 [`.kiro/specs/`](.kiro/specs/) generated much of the code. But spec-driven
 development is usually a one-way street: specs write the code, then rot as the
 code evolves.
@@ -423,7 +423,7 @@ time a file in `src/` is saved in Kiro, an agent:
    code for human review
 4. Keeps the [CLI options](#cli-options) tables in sync with the `clap`
    definitions in `src/cli.rs`
-5. Adds a [Keep a Changelog](keepachangelog.com) entry under
+5. Adds a [Keep a Changelog](https://keepachangelog.com) entry under
    `[Unreleased]`
 
 The hook never commits — it leaves everything in the working tree for review.
