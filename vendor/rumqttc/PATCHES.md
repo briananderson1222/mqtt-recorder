@@ -11,3 +11,7 @@ TLS error type; certificate verification remains owned by rustls.
 
 Remove the path patch when a published rumqttc release permits a patched webpki.
 Validate with cargo audit and the root crate's locked tests, including TLS integration.
+
+The upstream library development lockfile is omitted: this path dependency is
+resolved exclusively by the root Cargo.lock. The upstream license is retained
+at its recorded source revision.
