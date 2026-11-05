@@ -23,7 +23,9 @@ clap_complete = "4"
 
 # MQTT client and broker
 rumqttc = "0.25"
-rumqttd = "0.20"
+# The embedded broker configures tls: None; keep unused server TLS off.
+# Outbound MQTT TLS uses rumqttc and the direct rustls dependency below.
+rumqttd = { version = "0.20", default-features = false, features = ["websocket"] }
 
 # TLS (for the --tls-insecure custom verifier; version matches rumqttc's rustls)
 rustls = "0.23"
@@ -62,6 +64,8 @@ proptest = "1"
 tempfile = "3"
 # Self-signed certificate generation for the TLS integration test
 rcgen = "0.14"
+# TLS test termination uses the same patched rustls line as the client.
+tokio-rustls = "0.26.4"
 
 [[test]]
 name = "cli_props"
@@ -127,3 +131,7 @@ path = "tests/integration/tls_test.rs"
 [profile.release]
 lto = true
 strip = true
+
+[patch.crates-io]
+# Upstream 0.25.1 still pins vulnerable webpki 0.102; see vendor provenance.
+rumqttc = { path = "vendor/rumqttc" }

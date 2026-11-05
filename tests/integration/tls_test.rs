@@ -1,5 +1,5 @@
-//! Integration tests for the client TLS paths against a TLS-enabled rumqttd
-//! broker with a self-signed certificate (generated in-process via rcgen).
+//! Integration tests for the client TLS paths against a real rumqttd broker
+//! behind a rustls TLS terminator with a self-signed rcgen certificate.
 //!
 //! Covers the three verification modes of `build_tls_transport`:
 //! - `--tls-insecure`: accept the self-signed certificate
@@ -35,10 +35,28 @@ fn write_self_signed_cert(dir: &TempDir) -> (PathBuf, PathBuf) {
     (cert_path, key_path)
 }
 
-/// Start a TLS-only rumqttd v5 broker on the given port (mirrors the shape of
-/// EmbeddedBroker::create_config, plus TLS). The thread leaks like the other
-/// integration-test brokers; rumqttd has no shutdown API.
+/// Terminate TLS in front of a real plaintext rumqttd v5 broker. Production
+/// embeds rumqttd without TLS; keeping TLS in this fixture tests the client
+/// without enabling rumqttd's obsolete optional TLS dependencies. Like the
+/// other integration fixtures, threads end when the test process exits.
 fn start_tls_broker(port: u16, cert: &Path, key: &Path) {
+    let backend_port = get_free_port();
+    let cert_pem = std::fs::read(cert).unwrap();
+    let key_pem = std::fs::read(key).unwrap();
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .unwrap()
+        .unwrap();
+    let tls = rustls::ServerConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_no_client_auth()
+    .with_single_cert(certs, key)
+    .unwrap();
     let router = RouterConfig {
         max_connections: 100,
         max_outgoing_packet_count: 200,
@@ -56,12 +74,8 @@ fn start_tls_broker(port: u16, cert: &Path, key: &Path) {
     };
     let server = ServerSettings {
         name: "tls-test".to_string(),
-        listen: SocketAddr::new([127, 0, 0, 1].into(), port),
-        tls: Some(rumqttd::TlsConfig::Rustls {
-            capath: None,
-            certpath: cert.display().to_string(),
-            keypath: key.display().to_string(),
-        }),
+        listen: SocketAddr::new([127, 0, 0, 1].into(), backend_port),
+        tls: None,
         next_connection_delay_ms: 1,
         connections,
     };
@@ -82,6 +96,34 @@ fn start_tls_broker(port: u16, cert: &Path, key: &Path) {
     std::thread::spawn(move || {
         let mut broker = Broker::new(config);
         let _ = broker.start();
+    });
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                wait_for_port(backend_port).await;
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                    .await
+                    .unwrap();
+                let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(tls));
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let acceptor = acceptor.clone();
+                    tokio::spawn(async move {
+                        // The readiness probe and a rejecting client both close
+                        // before completing TLS; neither reaches the broker.
+                        let Ok(mut secure) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let mut plain = tokio::net::TcpStream::connect(("127.0.0.1", backend_port))
+                            .await
+                            .unwrap();
+                        let _ = tokio::io::copy_bidirectional(&mut secure, &mut plain).await;
+                    });
+                }
+            });
     });
 }
 
@@ -144,9 +186,10 @@ async fn test_tls_default_verification_rejects_self_signed_cert() {
     wait_for_port(port).await;
 
     let result = try_connect(port, "tls-strict", TlsConfig::new()).await;
+    let error = result.expect_err("default verification must reject a self-signed cert");
     assert!(
-        result.is_err(),
-        "default verification must reject a self-signed cert, but connected"
+        error.to_lowercase().contains("certificate") || error.contains("UnknownIssuer"),
+        "strict TLS must fail on certificate verification, not fixture availability: {error}"
     );
 }
 
